@@ -1,0 +1,39 @@
+# Usunięto przestarzałą linię 'version'
+services:
+  # Serwis Backendu (Node.js API)
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: media-center-backend
+    volumes:
+      - ./backend:/app
+      # KLUCZOWA ZMIANA: Ta linia chroni folder node_modules wewnątrz kontenera
+      - /app/node_modules 
+      - ./config/backend:/app/config
+      - /etc/localtime:/etc/localtime:ro
+    ports:
+      - "3001:3001"
+    environment:
+      - NODE_ENV=development
+    restart: unless-stopped
+
+  # Serwis Frontendu (React App)
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: media-center-frontend
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    ports:
+      - "3000:3000"
+    environment:
+      - CHOKIDAR_USEPOLLING=true
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  config:

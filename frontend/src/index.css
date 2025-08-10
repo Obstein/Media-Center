@@ -1,0 +1,15 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+    background-color: #111827;
+    color: #f3f4f6;
+}
+
+.card {
+    @apply transition-transform duration-200 ease-in-out;
+}
+.card:hover {
+    @apply scale-105 shadow-2xl;
+}
