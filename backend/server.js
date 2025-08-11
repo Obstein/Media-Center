@@ -5,7 +5,7 @@ const path = require('path');
 const fs = require('fs');
 const axios = require('axios');
 const cron = require('node-cron');
-const ffmpeg = require('fluent-ffmpeg');
+const { spawn } = require('child_process'); // Używamy spawn
 
 const app = express();
 const PORT = 3001;
@@ -57,6 +57,7 @@ function initializeDb() {
                 stream_type TEXT,
                 episode_id TEXT,
                 filename TEXT,
+                filepath TEXT,
                 status TEXT DEFAULT 'queued', -- queued, downloading, completed, failed
                 progress INTEGER DEFAULT 0,
                 error_message TEXT,
@@ -86,6 +87,7 @@ function stmtRun(stmt, params = []) {
 // --- Kolejka pobierania ---
 let downloadQueue = [];
 let isProcessing = false;
+const activeDownloads = new Map();
 
 app.use(cors());
 app.use(express.json());
@@ -126,7 +128,6 @@ app.get('/api/settings', (req, res) => {
 app.post('/api/settings', async (req, res) => {
     const settings = req.body;
     const sql = `INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`;
-    
     try {
         await dbRun('BEGIN TRANSACTION');
         const stmt = db.prepare(sql);
@@ -135,10 +136,8 @@ app.post('/api/settings', async (req, res) => {
         }
         stmt.finalize();
         await dbRun('COMMIT');
-        console.log('Ustawienia pomyślnie zapisane w bazie danych.');
         res.status(200).json({ message: 'Ustawienia zostały pomyślnie zapisane.' });
     } catch (error) {
-        console.error('Błąd podczas zapisu ustawień do bazy danych:', error);
         await dbRun('ROLLBACK');
         res.status(500).json({ error: 'Nie udało się zapisać ustawień.' });
     }
@@ -168,10 +167,8 @@ app.post('/api/favorites/toggle', async (req, res) => {
     if (!stream_id || !stream_type) {
         return res.status(400).json({ error: 'Brakujące dane.' });
     }
-
     try {
         const existing = await dbAll('SELECT * FROM favorites WHERE stream_id = ? AND stream_type = ?', [stream_id, stream_type]);
-        
         if (existing.length > 0) {
             await dbRun('DELETE FROM favorites WHERE stream_id = ? AND stream_type = ?', [stream_id, stream_type]);
             res.json({ status: 'removed' });
@@ -188,46 +185,33 @@ app.post('/api/favorites/toggle', async (req, res) => {
 app.get('/api/media', (req, res) => {
     const { page = 1, limit = 30, search = '', genre = 'all', filter = '' } = req.query;
     const offset = (page - 1) * limit;
-
     let params = [];
     let fromClause = 'FROM media m';
     let whereClauses = [];
-
     if (filter === 'favorites') {
         fromClause += ' JOIN favorites f ON m.stream_id = f.stream_id AND m.stream_type = f.stream_type';
     }
-
     if (genre && genre !== 'all') {
         fromClause += ' JOIN media_genres mg ON m.stream_id = mg.media_stream_id AND m.stream_type = mg.media_stream_type';
         whereClauses.push('mg.genre_id = ?');
         params.push(genre);
     }
-    
     if (search) {
         whereClauses.push(`m.name LIKE ?`);
         params.push(`%${search}%`);
     }
-
     const whereString = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
     const dataSql = `SELECT DISTINCT m.* ${fromClause} ${whereString} ORDER BY m.name ASC LIMIT ? OFFSET ?`;
     const countSql = `SELECT COUNT(DISTINCT m.stream_id) as total ${fromClause} ${whereString}`;
-    
     const countParams = [...params];
     params.push(limit, offset);
-
     db.get(countSql, countParams, (err, row) => {
         if (err) { res.status(500).json({ error: err.message }); return; }
         const totalItems = row.total;
         const totalPages = Math.ceil(totalItems / limit);
-
         db.all(dataSql, params, (err, rows) => {
             if (err) { res.status(500).json({ error: err.message }); return; }
-            res.json({
-                items: rows,
-                totalPages,
-                currentPage: parseInt(page),
-                totalItems
-            });
+            res.json({ items: rows, totalPages, currentPage: parseInt(page), totalItems });
         });
     });
 });
@@ -235,26 +219,20 @@ app.get('/api/media', (req, res) => {
 // --- API: SZCZEGÓŁY MEDIA ---
 app.get('/api/media/details/:type/:id', async (req, res) => {
     const { type, id } = req.params;
-
     try {
         const settingsRows = await dbAll(`SELECT key, value FROM settings`);
         const settings = settingsRows.reduce((acc, row) => ({...acc, [row.key]: row.value }), {});
         const { serverUrl, username, password, tmdbApi } = settings;
-
         if (!tmdbApi || !serverUrl || !username || !password) {
             return res.status(400).json({ error: 'API nie jest w pełni skonfigurowane.' });
         }
-
         const mediaItemResult = await dbAll('SELECT * FROM media WHERE stream_id = ? AND stream_type = ?', [id, type]);
         if (!mediaItemResult || mediaItemResult.length === 0) {
             return res.status(404).json({ error: 'Nie znaleziono pozycji w bazie danych.' });
         }
-
         let finalDetails = { ...mediaItemResult[0] };
         let tmdbIdToUse = finalDetails.tmdb_id;
-
         const xtreamBaseUrl = `${serverUrl}/player_api.php?username=${username}&password=${password}`;
-        
         if (finalDetails.stream_type === 'series') {
             const xtreamUrl = `${xtreamBaseUrl}&action=get_series_info&series_id=${id}`;
             const seriesInfoRes = await axios.get(xtreamUrl);
@@ -270,35 +248,29 @@ app.get('/api/media/details/:type/:id', async (req, res) => {
                 tmdbIdToUse = movieInfoRes.data.movie_data.tmdb_id;
             }
         }
-
         if (tmdbIdToUse) {
             const tmdbType = finalDetails.stream_type === 'series' ? 'tv' : 'movie';
             const tmdbUrl = `https://api.themoviedb.org/3/${tmdbType}/${tmdbIdToUse}?api_key=${tmdbApi}&append_to_response=videos,credits,translations`;
             try {
                 const tmdbRes = await axios.get(tmdbUrl);
                 let tmdbData = tmdbRes.data;
-
                 const polishTranslation = tmdbData.translations?.translations?.find(t => t.iso_639_1 === 'pl');
                 if (polishTranslation?.data) {
                     tmdbData.title = polishTranslation.data.title || tmdbData.title;
                     tmdbData.name = polishTranslation.data.name || tmdbData.name;
                     tmdbData.overview = polishTranslation.data.overview || tmdbData.overview;
                 }
-                
                 finalDetails.tmdb_details = tmdbData;
             } catch(tmdbError) {
                 console.error(`Nie udało się pobrać danych z TMDB dla ID ${tmdbIdToUse}: ${tmdbError.message}`);
             }
         }
-
         res.json(finalDetails);
-
     } catch (error) {
         console.error(`Błąd podczas pobierania szczegółów dla ${type}/${id}:`, error.message);
         res.status(500).json({ error: 'Nie udało się pobrać szczegółów.' });
     }
 });
-
 
 // --- ZOPTYMALIZOWANE ODŚWIEŻANIE MEDIÓW ---
 app.post('/api/media/refresh', async (req, res) => {
@@ -309,43 +281,32 @@ app.post('/api/media/refresh', async (req, res) => {
     } catch (err) {
         return res.status(500).json({ error: 'Błąd odczytu ustawień.' });
     }
-    
     const { serverUrl, username, password, tmdbApi } = settings;
-
     if (!serverUrl || !username || !password || !tmdbApi) {
         return res.status(400).json({ error: 'Wszystkie ustawienia (Xtream i TMDB API) muszą być skonfigurowane.' });
     }
-
     try {
         const xtreamBaseUrl = `${serverUrl}/player_api.php?username=${username}&password=${password}`;
         const tmdbBaseUrl = 'https://api.themoviedb.org/3';
         const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
-        
         console.log('Pobieranie filmów i seriali z Xtream...');
         const moviesRes = await axios.get(`${xtreamBaseUrl}&action=get_vod_streams`);
         const seriesRes = await axios.get(`${xtreamBaseUrl}&action=get_series`);
-
         const moviesList = Array.isArray(moviesRes.data) ? moviesRes.data.map(m => ({...m, stream_type: 'movie'})) : [];
         const seriesList = Array.isArray(seriesRes.data) ? seriesRes.data.map(s => ({...s, stream_type: 'series', stream_id: s.series_id})) : [];
         const incomingList = [...moviesList, ...seriesList];
         const incomingMediaSet = new Set(incomingList.map(item => `${item.stream_id}_${item.stream_type}`));
-
         console.log('Pobieranie istniejących mediów z bazy danych...');
         const existingMedia = await dbAll('SELECT stream_id, stream_type FROM media');
         const existingMediaSet = new Set(existingMedia.map(m => `${m.stream_id}_${m.stream_type}`));
-
         const itemsToAdd = incomingList.filter(item => !existingMediaSet.has(`${item.stream_id}_${item.stream_type}`));
-        const itemsToDelete = existingMedia.filter(m => !incomingMediaSet.has(`${m.stream_id}_${m.stream_type}`));
-
+        const itemsToDelete = existingMedia.filter(m => !incomingMediaSet.has(`${m.stream_id}_${item.stream_type}`));
         console.log(`Nowych pozycji do dodania: ${itemsToAdd.length}`);
         console.log(`Starych pozycji do usunięcia: ${itemsToDelete.length}`);
-
         if (itemsToAdd.length === 0 && itemsToDelete.length === 0) {
             return res.status(200).json({ message: 'Baza danych jest już aktualna. Nic nie zmieniono.' });
         }
-
         await dbRun('BEGIN TRANSACTION');
-        
         if (itemsToDelete.length > 0) {
             const deleteMediaStmt = db.prepare('DELETE FROM media WHERE stream_id = ? AND stream_type = ?');
             const deleteGenresStmt = db.prepare('DELETE FROM media_genres WHERE media_stream_id = ? AND media_stream_type = ?');
@@ -356,21 +317,17 @@ app.post('/api/media/refresh', async (req, res) => {
             deleteMediaStmt.finalize();
             deleteGenresStmt.finalize();
         }
-
         if (itemsToAdd.length > 0) {
             const insertMediaSql = `INSERT OR REPLACE INTO media (stream_id, name, stream_icon, rating, tmdb_id, stream_type, container_extension) VALUES (?, ?, ?, ?, ?, ?, ?)`;
             const insertGenreSql = `INSERT OR IGNORE INTO genres (id, name) VALUES (?, ?)`;
             const insertMediaGenreSql = `INSERT OR IGNORE INTO media_genres (media_stream_id, media_stream_type, genre_id) VALUES (?, ?, ?)`;
-            
             const mediaStmt = db.prepare(insertMediaSql);
             const genreStmt = db.prepare(insertGenreSql);
             const mediaGenreStmt = db.prepare(insertMediaGenreSql);
-
             let processedCount = 0;
             for (const item of itemsToAdd) {
                 const tmdbId = item.tmdb;
                 await stmtRun(mediaStmt, [item.stream_id, item.name, item.stream_icon || item.cover, item.rating_5based || item.rating, tmdbId, item.stream_type, item.container_extension]);
-
                 if (tmdbId) {
                     try {
                         const tmdbType = item.stream_type === 'series' ? 'tv' : 'movie';
@@ -394,18 +351,14 @@ app.post('/api/media/refresh', async (req, res) => {
                     console.log(`Przetworzono ${processedCount}/${itemsToAdd.length} nowych pozycji...`);
                 }
             }
-            
             mediaStmt.finalize();
             genreStmt.finalize();
             mediaGenreStmt.finalize();
         }
-
         await dbRun('COMMIT');
-        
         const summary = `Synchronizacja zakończona. Dodano: ${itemsToAdd.length}, Usunięto: ${itemsToDelete.length}.`;
         console.log(summary);
         res.status(200).json({ message: summary });
-
     } catch (error) {
         console.error('Błąd podczas odświeżania listy mediów:', error.message);
         await dbRun('ROLLBACK');
@@ -424,33 +377,63 @@ app.get('/api/downloads/status', async (req, res) => {
 });
 
 app.post('/api/downloads/start', async (req, res) => {
-    const { stream_id, stream_type, episodes } = req.body; // episodes to tablica
-
+    const { stream_id, stream_type, episodes } = req.body;
     if (!stream_id || !stream_type || !episodes || episodes.length === 0) {
         return res.status(400).json({ error: 'Brakujące dane do rozpoczęcia pobierania.' });
     }
-
     try {
+        await dbRun('BEGIN TRANSACTION');
+        const stmt = db.prepare('INSERT OR IGNORE INTO downloads (stream_id, stream_type, episode_id, filename, status) VALUES (?, ?, ?, ?, ?)');
         for (const episode of episodes) {
-            const newDownload = {
-                stream_id,
-                stream_type,
-                episode_id: episode.id,
-                filename: episode.filename
-            };
-            await dbRun(
-                'INSERT INTO downloads (stream_id, stream_type, episode_id, filename) VALUES (?, ?, ?, ?)',
-                [stream_id, stream_type, episode.id, episode.filename]
-            );
-            downloadQueue.push(newDownload);
+            await stmtRun(stmt, [stream_id, stream_type, episode.id, episode.filename, 'queued']);
         }
+        stmt.finalize();
+        await dbRun('COMMIT');
+        
+        const jobIds = episodes.map(ep => ep.id);
+        const newJobs = await dbAll(`SELECT * FROM downloads WHERE episode_id IN (${jobIds.map(() => '?').join(',')})`, jobIds);
+        downloadQueue.push(...newJobs);
+
         res.status(202).json({ message: `Dodano ${episodes.length} zadań do kolejki pobierania.` });
         if (!isProcessing) {
             processDownloadQueue();
         }
     } catch (error) {
         console.error("Błąd dodawania do kolejki:", error);
+        await dbRun('ROLLBACK');
         res.status(500).json({ error: 'Nie udało się dodać do kolejki.' });
+    }
+});
+
+app.post('/api/downloads/remove/:id', async (req, res) => {
+    const { id } = req.params;
+    try {
+        if (activeDownloads.has(parseInt(id))) {
+            console.log(`Anulowanie aktywnego pobierania dla zadania ID: ${id}`);
+            activeDownloads.get(parseInt(id)).kill('SIGKILL');
+            activeDownloads.delete(parseInt(id));
+        }
+        downloadQueue = downloadQueue.filter(job => job.id != id);
+
+        const jobToDelete = await dbAll('SELECT * FROM downloads WHERE id = ?', [id]);
+        if (jobToDelete.length > 0 && jobToDelete[0].filepath) {
+            const { filepath } = jobToDelete[0];
+            if (fs.existsSync(filepath)) {
+                console.log(`Usuwanie pliku: ${filepath}`);
+                fs.unlinkSync(filepath);
+                const dir = path.dirname(filepath);
+                if (fs.readdirSync(dir).length === 0) {
+                    console.log(`Usuwanie pustego folderu: ${dir}`);
+                    fs.rmdirSync(dir);
+                }
+            }
+        }
+
+        await dbRun('DELETE FROM downloads WHERE id = ?', [id]);
+        res.status(200).json({ message: 'Zadanie usunięte.' });
+    } catch (error) {
+        console.error(`Błąd usuwania zadania ${id}:`, error);
+        res.status(500).json({ error: 'Nie udało się usunąć zadania.' });
     }
 });
 
@@ -460,60 +443,77 @@ async function processDownloadQueue() {
     }
     isProcessing = true;
     const job = downloadQueue.shift();
-
     try {
+        await dbRun('UPDATE downloads SET status = ? WHERE id = ?', ['downloading', job.id]);
+
         const settingsRows = await dbAll(`SELECT key, value FROM settings`);
         const settings = settingsRows.reduce((acc, row) => ({...acc, [row.key]: row.value }), {});
         const { serverUrl, username, password } = settings;
-
-        const mediaInfo = await dbAll('SELECT * FROM media WHERE stream_id = ? AND stream_type = ?', [job.stream_id, job.stream_type]);
-        if (mediaInfo.length === 0) throw new Error('Nie znaleziono media w bazie.');
-
-        const details = mediaInfo[0];
-        const yearMatch = details.name.match(/\((\d{4})\)/);
-        const year = yearMatch ? yearMatch[1] : 'UnknownYear';
         
-        const safeName = details.name.replace(/[^a-z0-9\s-]/gi, '').trim();
-        const folderPath = job.stream_type === 'movie'
+        const mediaDetailsRes = await axios.get(`http://localhost:${PORT}/api/media/details/${job.stream_type}/${job.stream_id}`);
+        const { tmdb_details, xtream_details } = mediaDetailsRes.data;
+        
+        const title = tmdb_details?.title || tmdb_details?.name || xtream_details?.info?.name || job.filename;
+        const year = (tmdb_details?.release_date || tmdb_details?.first_air_date || xtream_details?.info?.releasedate)?.substring(0, 4) || 'UnknownYear';
+        
+        const safeName = title.replace(/[^\w\s.-]/gi, '').trim();
+        let folderPath = job.stream_type === 'movie'
             ? path.join('/downloads/movies', `${safeName} (${year})`)
             : path.join('/downloads/series', `${safeName} (${year})`);
-
+        
+        let extension = 'mp4';
+        if (job.stream_type === 'movie') {
+            extension = xtream_details?.info?.container_extension || extension;
+        } else {
+            const episodeData = Object.values(xtream_details.episodes).flat().find(ep => ep.id == job.episode_id);
+            extension = episodeData?.container_extension || extension;
+            if (episodeData?.season) {
+                folderPath = path.join(folderPath, `Season ${String(episodeData.season).padStart(2, '0')}`);
+            }
+        }
         fs.mkdirSync(folderPath, { recursive: true });
         
-        const filePath = path.join(folderPath, job.filename);
-        const downloadUrl = `${serverUrl}/${job.stream_type === 'movie' ? 'movie' : 'series'}/${username}/${password}/${job.episode_id}.${details.container_extension || 'mp4'}`;
+        const safeFilename = `${job.filename.replace(/\.mp4$/, '')}.${extension}`;
+        const filePath = path.join(folderPath, safeFilename);
+        const downloadUrl = `${serverUrl}/${job.stream_type}/${username}/${password}/${job.episode_id}.${extension}`;
 
-        await dbRun('UPDATE downloads SET status = ? WHERE episode_id = ?', ['downloading', job.episode_id]);
+        await dbRun('UPDATE downloads SET filename = ?, filepath = ? WHERE id = ?', [safeFilename, filePath, job.id]);
+        
+        const command = `python3 download.py "${downloadUrl}" "${filePath}"`;
+        console.log(`Uruchamianie polecenia: python3 download.py ...`);
 
         await new Promise((resolve, reject) => {
-            ffmpeg(downloadUrl)
-                .on('progress', (progress) => {
-                    const percent = Math.floor(progress.percent);
-                    if (percent > 0) {
-                        dbRun('UPDATE downloads SET progress = ? WHERE episode_id = ?', [percent, job.episode_id]);
-                    }
-                })
-                .on('end', () => {
-                    dbRun('UPDATE downloads SET status = ?, progress = 100 WHERE episode_id = ?', ['completed', job.episode_id]);
+            const pythonProcess = spawn('python3', ['download.py', downloadUrl, filePath]);
+            activeDownloads.set(job.id, pythonProcess);
+
+            pythonProcess.stdout.on('data', (data) => {
+                console.log(`[Python] stdout: ${data}`);
+            });
+
+            pythonProcess.stderr.on('data', (data) => {
+                console.error(`[Python] stderr: ${data}`);
+            });
+
+            pythonProcess.on('close', (code) => {
+                if (code === 0) {
                     resolve();
-                })
-                .on('error', (err) => {
-                    dbRun('UPDATE downloads SET status = ?, error_message = ? WHERE episode_id = ?', ['failed', err.message, job.episode_id]);
-                    reject(err);
-                })
-                .outputOptions('-c', 'copy')
-                .save(filePath);
+                } else {
+                    reject(new Error(`Skrypt Pythona zakończył działanie z kodem ${code}`));
+                }
+            });
         });
 
+        await dbRun('UPDATE downloads SET status = ?, progress = 100 WHERE id = ?', ['completed', job.id]);
+
     } catch (error) {
-        console.error(`Błąd przetwarzania zadania ${job.episode_id}:`, error);
-        await dbRun('UPDATE downloads SET status = ?, error_message = ? WHERE episode_id = ?', ['failed', error.message, job.episode_id]);
+        console.error(`Błąd przetwarzania zadania ${job.id}:`, error);
+        await dbRun('UPDATE downloads SET status = ?, error_message = ? WHERE id = ?', ['failed', error.message, job.id]);
     } finally {
+        activeDownloads.delete(job.id);
         isProcessing = false;
-        processDownloadQueue(); // Przetwórz następne zadanie
+        processDownloadQueue();
     }
 }
-
 
 app.listen(PORT, () => {
     console.log(`Serwer backendu działa na porcie ${PORT}`);

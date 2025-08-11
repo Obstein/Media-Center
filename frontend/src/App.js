@@ -23,7 +23,9 @@ const Pagination = ({ currentPage, totalPages, onPageChange }) => {
 // --- Komponent Karta Mediów ---
 const MediaCard = ({ item, isFavorite, onToggleFavorite }) => (
   <div className="card bg-gray-800 rounded-lg overflow-hidden shadow-lg relative group">
-    <a href={`#/details/${item.stream_type}/${item.stream_id}`} className="absolute inset-0 z-0"></a>
+    <a href={`#/details/${item.stream_type}/${item.stream_id}`} className="absolute inset-0 z-0">
+        <span className="sr-only">Zobacz szczegóły {item.name}</span>
+    </a>
     <button 
       onClick={(e) => {
         e.stopPropagation(); // Zapobiegaj nawigacji do szczegółów
@@ -48,8 +50,47 @@ const MediaCard = ({ item, isFavorite, onToggleFavorite }) => (
   </div>
 );
 
+// --- Komponent Widgetu Pobierania ---
+const DownloadWidget = ({ downloads, onRemove, onClose, isOpen }) => {
+    if (!isOpen || downloads.length === 0) return null;
+
+    return (
+        <div className="fixed bottom-4 right-4 w-80 bg-gray-800 rounded-lg shadow-2xl border border-gray-700 z-50">
+            <div className="p-4">
+                <div className="flex justify-between items-center mb-3">
+                    <h4 className="font-bold text-lg text-white">Aktywne Pobierania</h4>
+                    <button onClick={onClose} className="text-gray-400 hover:text-white">&times;</button>
+                </div>
+                <ul className="space-y-3 text-sm max-h-64 overflow-y-auto">
+                    {downloads.map(d => (
+                        <li key={d.id}>
+                            <div className="flex justify-between items-center mb-1">
+                                <span className="truncate text-gray-300">{d.filename}</span>
+                                <div className="flex items-center gap-2">
+                                    <span className={`font-semibold ${d.status === 'failed' ? 'text-red-400' : 'text-gray-400'}`}>
+                                        {d.status === 'downloading' && 'Pobieranie...'}
+                                        {d.status === 'completed' && 'Gotowe'}
+                                        {d.status === 'queued' && 'W kolejce'}
+                                        {d.status === 'failed' && 'Błąd'}
+                                    </span>
+                                    <button onClick={() => onRemove(d.id)} className="text-gray-500 hover:text-white">&times;</button>
+                                </div>
+                            </div>
+                            {d.status === 'downloading' && (
+                                <div className="w-full bg-gray-600 rounded-full h-2 animate-pulse">
+                                    <div className="bg-blue-500 h-2 rounded-full"></div>
+                                </div>
+                            )}
+                        </li>
+                    ))}
+                </ul>
+            </div>
+        </div>
+    );
+};
+
 // --- Komponent Widoku Szczegółów ---
-const DetailsView = ({ type, id, favorites, onToggleFavorite }) => {
+const DetailsView = ({ type, id, favorites, onToggleFavorite, onDownload }) => {
     const [details, setDetails] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
@@ -73,6 +114,33 @@ const DetailsView = ({ type, id, favorites, onToggleFavorite }) => {
         };
         fetchDetails();
     }, [type, id]);
+    
+    const handleDownloadMovie = () => {
+        const tmdb = details?.tmdb_details;
+        const xtreamInfo = details?.xtream_details?.info;
+        const title = tmdb?.title || tmdb?.name || xtreamInfo?.name || details.name;
+        const filename = title.replace(/[^\w\s.-]/gi, '').trim();
+        onDownload(details.stream_id, 'movie', [{ id: details.stream_id, filename }]);
+    };
+    
+    const handleDownloadEpisode = (episode) => {
+        const tmdb = details?.tmdb_details;
+        const xtreamInfo = details?.xtream_details?.info;
+        const title = tmdb?.title || tmdb?.name || xtreamInfo?.name || details.name;
+        const filename = `${title.replace(/[^\w\s.-]/gi, '').trim()} - S${String(episode.season).padStart(2, '0')}E${String(episode.episode_num).padStart(2, '0')}`;
+        onDownload(details.stream_id, 'series', [{ id: episode.id, filename }]);
+    };
+
+    const handleDownloadSeason = (seasonNum) => {
+        const tmdb = details?.tmdb_details;
+        const xtreamInfo = details?.xtream_details?.info;
+        const title = tmdb?.title || tmdb?.name || xtreamInfo?.name || details.name;
+        const episodesToDownload = details.xtream_details.episodes[seasonNum].map(ep => ({
+            id: ep.id,
+            filename: `${title.replace(/[^\w\s.-]/gi, '').trim()} - S${String(ep.season).padStart(2, '0')}E${String(ep.episode_num).padStart(2, '0')}`
+        }));
+        onDownload(details.stream_id, 'series', episodesToDownload);
+    };
 
     if (loading) return <p className="text-center text-gray-400">Ładowanie szczegółów...</p>;
     if (error) return <p className="text-center text-red-400">{error}</p>;
@@ -103,12 +171,19 @@ const DetailsView = ({ type, id, favorites, onToggleFavorite }) => {
                         <span>{genres}</span>
                     </div>
                     <p className="text-gray-300 mt-4">{plot}</p>
-                    <button onClick={() => onToggleFavorite(details)} className={`mt-6 inline-flex items-center gap-2 px-4 py-2 rounded-lg font-semibold transition-colors ${isFavorite ? 'bg-red-600 hover:bg-red-700 text-white' : 'bg-gray-600 hover:bg-gray-500 text-gray-200'}`}>
-                        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
-                            <path fillRule="evenodd" d="M3.172 5.172a4 4 0 015.656 0L10 6.343l1.172-1.171a4 4 0 115.656 5.656L10 17.657l-6.828-6.829a4 4 0 010-5.656z" clipRule="evenodd" />
-                        </svg>
-                        {isFavorite ? 'Usuń z ulubionych' : 'Dodaj do ulubionych'}
-                    </button>
+                    <div className="flex items-center gap-4 mt-6">
+                        <button onClick={() => onToggleFavorite(details)} className={`inline-flex items-center gap-2 px-4 py-2 rounded-lg font-semibold transition-colors ${isFavorite ? 'bg-red-600 hover:bg-red-700 text-white' : 'bg-gray-600 hover:bg-gray-500 text-gray-200'}`}>
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                                <path fillRule="evenodd" d="M3.172 5.172a4 4 0 015.656 0L10 6.343l1.172-1.171a4 4 0 115.656 5.656L10 17.657l-6.828-6.829a4 4 0 010-5.656z" clipRule="evenodd" />
+                            </svg>
+                            {isFavorite ? 'Usuń z ulubionych' : 'Dodaj do ulubionych'}
+                        </button>
+                        {details.stream_type === 'movie' && (
+                            <button onClick={handleDownloadMovie} className="inline-flex items-center gap-2 px-4 py-2 rounded-lg font-semibold bg-blue-600 hover:bg-blue-700 text-white transition-colors">
+                                Pobierz Film
+                            </button>
+                        )}
+                    </div>
                 </div>
             </div>
 
@@ -134,11 +209,19 @@ const DetailsView = ({ type, id, favorites, onToggleFavorite }) => {
                     <h3 className="text-2xl font-bold mb-4">Odcinki</h3>
                     {Object.entries(details.xtream_details.episodes).map(([seasonNum, episodes]) => (
                         <div key={seasonNum} className="mb-6">
-                            <h4 className="text-xl font-semibold mb-3">Sezon {seasonNum}</h4>
+                            <div className="flex justify-between items-center mb-3">
+                                <h4 className="text-xl font-semibold">Sezon {seasonNum}</h4>
+                                <button onClick={() => handleDownloadSeason(seasonNum)} className="px-3 py-1 rounded-lg text-sm font-semibold bg-blue-600 hover:bg-blue-700 text-white transition-colors">
+                                    Pobierz Sezon
+                                </button>
+                            </div>
                             <ul className="space-y-2">
                                 {episodes.map(ep => (
                                     <li key={ep.id} className="bg-gray-800 p-3 rounded-lg flex justify-between items-center">
                                         <span>{ep.episode_num}. {ep.title}</span>
+                                        <button onClick={() => handleDownloadEpisode(ep)} className="px-3 py-1 rounded-lg text-xs font-semibold bg-gray-600 hover:bg-gray-500 text-white transition-colors">
+                                            Pobierz
+                                        </button>
                                     </li>
                                 ))}
                             </ul>
@@ -254,7 +337,7 @@ const HomeView = ({ queryParams, onNavigate, favorites, onToggleFavorite }) => {
     );
 };
 
-// --- Komponent Ustawień (bez zmian) ---
+// --- Komponent Ustawień ---
 const SettingsView = () => {
     const [settings, setSettings] = useState({ serverUrl: '', username: '', password: '', tmdbApi: '', discordWebhook: '', checkFrequency: '12' });
     const [message, setMessage] = useState('');
@@ -348,8 +431,10 @@ const SettingsView = () => {
 function App() {
   const [route, setRoute] = useState({ path: 'home', params: {} });
   const [favorites, setFavorites] = useState(new Set());
+  const [downloads, setDownloads] = useState([]);
+  const [isWidgetOpen, setIsWidgetOpen] = useState(true);
 
-  // Pobieranie listy ulubionych przy starcie
+  // Pobieranie ulubionych
   useEffect(() => {
     const fetchFavorites = async () => {
         try {
@@ -361,6 +446,21 @@ function App() {
         }
     };
     fetchFavorites();
+  }, []);
+
+  // Pobieranie statusu pobierania
+  useEffect(() => {
+    const fetchStatus = async () => {
+        try {
+            const response = await axios.get('/api/downloads/status');
+            setDownloads(response.data);
+        } catch (error) {
+            console.error("Nie udało się pobrać statusu pobierania", error);
+        }
+    };
+    fetchStatus();
+    const interval = setInterval(fetchStatus, 5000);
+    return () => clearInterval(interval);
   }, []);
 
   const handleToggleFavorite = async (item) => {
@@ -383,6 +483,24 @@ function App() {
         console.error("Błąd podczas zmiany statusu ulubionych", error);
         // Wycofaj zmianę w UI w razie błędu
         setFavorites(favorites);
+    }
+  };
+  
+  const handleDownload = async (stream_id, stream_type, episodes) => {
+    try {
+        await axios.post('/api/downloads/start', { stream_id, stream_type, episodes });
+        setIsWidgetOpen(true); // Otwórz widget po dodaniu nowego pobierania
+    } catch (error) {
+        console.error("Błąd podczas rozpoczynania pobierania", error);
+    }
+  };
+
+  const handleRemoveDownload = async (id) => {
+    try {
+        await axios.post(`/api/downloads/remove/${id}`);
+        setDownloads(prev => prev.filter(d => d.id !== id));
+    } catch (error) {
+        console.error("Błąd podczas usuwania zadania", error);
     }
   };
 
@@ -430,7 +548,7 @@ function App() {
         case 'settings':
             return <SettingsView />;
         case 'details':
-            return <DetailsView type={route.params.type} id={route.params.id} favorites={favorites} onToggleFavorite={handleToggleFavorite} />;
+            return <DetailsView type={route.params.type} id={route.params.id} favorites={favorites} onToggleFavorite={handleToggleFavorite} onDownload={handleDownload} />;
         case 'home':
         default:
             return <HomeView queryParams={route.params} onNavigate={handleNavigate} favorites={favorites} onToggleFavorite={handleToggleFavorite} />;
@@ -442,10 +560,9 @@ function App() {
       <header className="bg-gray-900/80 backdrop-blur-sm shadow-lg sticky top-0 z-50">
         <nav className="container mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex items-center justify-between h-16">
-            <div className="flex items-center">
-              <a href="#/home" className="text-2xl font-bold text-white no-underline"><span className="text-red-500">M</span>ediaCenter</a>
-            </div>
+            <a href="#/home" className="text-2xl font-bold text-white no-underline"><span className="text-red-500">M</span>ediaCenter</a>
             <div className="flex items-center space-x-4">
+              <button onClick={() => setIsWidgetOpen(!isWidgetOpen)} className="text-gray-300 hover:text-white">Pobierane</button>
               <a href="#/home" className="text-gray-300 hover:text-white px-3 py-2 rounded-md text-sm font-medium no-underline">Strona Główna</a>
               <a href="#/settings" className="text-gray-300 hover:text-white px-3 py-2 rounded-md text-sm font-medium no-underline">Ustawienia</a>
             </div>
@@ -455,6 +572,7 @@ function App() {
       <main className="flex-grow container mx-auto p-4 sm:p-6 lg:p-8">
         {renderContent()}
       </main>
+      <DownloadWidget downloads={downloads} onRemove={handleRemoveDownload} onClose={() => setIsWidgetOpen(false)} isOpen={isWidgetOpen} />
     </div>
   );
 }

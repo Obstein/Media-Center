@@ -11,8 +11,7 @@ services:
       # KLUCZOWA ZMIANA: Ta linia chroni folder node_modules wewnątrz kontenera
       - /app/node_modules 
       - ./config/backend:/app/config
-      - /mnt/user/Media/Filmy:/downloads/movies
-      - /mnt/user/Media/Seriale:/downloads/series
+     -
       - /etc/localtime:/etc/localtime:ro
     ports:
       - "3001:3001"
