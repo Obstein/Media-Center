@@ -89,6 +89,22 @@ let downloadQueue = [];
 let isProcessing = false;
 const activeDownloads = new Map();
 
+// NOWA FUNKCJA - Wklej ją tutaj
+async function sendDiscordNotification(message) {
+    try {
+        const webhookUrl = await dbAll('SELECT value FROM settings WHERE key = ?', ['discordWebhook']);
+        if (webhookUrl && webhookUrl[0] && webhookUrl[0].value) {
+            await axios.post(webhookUrl[0].value, {
+                content: message,
+                username: "Media Center Downloader"
+            });
+            console.log("Wysłano powiadomienie na Discord.");
+        }
+    } catch (error) {
+        console.error("Nie udało się wysłać powiadomienia na Discord:", error.message);
+    }
+}
+
 app.use(cors());
 app.use(express.json());
 
@@ -408,34 +424,48 @@ app.post('/api/downloads/start', async (req, res) => {
 app.post('/api/downloads/remove/:id', async (req, res) => {
     const { id } = req.params;
     try {
+        // Anuluj aktywne pobieranie, jeśli istnieje
         if (activeDownloads.has(parseInt(id))) {
             console.log(`Anulowanie aktywnego pobierania dla zadania ID: ${id}`);
             activeDownloads.get(parseInt(id)).kill('SIGKILL');
             activeDownloads.delete(parseInt(id));
         }
+        // Usuń z kolejki w pamięci
         downloadQueue = downloadQueue.filter(job => job.id != id);
 
+        // Pobierz informacje o zadaniu z bazy danych
         const jobToDelete = await dbAll('SELECT * FROM downloads WHERE id = ?', [id]);
-        if (jobToDelete.length > 0 && jobToDelete[0].filepath) {
+        
+        // Sprawdź, czy zadanie istnieje i czy plik nie został w pełni pobrany
+        if (jobToDelete.length > 0 && jobToDelete[0].filepath && jobToDelete[0].status !== 'completed') {
             const { filepath } = jobToDelete[0];
             if (fs.existsSync(filepath)) {
-                console.log(`Usuwanie pliku: ${filepath}`);
+                console.log(`Usuwanie niekompletnego pliku: ${filepath}`);
                 fs.unlinkSync(filepath);
-                const dir = path.dirname(filepath);
-                if (fs.readdirSync(dir).length === 0) {
-                    console.log(`Usuwanie pustego folderu: ${dir}`);
-                    fs.rmdirSync(dir);
+                try {
+                    const dir = path.dirname(filepath);
+                    if (fs.readdirSync(dir).length === 0) {
+                        console.log(`Usuwanie pustego folderu: ${dir}`);
+                        fs.rmdirSync(dir);
+                    }
+                } catch (e) {
+                    // Ignoruj błąd, jeśli folder nie jest pusty (np. z powodu innego pobierania)
+                    console.warn(`Nie można usunąć folderu ${path.dirname(filepath)}, prawdopodobnie nie jest pusty.`);
                 }
             }
+        } else if (jobToDelete.length > 0 && jobToDelete[0].status === 'completed') {
+            console.log(`Zadanie ${id} jest ukończone. Plik nie zostanie usunięty.`);
         }
 
+        // Zawsze usuwaj wpis z bazy danych
         await dbRun('DELETE FROM downloads WHERE id = ?', [id]);
-        res.status(200).json({ message: 'Zadanie usunięte.' });
+        res.status(200).json({ message: 'Zadanie usunięte z listy.' });
     } catch (error) {
         console.error(`Błąd usuwania zadania ${id}:`, error);
         res.status(500).json({ error: 'Nie udało się usunąć zadania.' });
     }
 });
+
 
 async function processDownloadQueue() {
     if (isProcessing || downloadQueue.length === 0) {
@@ -514,6 +544,67 @@ async function processDownloadQueue() {
         processDownloadQueue();
     }
 }
+
+async function monitorFavorites() {
+    console.log('Uruchamianie zadania monitorowania ulubionych...');
+    try {
+        const settingsRows = await dbAll(`SELECT key, value FROM settings`);
+        const settings = settingsRows.reduce((acc, row) => ({...acc, [row.key]: row.value }), {});
+        const { serverUrl, username, password, tmdbApi } = settings;
+
+        if (!serverUrl || !username || !password || !tmdbApi) {
+            console.log('Monitorowanie przerwane: brak pełnej konfiguracji Xtream i TMDB.');
+            return;
+        }
+
+        const favoriteSeries = await dbAll('SELECT * FROM favorites WHERE stream_type = ?', ['series']);
+        if (favoriteSeries.length === 0) {
+            console.log('Monitorowanie zakończone: brak ulubionych seriali do sprawdzenia.');
+            return;
+        }
+
+        console.log(`Znaleziono ${favoriteSeries.length} ulubionych seriali do sprawdzenia...`);
+        let newDownloadsAdded = false;
+
+        for (const series of favoriteSeries) {
+            const seriesInfoRes = await axios.get(`http://localhost:${PORT}/api/media/details/series/${series.stream_id}`);
+            const allEpisodes = Object.values(seriesInfoRes.data.xtream_details.episodes).flat();
+            
+            const downloadedEpisodes = await dbAll('SELECT episode_id FROM downloads WHERE stream_id = ?', [series.stream_id]);
+            const downloadedEpisodeIds = new Set(downloadedEpisodes.map(ep => ep.episode_id));
+
+            const newEpisodes = allEpisodes.filter(ep => !downloadedEpisodeIds.has(ep.id));
+
+            if (newEpisodes.length > 0) {
+                console.log(`Znaleziono ${newEpisodes.length} nowych odcinków dla serialu: ${seriesInfoRes.data.name}`);
+                newDownloadsAdded = true;
+
+                const episodesToQueue = newEpisodes.map(ep => {
+                    const title = seriesInfoRes.data.tmdb_details?.name || seriesInfoRes.data.name;
+                    const filename = `${title.replace(/[^\w\s.-]/gi, '').trim()} - S${String(ep.season).padStart(2, '0')}E${String(ep.episode_num).padStart(2, '0')}`;
+                    return { id: ep.id, filename };
+                });
+
+                await axios.post(`http://localhost:${PORT}/api/downloads/start`, {
+                    stream_id: series.stream_id,
+                    stream_type: 'series',
+                    episodes: episodesToQueue
+                });
+
+                const episodeList = newEpisodes.map(ep => `S${String(ep.season).padStart(2, '0')}E${String(ep.episode_num).padStart(2, '0')}`).join(', ');
+                await sendDiscordNotification(`✅ Nowe odcinki dla **${seriesInfoRes.data.name}** dodane do kolejki: **${episodeList}**`);
+            }
+        }
+
+        if (!newDownloadsAdded) {
+            console.log('Monitorowanie zakończone: nie znaleziono nowych odcinków.');
+        }
+
+    } catch (error) {
+        console.error("Wystąpił błąd podczas monitorowania ulubionych:", error.message);
+    }
+}
+
 
 app.listen(PORT, () => {
     console.log(`Serwer backendu działa na porcie ${PORT}`);
@@ -598,7 +689,20 @@ async function backfillTmdbGenres(limit = 50) {
     }
 }
 
-cron.schedule('0 * * * *', () => {
-    console.log('Uruchamianie zaplanowanego zadania uzupełniania gatunków TMDB...');
+cron.schedule('0 * * * *', async () => { // Uruchamia się co godzinę
+    console.log('Uruchamianie zaplanowanych zadań...');
+    
+    const settingsRows = await dbAll(`SELECT key, value FROM settings WHERE key = 'checkFrequency'`);
+    const frequency = parseInt(settingsRows[0]?.value || '12', 10);
+    const currentHour = new Date().getHours();
+
+    // Uruchom monitorowanie ulubionych zgodnie z ustawioną częstotliwością
+    if (currentHour % frequency === 0) {
+        monitorFavorites();
+    } else {
+        console.log(`Pominięto monitorowanie ulubionych. Następne sprawdzenie za ${frequency - (currentHour % frequency)}h.`);
+    }
+
+    // Zawsze uruchamiaj uzupełnianie brakujących gatunków
     backfillTmdbGenres(50);
 });
