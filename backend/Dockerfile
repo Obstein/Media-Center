@@ -3,7 +3,8 @@ FROM node:18-alpine
 
 # Zainstaluj Pythona i pip
 RUN apk add --no-cache python3 py3-pip
-
+#RUN apk add --no-cache python3 py3-pip wget
+RUN apk add --no-cache python3 py3-pip curl
 # Ustaw katalog roboczy w kontenerze
 WORKDIR /app
 

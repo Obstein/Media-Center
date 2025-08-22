@@ -5,7 +5,7 @@ const path = require('path');
 const fs = require('fs');
 const axios = require('axios');
 const cron = require('node-cron');
-const { spawn } = require('child_process'); // Używamy spawn
+const { spawn } = require('child_process');
 
 const app = express();
 const PORT = 3001;
@@ -28,6 +28,7 @@ const db = new sqlite3.Database(dbPath, (err) => {
 function initializeDb() {
     db.serialize(() => {
         db.run(`CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)`);
+        
         db.run(`
             CREATE TABLE IF NOT EXISTS media (
                 stream_id INTEGER, name TEXT, stream_icon TEXT, rating REAL,
@@ -35,8 +36,10 @@ function initializeDb() {
                 PRIMARY KEY (stream_id, stream_type)
             )
         `);
+        
         db.run(`CREATE TABLE IF NOT EXISTS genres (id INTEGER PRIMARY KEY, name TEXT)`);
         db.run(`INSERT OR IGNORE INTO genres (id, name) VALUES (-1, 'Sprawdzono - Brak Gatunku')`);
+        
         db.run(`
             CREATE TABLE IF NOT EXISTS media_genres (
                 media_stream_id INTEGER, media_stream_type TEXT, genre_id INTEGER,
@@ -44,12 +47,15 @@ function initializeDb() {
                 FOREIGN KEY (genre_id) REFERENCES genres(id)
             )
         `);
+        
         db.run(`
             CREATE TABLE IF NOT EXISTS favorites (
                 stream_id INTEGER, stream_type TEXT, added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (stream_id, stream_type)
             )
         `);
+        
+        // Rozszerzona tabela downloads z nowymi kolumnami
         db.run(`
             CREATE TABLE IF NOT EXISTS downloads (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -59,11 +65,59 @@ function initializeDb() {
                 filename TEXT,
                 filepath TEXT,
                 status TEXT DEFAULT 'queued', -- queued, downloading, completed, failed
+                worker_status TEXT DEFAULT 'queued', -- queued, downloading, completed, failed
+                download_status TEXT DEFAULT 'pending', -- pending, downloading, completed, failed
                 progress INTEGER DEFAULT 0,
                 error_message TEXT,
+                download_url TEXT,
                 added_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         `);
+        
+        // Tabela logów pobierania
+        db.run(`
+            CREATE TABLE IF NOT EXISTS download_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                download_id INTEGER,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                level TEXT DEFAULT 'INFO',
+                message TEXT,
+                FOREIGN KEY (download_id) REFERENCES downloads(id)
+            )
+        `);
+        
+        // Dodaj nowe kolumny do istniejącej tabeli downloads jeśli nie istnieją
+        db.all("PRAGMA table_info(downloads)", [], (err, columns) => {
+            if (err) {
+                console.error("Błąd sprawdzania struktury tabeli downloads:", err);
+                return;
+            }
+            
+            const columnNames = columns.map(col => col.name);
+            
+            if (!columnNames.includes('worker_status')) {
+                db.run("ALTER TABLE downloads ADD COLUMN worker_status TEXT DEFAULT 'queued'", (alterErr) => {
+                    if (alterErr) console.error("Błąd dodawania kolumny worker_status:", alterErr);
+                    else console.log("Dodano kolumnę worker_status");
+                });
+            }
+            
+            if (!columnNames.includes('download_status')) {
+                db.run("ALTER TABLE downloads ADD COLUMN download_status TEXT DEFAULT 'pending'", (alterErr) => {
+                    if (alterErr) console.error("Błąd dodawania kolumny download_status:", alterErr);
+                    else console.log("Dodano kolumnę download_status");
+                });
+            }
+            
+            if (!columnNames.includes('download_url')) {
+                db.run("ALTER TABLE downloads ADD COLUMN download_url TEXT", (alterErr) => {
+                    if (alterErr) console.error("Błąd dodawania kolumny download_url:", alterErr);
+                    else console.log("Dodano kolumnę download_url");
+                });
+            }
+        });
+        
+        console.log("Baza danych zainicjalizowana z tabelami pobierania");
     });
 }
 
@@ -84,10 +138,50 @@ function stmtRun(stmt, params = []) {
     });
 }
 
+// --- Funkcja retry dla API calls ---
+async function makeRetryRequest(url, options = {}, maxRetries = 3, delay = 1000) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            const response = await axios.get(url, {
+                timeout: 15000,
+                ...options
+            });
+            return response;
+        } catch (error) {
+            console.error(`API request failed (attempt ${attempt}/${maxRetries}): ${error.message}`);
+            
+            // Jeśli to ostatnia próba, rzuć błąd
+            if (attempt === maxRetries) {
+                throw error;
+            }
+            
+            // Sprawdź czy warto ponowić próbę
+            const shouldRetry = (
+                error.code === 'ECONNRESET' ||
+                error.code === 'ETIMEDOUT' ||
+                error.code === 'ENOTFOUND' ||
+                (error.response && [502, 503, 504, 521, 522, 523, 524].includes(error.response.status))
+            );
+            
+            if (!shouldRetry) {
+                throw error;
+            }
+            
+            // Czekaj przed następną próbą (exponential backoff)
+            const waitTime = delay * Math.pow(2, attempt - 1);
+            console.log(`Waiting ${waitTime}ms before retry...`);
+            await new Promise(resolve => setTimeout(resolve, waitTime));
+        }
+    }
+}
+
 // --- Kolejka pobierania ---
 let downloadQueue = [];
 let isProcessing = false;
 const activeDownloads = new Map();
+
+// --- Download Manager Process ---
+let downloadManagerProcess = null;
 
 // NOWA FUNKCJA - Wklej ją tutaj
 async function sendDiscordNotification(message) {
@@ -239,36 +333,53 @@ app.get('/api/media/details/:type/:id', async (req, res) => {
         const settingsRows = await dbAll(`SELECT key, value FROM settings`);
         const settings = settingsRows.reduce((acc, row) => ({...acc, [row.key]: row.value }), {});
         const { serverUrl, username, password, tmdbApi } = settings;
+        
         if (!tmdbApi || !serverUrl || !username || !password) {
             return res.status(400).json({ error: 'API nie jest w pełni skonfigurowane.' });
         }
+        
         const mediaItemResult = await dbAll('SELECT * FROM media WHERE stream_id = ? AND stream_type = ?', [id, type]);
         if (!mediaItemResult || mediaItemResult.length === 0) {
             return res.status(404).json({ error: 'Nie znaleziono pozycji w bazie danych.' });
         }
+        
         let finalDetails = { ...mediaItemResult[0] };
         let tmdbIdToUse = finalDetails.tmdb_id;
         const xtreamBaseUrl = `${serverUrl}/player_api.php?username=${username}&password=${password}`;
-        if (finalDetails.stream_type === 'series') {
-            const xtreamUrl = `${xtreamBaseUrl}&action=get_series_info&series_id=${id}`;
-            const seriesInfoRes = await axios.get(xtreamUrl);
-            finalDetails.xtream_details = seriesInfoRes.data;
-            if (seriesInfoRes.data?.info?.tmdb) {
-                tmdbIdToUse = seriesInfoRes.data.info.tmdb;
+        
+        // Użyj retry mechanism dla Xtream API calls
+        try {
+            if (finalDetails.stream_type === 'series') {
+                const xtreamUrl = `${xtreamBaseUrl}&action=get_series_info&series_id=${id}`;
+                console.log(`Fetching series info for ID: ${id}`);
+                const seriesInfoRes = await makeRetryRequest(xtreamUrl);
+                finalDetails.xtream_details = seriesInfoRes.data;
+                if (seriesInfoRes.data?.info?.tmdb) {
+                    tmdbIdToUse = seriesInfoRes.data.info.tmdb;
+                }
+            } else if (finalDetails.stream_type === 'movie') {
+                const xtreamUrl = `${xtreamBaseUrl}&action=get_vod_info&vod_id=${id}`;
+                console.log(`Fetching movie info for ID: ${id}`);
+                const movieInfoRes = await makeRetryRequest(xtreamUrl);
+                finalDetails.xtream_details = { info: movieInfoRes.data?.movie_data, ...movieInfoRes.data };
+                if (movieInfoRes.data?.movie_data?.tmdb_id) {
+                    tmdbIdToUse = movieInfoRes.data.movie_data.tmdb_id;
+                }
             }
-        } else if (finalDetails.stream_type === 'movie') {
-            const xtreamUrl = `${xtreamBaseUrl}&action=get_vod_info&vod_id=${id}`;
-            const movieInfoRes = await axios.get(xtreamUrl);
-            finalDetails.xtream_details = { info: movieInfoRes.data?.movie_data, ...movieInfoRes.data };
-             if (movieInfoRes.data?.movie_data?.tmdb_id) {
-                tmdbIdToUse = movieInfoRes.data.movie_data.tmdb_id;
-            }
+        } catch (xtreamError) {
+            console.error(`Failed to fetch Xtream details after retries: ${xtreamError.message}`);
+            // Kontynuuj bez szczegółów Xtream jeśli nie można ich pobrać
+            finalDetails.xtream_details = null;
+            finalDetails.xtream_error = `Nie udało się pobrać szczegółów z serwera: ${xtreamError.message}`;
         }
+        
+        // TMDB API call z retry
         if (tmdbIdToUse) {
             const tmdbType = finalDetails.stream_type === 'series' ? 'tv' : 'movie';
             const tmdbUrl = `https://api.themoviedb.org/3/${tmdbType}/${tmdbIdToUse}?api_key=${tmdbApi}&append_to_response=videos,credits,translations`;
             try {
-                const tmdbRes = await axios.get(tmdbUrl);
+                console.log(`Fetching TMDB details for ID: ${tmdbIdToUse}`);
+                const tmdbRes = await makeRetryRequest(tmdbUrl);
                 let tmdbData = tmdbRes.data;
                 const polishTranslation = tmdbData.translations?.translations?.find(t => t.iso_639_1 === 'pl');
                 if (polishTranslation?.data) {
@@ -278,117 +389,279 @@ app.get('/api/media/details/:type/:id', async (req, res) => {
                 }
                 finalDetails.tmdb_details = tmdbData;
             } catch(tmdbError) {
-                console.error(`Nie udało się pobrać danych z TMDB dla ID ${tmdbIdToUse}: ${tmdbError.message}`);
+                console.error(`Failed to fetch TMDB details after retries: ${tmdbError.message}`);
+                finalDetails.tmdb_details = null;
+                finalDetails.tmdb_error = `Nie udało się pobrać szczegółów z TMDB: ${tmdbError.message}`;
             }
         }
+        
         res.json(finalDetails);
     } catch (error) {
         console.error(`Błąd podczas pobierania szczegółów dla ${type}/${id}:`, error.message);
-        res.status(500).json({ error: 'Nie udało się pobrać szczegółów.' });
+        res.status(500).json({ 
+            error: 'Nie udało się pobrać szczegółów.',
+            details: error.message 
+        });
     }
 });
 
 // --- ZOPTYMALIZOWANE ODŚWIEŻANIE MEDIÓW ---
 app.post('/api/media/refresh', async (req, res) => {
     let settings;
+    let transactionActive = false;
+    
     try {
         const rows = await dbAll(`SELECT key, value FROM settings`);
         settings = rows.reduce((acc, row) => ({...acc, [row.key]: row.value }), {});
     } catch (err) {
         return res.status(500).json({ error: 'Błąd odczytu ustawień.' });
     }
+    
     const { serverUrl, username, password, tmdbApi } = settings;
     if (!serverUrl || !username || !password || !tmdbApi) {
         return res.status(400).json({ error: 'Wszystkie ustawienia (Xtream i TMDB API) muszą być skonfigurowane.' });
     }
+    
     try {
         const xtreamBaseUrl = `${serverUrl}/player_api.php?username=${username}&password=${password}`;
         const tmdbBaseUrl = 'https://api.themoviedb.org/3';
         const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+        
         console.log('Pobieranie filmów i seriali z Xtream...');
-        const moviesRes = await axios.get(`${xtreamBaseUrl}&action=get_vod_streams`);
-        const seriesRes = await axios.get(`${xtreamBaseUrl}&action=get_series`);
-        const moviesList = Array.isArray(moviesRes.data) ? moviesRes.data.map(m => ({...m, stream_type: 'movie'})) : [];
-        const seriesList = Array.isArray(seriesRes.data) ? seriesRes.data.map(s => ({...s, stream_type: 'series', stream_id: s.series_id})) : [];
+        
+        // Pobierz dane z Xtream
+        let moviesList = [];
+        let seriesList = [];
+        
+        try {
+            console.log('Pobieranie filmów...');
+            const moviesRes = await axios.get(`${xtreamBaseUrl}&action=get_vod_streams`, {
+                timeout: 30000
+            });
+            moviesList = Array.isArray(moviesRes.data) ? moviesRes.data.map(m => ({...m, stream_type: 'movie'})) : [];
+            console.log(`Pobrano ${moviesList.length} filmów`);
+        } catch (error) {
+            console.error('Błąd pobierania filmów:', error.message);
+        }
+        
+        try {
+            console.log('Pobieranie seriali...');
+            const seriesRes = await axios.get(`${xtreamBaseUrl}&action=get_series`, {
+                timeout: 30000
+            });
+            seriesList = Array.isArray(seriesRes.data) ? seriesRes.data.map(s => ({...s, stream_type: 'series', stream_id: s.series_id})) : [];
+            console.log(`Pobrano ${seriesList.length} seriali`);
+        } catch (error) {
+            console.error('Błąd pobierania seriali:', error.message);
+        }
+        
         const incomingList = [...moviesList, ...seriesList];
         const incomingMediaSet = new Set(incomingList.map(item => `${item.stream_id}_${item.stream_type}`));
+        
         console.log('Pobieranie istniejących mediów z bazy danych...');
         const existingMedia = await dbAll('SELECT stream_id, stream_type FROM media');
         const existingMediaSet = new Set(existingMedia.map(m => `${m.stream_id}_${m.stream_type}`));
+        
         const itemsToAdd = incomingList.filter(item => !existingMediaSet.has(`${item.stream_id}_${item.stream_type}`));
-        const itemsToDelete = existingMedia.filter(m => !incomingMediaSet.has(`${m.stream_id}_${item.stream_type}`));
+        const itemsToDelete = existingMedia.filter(m => !incomingMediaSet.has(`${m.stream_id}_${m.stream_type}`));
+        
         console.log(`Nowych pozycji do dodania: ${itemsToAdd.length}`);
         console.log(`Starych pozycji do usunięcia: ${itemsToDelete.length}`);
+        
         if (itemsToAdd.length === 0 && itemsToDelete.length === 0) {
             return res.status(200).json({ message: 'Baza danych jest już aktualna. Nic nie zmieniono.' });
         }
+        
+        // Rozpocznij transakcję TYLKO jeśli mamy zmiany do wykonania
         await dbRun('BEGIN TRANSACTION');
+        transactionActive = true;
+        
+        // Usuń stare pozycje
         if (itemsToDelete.length > 0) {
+            console.log(`Usuwanie ${itemsToDelete.length} starych pozycji...`);
+            
             const deleteMediaStmt = db.prepare('DELETE FROM media WHERE stream_id = ? AND stream_type = ?');
             const deleteGenresStmt = db.prepare('DELETE FROM media_genres WHERE media_stream_id = ? AND media_stream_type = ?');
-            for (const item of itemsToDelete) {
-                await stmtRun(deleteMediaStmt, [item.stream_id, item.stream_type]);
-                await stmtRun(deleteGenresStmt, [item.stream_id, item.stream_type]);
+            const deleteFavoritesStmt = db.prepare('DELETE FROM favorites WHERE stream_id = ? AND stream_type = ?');
+            
+            try {
+                for (const item of itemsToDelete) {
+                    await stmtRun(deleteMediaStmt, [item.stream_id, item.stream_type]);
+                    await stmtRun(deleteGenresStmt, [item.stream_id, item.stream_type]);
+                    await stmtRun(deleteFavoritesStmt, [item.stream_id, item.stream_type]);
+                }
+            } finally {
+                deleteMediaStmt.finalize();
+                deleteGenresStmt.finalize();
+                deleteFavoritesStmt.finalize();
             }
-            deleteMediaStmt.finalize();
-            deleteGenresStmt.finalize();
         }
+        
+        // Dodaj nowe pozycje
         if (itemsToAdd.length > 0) {
+            console.log(`Dodawanie ${itemsToAdd.length} nowych pozycji...`);
+            
             const insertMediaSql = `INSERT OR REPLACE INTO media (stream_id, name, stream_icon, rating, tmdb_id, stream_type, container_extension) VALUES (?, ?, ?, ?, ?, ?, ?)`;
             const insertGenreSql = `INSERT OR IGNORE INTO genres (id, name) VALUES (?, ?)`;
             const insertMediaGenreSql = `INSERT OR IGNORE INTO media_genres (media_stream_id, media_stream_type, genre_id) VALUES (?, ?, ?)`;
+            
             const mediaStmt = db.prepare(insertMediaSql);
             const genreStmt = db.prepare(insertGenreSql);
             const mediaGenreStmt = db.prepare(insertMediaGenreSql);
-            let processedCount = 0;
-            for (const item of itemsToAdd) {
-                const tmdbId = item.tmdb;
-                await stmtRun(mediaStmt, [item.stream_id, item.name, item.stream_icon || item.cover, item.rating_5based || item.rating, tmdbId, item.stream_type, item.container_extension]);
-                if (tmdbId) {
-                    try {
-                        const tmdbType = item.stream_type === 'series' ? 'tv' : 'movie';
-                        const tmdbUrl = `${tmdbBaseUrl}/${tmdbType}/${tmdbId}?api_key=${tmdbApi}&language=pl-PL`;
-                        const tmdbRes = await axios.get(tmdbUrl);
-                        if (tmdbRes.data && tmdbRes.data.genres) {
-                            for (const genre of tmdbRes.data.genres) {
-                                await stmtRun(genreStmt, [genre.id, genre.name]);
-                                await stmtRun(mediaGenreStmt, [item.stream_id, item.stream_type, genre.id]);
+            
+            try {
+                let processedCount = 0;
+                for (const item of itemsToAdd) {
+                    const tmdbId = item.tmdb;
+                    await stmtRun(mediaStmt, [
+                        item.stream_id, 
+                        item.name, 
+                        item.stream_icon || item.cover, 
+                        item.rating_5based || item.rating, 
+                        tmdbId, 
+                        item.stream_type, 
+                        item.container_extension
+                    ]);
+                    
+                    // Pobierz gatunki z TMDB jeśli mamy ID
+                    if (tmdbId) {
+                        try {
+                            const tmdbType = item.stream_type === 'series' ? 'tv' : 'movie';
+                            const tmdbUrl = `${tmdbBaseUrl}/${tmdbType}/${tmdbId}?api_key=${tmdbApi}&language=pl-PL`;
+                            
+                            const tmdbRes = await axios.get(tmdbUrl, {
+                                timeout: 10000
+                            });
+                            
+                            if (tmdbRes.data && tmdbRes.data.genres) {
+                                for (const genre of tmdbRes.data.genres) {
+                                    await stmtRun(genreStmt, [genre.id, genre.name]);
+                                    await stmtRun(mediaGenreStmt, [item.stream_id, item.stream_type, genre.id]);
+                                }
                             }
+                            
+                            await delay(50); // Krótkie opóźnienie dla TMDB API
+                        } catch (tmdbError) {
+                            if (tmdbError.response && tmdbError.response.status !== 404) {
+                                console.warn(`Błąd TMDB dla ID ${tmdbId} (typ: ${item.stream_type}): ${tmdbError.response.status}`);
+                            }
+                            // Dodaj domyślny gatunek przy błędzie
+                            await stmtRun(mediaGenreStmt, [item.stream_id, item.stream_type, -1]);
                         }
-                        await delay(50);
-                    } catch (tmdbError) {
-                        if (tmdbError.response && tmdbError.response.status !== 404) {
-                            console.warn(`Błąd TMDB dla ID ${tmdbId} (typ: ${item.stream_type}): ${tmdbError.response.status}`);
-                        }
+                    } else {
+                        // Brak TMDB ID - dodaj domyślny gatunek
+                        await stmtRun(mediaGenreStmt, [item.stream_id, item.stream_type, -1]);
+                    }
+                    
+                    processedCount++;
+                    if (processedCount % 100 === 0) {
+                        console.log(`Przetworzono ${processedCount}/${itemsToAdd.length} nowych pozycji...`);
                     }
                 }
-                processedCount++;
-                if (processedCount % 100 === 0) {
-                    console.log(`Przetworzono ${processedCount}/${itemsToAdd.length} nowych pozycji...`);
-                }
+            } finally {
+                mediaStmt.finalize();
+                genreStmt.finalize();
+                mediaGenreStmt.finalize();
             }
-            mediaStmt.finalize();
-            genreStmt.finalize();
-            mediaGenreStmt.finalize();
         }
+        
+        // Zatwierdź transakcję
         await dbRun('COMMIT');
+        transactionActive = false;
+        
         const summary = `Synchronizacja zakończona. Dodano: ${itemsToAdd.length}, Usunięto: ${itemsToDelete.length}.`;
         console.log(summary);
         res.status(200).json({ message: summary });
+        
     } catch (error) {
         console.error('Błąd podczas odświeżania listy mediów:', error.message);
-        await dbRun('ROLLBACK');
-        res.status(500).json({ error: `Nie udało się pobrać lub przetworzyć listy. Błąd: ${error.message}` });
+        
+        // Wycofaj transakcję tylko jeśli jest aktywna
+        if (transactionActive) {
+            try {
+                await dbRun('ROLLBACK');
+            } catch (rollbackError) {
+                console.error('Błąd podczas rollback:', rollbackError.message);
+            }
+        }
+        
+        res.status(500).json({ 
+            error: `Nie udało się pobrać lub przetworzyć listy. Błąd: ${error.message}` 
+        });
     }
 });
 
 // --- API POBIERANIA ---
 app.get('/api/downloads/status', async (req, res) => {
     try {
-        const downloads = await dbAll('SELECT * FROM downloads ORDER BY added_at DESC LIMIT 10');
-        res.json(downloads);
+        // Pobierz z bazy danych z dodatkowymi kolumnami
+        const downloads = await dbAll(`
+            SELECT 
+                id, stream_id, stream_type, episode_id, filename, filepath,
+                status, worker_status, progress, error_message, download_url,
+                added_at
+            FROM downloads 
+            ORDER BY added_at DESC 
+            LIMIT 50
+        `);
+        
+        // Dodaj logi pobierania jeśli istnieją
+        const downloadsWithLogs = await Promise.all(downloads.map(async (download) => {
+            try {
+                const logs = await dbAll(`
+                    SELECT timestamp, level, message 
+                    FROM download_logs 
+                    WHERE download_id = ? 
+                    ORDER BY timestamp DESC 
+                    LIMIT 10
+                `, [download.id]);
+                
+                return {
+                    ...download,
+                    logs: logs
+                };
+            } catch (logError) {
+                return download; // Zwróć bez logów jeśli błąd
+            }
+        }));
+        
+        res.json(downloadsWithLogs);
     } catch (error) {
+        console.error("Błąd pobierania statusu:", error);
         res.status(500).json({ error: 'Błąd pobierania statusu.' });
+    }
+});
+
+// Nowy endpoint do statystyk download managera
+app.get('/api/downloads/statistics', async (req, res) => {
+    try {
+        const stats = await dbAll(`
+            SELECT 
+                COUNT(*) as total,
+                SUM(CASE WHEN worker_status = 'queued' THEN 1 ELSE 0 END) as queued,
+                SUM(CASE WHEN worker_status = 'downloading' THEN 1 ELSE 0 END) as downloading,
+                SUM(CASE WHEN worker_status = 'completed' THEN 1 ELSE 0 END) as completed,
+                SUM(CASE WHEN worker_status = 'failed' THEN 1 ELSE 0 END) as failed
+            FROM downloads
+        `);
+        
+        const recentActivity = await dbAll(`
+            SELECT 
+                dl.timestamp, dl.level, dl.message, dl.download_id,
+                d.filename
+            FROM download_logs dl
+            LEFT JOIN downloads d ON dl.download_id = d.id
+            ORDER BY dl.timestamp DESC 
+            LIMIT 20
+        `);
+        
+        res.json({
+            statistics: stats[0],
+            recent_activity: recentActivity
+        });
+    } catch (error) {
+        console.error("Błąd pobierania statystyk:", error);
+        res.status(500).json({ error: 'Błąd pobierania statystyk.' });
     }
 });
 
@@ -399,9 +672,9 @@ app.post('/api/downloads/start', async (req, res) => {
     }
     try {
         await dbRun('BEGIN TRANSACTION');
-        const stmt = db.prepare('INSERT OR IGNORE INTO downloads (stream_id, stream_type, episode_id, filename, status) VALUES (?, ?, ?, ?, ?)');
+        const stmt = db.prepare('INSERT OR IGNORE INTO downloads (stream_id, stream_type, episode_id, filename, status, worker_status) VALUES (?, ?, ?, ?, ?, ?)');
         for (const episode of episodes) {
-            await stmtRun(stmt, [stream_id, stream_type, episode.id, episode.filename, 'queued']);
+            await stmtRun(stmt, [stream_id, stream_type, episode.id, episode.filename, 'queued', 'queued']);
         }
         stmt.finalize();
         await dbRun('COMMIT');
@@ -430,6 +703,7 @@ app.post('/api/downloads/remove/:id', async (req, res) => {
             activeDownloads.get(parseInt(id)).kill('SIGKILL');
             activeDownloads.delete(parseInt(id));
         }
+        
         // Usuń z kolejki w pamięci
         downloadQueue = downloadQueue.filter(job => job.id != id);
 
@@ -437,7 +711,7 @@ app.post('/api/downloads/remove/:id', async (req, res) => {
         const jobToDelete = await dbAll('SELECT * FROM downloads WHERE id = ?', [id]);
         
         // Sprawdź, czy zadanie istnieje i czy plik nie został w pełni pobrany
-        if (jobToDelete.length > 0 && jobToDelete[0].filepath && jobToDelete[0].status !== 'completed') {
+        if (jobToDelete.length > 0 && jobToDelete[0].filepath && jobToDelete[0].worker_status !== 'completed') {
             const { filepath } = jobToDelete[0];
             if (fs.existsSync(filepath)) {
                 console.log(`Usuwanie niekompletnego pliku: ${filepath}`);
@@ -449,16 +723,15 @@ app.post('/api/downloads/remove/:id', async (req, res) => {
                         fs.rmdirSync(dir);
                     }
                 } catch (e) {
-                    // Ignoruj błąd, jeśli folder nie jest pusty (np. z powodu innego pobierania)
                     console.warn(`Nie można usunąć folderu ${path.dirname(filepath)}, prawdopodobnie nie jest pusty.`);
                 }
             }
-        } else if (jobToDelete.length > 0 && jobToDelete[0].status === 'completed') {
-            console.log(`Zadanie ${id} jest ukończone. Plik nie zostanie usunięty.`);
         }
 
-        // Zawsze usuwaj wpis z bazy danych
+        // Usuń wpis z bazy danych wraz z logami
+        await dbRun('DELETE FROM download_logs WHERE download_id = ?', [id]);
         await dbRun('DELETE FROM downloads WHERE id = ?', [id]);
+        
         res.status(200).json({ message: 'Zadanie usunięte z listy.' });
     } catch (error) {
         console.error(`Błąd usuwania zadania ${id}:`, error);
@@ -466,6 +739,100 @@ app.post('/api/downloads/remove/:id', async (req, res) => {
     }
 });
 
+// --- Endpoint do uruchamiania download manager daemon ---
+app.post('/api/downloads/start-daemon', async (req, res) => {
+    try {
+        if (downloadManagerProcess && !downloadManagerProcess.killed) {
+            return res.status(400).json({ error: 'Download Manager już działa' });
+        }
+        
+        console.log('Uruchamianie Download Manager w trybie daemon...');
+        
+        downloadManagerProcess = spawn('python3', ['download_manager.py', '--daemon'], {
+            cwd: __dirname,
+            stdio: ['ignore', 'pipe', 'pipe']
+        });
+        
+        downloadManagerProcess.stdout.on('data', (data) => {
+            console.log(`[Download Manager] ${data.toString().trim()}`);
+        });
+        
+        downloadManagerProcess.stderr.on('data', (data) => {
+            console.error(`[Download Manager Error] ${data.toString().trim()}`);
+        });
+        
+        downloadManagerProcess.on('close', (code) => {
+            console.log(`Download Manager zatrzymany z kodem: ${code}`);
+            downloadManagerProcess = null;
+        });
+        
+        downloadManagerProcess.on('error', (error) => {
+            console.error('Błąd uruchamiania Download Manager:', error);
+            downloadManagerProcess = null;
+        });
+        
+        // Czekaj chwilę aby upewnić się że proces się uruchomił
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        
+        if (downloadManagerProcess && !downloadManagerProcess.killed) {
+            res.json({ message: 'Download Manager uruchomiony pomyślnie', pid: downloadManagerProcess.pid });
+        } else {
+            res.status(500).json({ error: 'Nie udało się uruchomić Download Manager' });
+        }
+        
+    } catch (error) {
+        console.error('Błąd uruchamiania daemon:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Endpoint do zatrzymywania download manager daemon
+app.post('/api/downloads/stop-daemon', async (req, res) => {
+    try {
+        if (!downloadManagerProcess || downloadManagerProcess.killed) {
+            return res.status(400).json({ error: 'Download Manager nie działa' });
+        }
+        
+        console.log('Zatrzymywanie Download Manager...');
+        
+        // Wyślij SIGTERM dla graceful shutdown
+        downloadManagerProcess.kill('SIGTERM');
+        
+        // Czekaj na zakończenie procesu
+        await new Promise((resolve) => {
+            const timeout = setTimeout(() => {
+                // Jeśli nie zakończył się po 10s, wymuś zabicie
+                if (downloadManagerProcess && !downloadManagerProcess.killed) {
+                    downloadManagerProcess.kill('SIGKILL');
+                }
+                resolve();
+            }, 10000);
+            
+            downloadManagerProcess.on('close', () => {
+                clearTimeout(timeout);
+                resolve();
+            });
+        });
+        
+        downloadManagerProcess = null;
+        res.json({ message: 'Download Manager zatrzymany' });
+        
+    } catch (error) {
+        console.error('Błąd zatrzymywania daemon:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Endpoint do sprawdzania statusu daemon
+app.get('/api/downloads/daemon-status', (req, res) => {
+    const isRunning = downloadManagerProcess && !downloadManagerProcess.killed;
+    
+    res.json({
+        is_running: isRunning,
+        pid: isRunning ? downloadManagerProcess.pid : null,
+        uptime: isRunning ? Date.now() - downloadManagerProcess.spawntime : 0
+    });
+});
 
 async function processDownloadQueue() {
     if (isProcessing || downloadQueue.length === 0) {
@@ -473,13 +840,17 @@ async function processDownloadQueue() {
     }
     isProcessing = true;
     const job = downloadQueue.shift();
+    
     try {
-        await dbRun('UPDATE downloads SET status = ? WHERE id = ?', ['downloading', job.id]);
+        // Aktualizuj status w bazie
+        await dbRun('UPDATE downloads SET status = ?, worker_status = ? WHERE id = ?', 
+                    ['downloading', 'downloading', job.id]);
 
         const settingsRows = await dbAll(`SELECT key, value FROM settings`);
         const settings = settingsRows.reduce((acc, row) => ({...acc, [row.key]: row.value }), {});
         const { serverUrl, username, password } = settings;
         
+        // Pobierz szczegóły media
         const mediaDetailsRes = await axios.get(`http://localhost:${PORT}/api/media/details/${job.stream_type}/${job.stream_id}`);
         const { tmdb_details, xtream_details } = mediaDetailsRes.data;
         
@@ -501,47 +872,65 @@ async function processDownloadQueue() {
                 folderPath = path.join(folderPath, `Season ${String(episodeData.season).padStart(2, '0')}`);
             }
         }
-        fs.mkdirSync(folderPath, { recursive: true });
         
         const safeFilename = `${job.filename.replace(/\.mp4$/, '')}.${extension}`;
         const filePath = path.join(folderPath, safeFilename);
         const downloadUrl = `${serverUrl}/${job.stream_type}/${username}/${password}/${job.episode_id}.${extension}`;
 
-        await dbRun('UPDATE downloads SET filename = ?, filepath = ? WHERE id = ?', [safeFilename, filePath, job.id]);
+        // Aktualizuj szczegóły w bazie z URL pobierania
+        await dbRun('UPDATE downloads SET filename = ?, filepath = ?, download_url = ? WHERE id = ?', 
+                    [safeFilename, filePath, downloadUrl, job.id]);
         
-        const command = `python3 download.py "${downloadUrl}" "${filePath}"`;
-        console.log(`Uruchamianie polecenia: python3 download.py ...`);
+        console.log(`Starting download job ${job.id}: ${safeFilename}`);
 
+        // Użyj download_manager.py
         await new Promise((resolve, reject) => {
-            const pythonProcess = spawn('python3', ['download.py', downloadUrl, filePath]);
+            const pythonProcess = spawn('python3', ['download_manager.py', downloadUrl, filePath]);
             activeDownloads.set(job.id, pythonProcess);
 
+            let stdoutData = '';
+            let stderrData = '';
+
             pythonProcess.stdout.on('data', (data) => {
-                console.log(`[Python] stdout: ${data}`);
+                stdoutData += data.toString();
+                console.log(`[Download ${job.id}] ${data.toString().trim()}`);
             });
 
             pythonProcess.stderr.on('data', (data) => {
-                console.error(`[Python] stderr: ${data}`);
+                stderrData += data.toString();
+                console.error(`[Download ${job.id} Error] ${data.toString().trim()}`);
             });
 
             pythonProcess.on('close', (code) => {
-                if (code === 0) {
+                console.log(`Download ${job.id} finished with code: ${code}`);
+                
+                if (code === 0 || stdoutData.includes('SUCCESS')) {
                     resolve();
                 } else {
-                    reject(new Error(`Skrypt Pythona zakończył działanie z kodem ${code}`));
+                    reject(new Error(`Download failed with code ${code}. Error: ${stderrData}`));
                 }
+            });
+
+            pythonProcess.on('error', (error) => {
+                console.error(`Download ${job.id} process error:`, error);
+                reject(error);
             });
         });
 
-        await dbRun('UPDATE downloads SET status = ?, progress = 100 WHERE id = ?', ['completed', job.id]);
+        // Oznacz jako ukończone
+        await dbRun('UPDATE downloads SET status = ?, worker_status = ?, progress = 100 WHERE id = ?', 
+                    ['completed', 'completed', job.id]);
+        console.log(`✅ Download completed for job ${job.id}`);
 
     } catch (error) {
         console.error(`Błąd przetwarzania zadania ${job.id}:`, error);
-        await dbRun('UPDATE downloads SET status = ?, error_message = ? WHERE id = ?', ['failed', error.message, job.id]);
+        await dbRun('UPDATE downloads SET status = ?, worker_status = ?, error_message = ? WHERE id = ?', 
+                    ['failed', 'failed', error.message, job.id]);
     } finally {
         activeDownloads.delete(job.id);
         isProcessing = false;
-        processDownloadQueue();
+        // Kontynuuj przetwarzanie kolejki
+        setTimeout(processDownloadQueue, 1000);
     }
 }
 
@@ -605,9 +994,61 @@ async function monitorFavorites() {
     }
 }
 
+// Auto-start download manager przy starcie serwera
+async function autoStartDownloadManager() {
+    try {
+        console.log('Auto-uruchamianie Download Manager...');
+        
+        downloadManagerProcess = spawn('python3', ['download_manager.py', '--daemon'], {
+            cwd: __dirname,
+            stdio: ['ignore', 'pipe', 'pipe']
+        });
+        
+        downloadManagerProcess.stdout.on('data', (data) => {
+            console.log(`[Download Manager] ${data.toString().trim()}`);
+        });
+        
+        downloadManagerProcess.stderr.on('data', (data) => {
+            console.error(`[Download Manager Error] ${data.toString().trim()}`);
+        });
+        
+        downloadManagerProcess.on('close', (code) => {
+            console.log(`Download Manager zatrzymany z kodem: ${code}`);
+            downloadManagerProcess = null;
+            
+            // Auto-restart po 30 sekundach jeśli unexpected shutdown
+            if (code !== 0) {
+                console.log('Nieprzewidziany błąd Download Manager, restart za 30s...');
+                setTimeout(autoStartDownloadManager, 30000);
+            }
+        });
+        
+        downloadManagerProcess.on('error', (error) => {
+            console.error('Błąd auto-uruchamiania Download Manager:', error);
+            downloadManagerProcess = null;
+        });
+        
+        console.log(`Download Manager uruchomiony automatycznie (PID: ${downloadManagerProcess.pid})`);
+        
+    } catch (error) {
+        console.error('Błąd auto-uruchamiania Download Manager:', error);
+    }
+}
 
-app.listen(PORT, () => {
-    console.log(`Serwer backendu działa na porcie ${PORT}`);
+// Graceful shutdown download manager przy zamykaniu serwera
+process.on('SIGTERM', () => {
+    if (downloadManagerProcess && !downloadManagerProcess.killed) {
+        console.log('Zatrzymywanie Download Manager...');
+        downloadManagerProcess.kill('SIGTERM');
+    }
+});
+
+process.on('SIGINT', () => {
+    if (downloadManagerProcess && !downloadManagerProcess.killed) {
+        console.log('Zatrzymywanie Download Manager...');
+        downloadManagerProcess.kill('SIGTERM');
+    }
+    process.exit(0);
 });
 
 // --- Uzupełnianie brakujących danych w tle ---
@@ -688,6 +1129,13 @@ async function backfillTmdbGenres(limit = 50) {
         console.error('Wystąpił krytyczny błąd w zadaniu uzupełniania:', error.message);
     }
 }
+
+app.listen(PORT, () => {
+    console.log(`Serwer backendu działa na porcie ${PORT}`);
+    
+    // Auto-start Download Manager po uruchomieniu serwera
+    setTimeout(autoStartDownloadManager, 3000); // Czekaj 3s na inicjalizację bazy
+});
 
 cron.schedule('0 * * * *', async () => { // Uruchamia się co godzinę
     console.log('Uruchamianie zaplanowanych zadań...');

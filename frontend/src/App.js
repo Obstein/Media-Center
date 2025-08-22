@@ -51,7 +51,7 @@ const MediaCard = ({ item, isFavorite, onToggleFavorite }) => (
 );
 
 // --- Komponent Widgetu Pobierania ---
-const DownloadWidget = ({ downloads, onRemove, onClose, isOpen }) => {
+/* const DownloadWidget = ({ downloads, onRemove, onClose, isOpen }) => {
     if (!isOpen || downloads.length === 0) return null;
 
     return (
@@ -88,7 +88,220 @@ const DownloadWidget = ({ downloads, onRemove, onClose, isOpen }) => {
         </div>
     );
 };
+*/
+// Zaktualizowany komponent DownloadWidget w App.js
 
+const DownloadWidget = ({ downloads, onRemove, onClose, isOpen }) => {
+    const [statistics, setStatistics] = useState(null);
+    const [daemonStatus, setDaemonStatus] = useState(null);
+
+    // Pobierz statystyki i status daemon
+    useEffect(() => {
+        if (isOpen) {
+            const fetchStats = async () => {
+                try {
+                    const [statsResponse, daemonResponse] = await Promise.all([
+                        axios.get('/api/downloads/statistics'),
+                        axios.get('/api/downloads/daemon-status')
+                    ]);
+                    setStatistics(statsResponse.data);
+                    setDaemonStatus(daemonResponse.data);
+                } catch (error) {
+                    console.error('Błąd pobierania statystyk pobierania:', error);
+                }
+            };
+            
+            fetchStats();
+            const interval = setInterval(fetchStats, 5000);
+            return () => clearInterval(interval);
+        }
+    }, [isOpen]);
+
+    const handleStartDaemon = async () => {
+        try {
+            await axios.post('/api/downloads/start-daemon');
+            // Odśwież status po chwili
+            setTimeout(async () => {
+                const response = await axios.get('/api/downloads/daemon-status');
+                setDaemonStatus(response.data);
+            }, 2000);
+        } catch (error) {
+            console.error('Błąd uruchamiania daemon:', error);
+        }
+    };
+
+    const handleStopDaemon = async () => {
+        try {
+            await axios.post('/api/downloads/stop-daemon');
+            // Odśwież status po chwili
+            setTimeout(async () => {
+                const response = await axios.get('/api/downloads/daemon-status');
+                setDaemonStatus(response.data);
+            }, 2000);
+        } catch (error) {
+            console.error('Błąd zatrzymywania daemon:', error);
+        }
+    };
+
+    if (!isOpen) return null;
+
+    const getStatusIcon = (status, workerStatus) => {
+        if (workerStatus === 'downloading') return '⏳';
+        if (workerStatus === 'completed') return '✅';
+        if (workerStatus === 'failed') return '❌';
+        return '⏸️';
+    };
+
+    const getStatusText = (status, workerStatus) => {
+        if (workerStatus === 'downloading') return 'Pobieranie...';
+        if (workerStatus === 'completed') return 'Ukończone';
+        if (workerStatus === 'failed') return 'Błąd';
+        if (workerStatus === 'queued') return 'W kolejce';
+        return status;
+    };
+
+    return (
+        <div className="fixed bottom-4 right-4 w-96 bg-gray-800 rounded-lg shadow-2xl border border-gray-700 z-50 max-h-96 overflow-hidden">
+            <div className="p-4">
+                <div className="flex justify-between items-center mb-3">
+                    <h4 className="font-bold text-lg text-white">Download Manager</h4>
+                    <button onClick={onClose} className="text-gray-400 hover:text-white text-xl">&times;</button>
+                </div>
+
+                {/* Status Daemon */}
+                {daemonStatus && (
+                    <div className="mb-3 p-2 bg-gray-700 rounded">
+                        <div className="flex justify-between items-center">
+                            <span className="text-sm text-gray-300">
+                                Daemon: {daemonStatus.is_running ? 
+                                    <span className="text-green-400">🟢 Aktywny</span> : 
+                                    <span className="text-red-400">🔴 Zatrzymany</span>
+                                }
+                            </span>
+                            <div className="flex gap-2">
+                                {!daemonStatus.is_running ? (
+                                    <button 
+                                        onClick={handleStartDaemon}
+                                        className="px-2 py-1 text-xs bg-green-600 hover:bg-green-700 text-white rounded"
+                                    >
+                                        Start
+                                    </button>
+                                ) : (
+                                    <button 
+                                        onClick={handleStopDaemon}
+                                        className="px-2 py-1 text-xs bg-red-600 hover:bg-red-700 text-white rounded"
+                                    >
+                                        Stop
+                                    </button>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {/* Statystyki */}
+                {statistics && (
+                    <div className="mb-3 grid grid-cols-4 gap-2 text-xs">
+                        <div className="bg-blue-900/50 p-2 rounded text-center">
+                            <div className="text-blue-300 font-semibold">{statistics.statistics.queued}</div>
+                            <div className="text-gray-400">Kolejka</div>
+                        </div>
+                        <div className="bg-yellow-900/50 p-2 rounded text-center">
+                            <div className="text-yellow-300 font-semibold">{statistics.statistics.downloading}</div>
+                            <div className="text-gray-400">Pobiera</div>
+                        </div>
+                        <div className="bg-green-900/50 p-2 rounded text-center">
+                            <div className="text-green-300 font-semibold">{statistics.statistics.completed}</div>
+                            <div className="text-gray-400">Gotowe</div>
+                        </div>
+                        <div className="bg-red-900/50 p-2 rounded text-center">
+                            <div className="text-red-300 font-semibold">{statistics.statistics.failed}</div>
+                            <div className="text-gray-400">Błędy</div>
+                        </div>
+                    </div>
+                )}
+
+                {/* Lista aktywnych pobierań */}
+                <div className="max-h-64 overflow-y-auto">
+                    {downloads.length === 0 ? (
+                        <p className="text-gray-400 text-sm text-center py-4">Brak aktywnych pobierań</p>
+                    ) : (
+                        <ul className="space-y-2 text-sm">
+                            {downloads.slice(0, 10).map(d => (
+                                <li key={d.id} className="bg-gray-700 p-2 rounded">
+                                    <div className="flex justify-between items-center mb-1">
+                                        <span className="truncate text-gray-300 flex-1">
+                                            {getStatusIcon(d.status, d.worker_status)} {d.filename}
+                                        </span>
+                                        <div className="flex items-center gap-2 ml-2">
+                                            <span className={`text-xs font-semibold ${
+                                                d.worker_status === 'failed' ? 'text-red-400' : 
+                                                d.worker_status === 'completed' ? 'text-green-400' :
+                                                d.worker_status === 'downloading' ? 'text-blue-400' :
+                                                'text-gray-400'
+                                            }`}>
+                                                {getStatusText(d.status, d.worker_status)}
+                                            </span>
+                                            <button 
+                                                onClick={() => onRemove(d.id)} 
+                                                className="text-gray-500 hover:text-white text-lg"
+                                                title="Usuń z listy"
+                                            >
+                                                &times;
+                                            </button>
+                                        </div>
+                                    </div>
+                                    
+                                    {/* Progress bar dla pobierania */}
+                                    {d.worker_status === 'downloading' && (
+                                        <div className="w-full bg-gray-600 rounded-full h-1.5 animate-pulse">
+                                            <div className="bg-blue-500 h-1.5 rounded-full" style={{width: `${d.progress || 30}%`}}></div>
+                                        </div>
+                                    )}
+                                    
+                                    {/* Błąd */}
+                                    {d.error_message && (
+                                        <div className="text-red-400 text-xs mt-1 truncate" title={d.error_message}>
+                                            {d.error_message}
+                                        </div>
+                                    )}
+                                    
+                                    {/* URL (do debugowania) */}
+                                    {d.download_url && (
+                                        <div className="text-gray-500 text-xs mt-1 truncate" title={d.download_url}>
+                                            {new URL(d.download_url).hostname}
+                                        </div>
+                                    )}
+                                </li>
+                            ))}
+                        </ul>
+                    )}
+                </div>
+
+                {/* Ostatnia aktywność */}
+                {statistics?.recent_activity && statistics.recent_activity.length > 0 && (
+                    <div className="mt-3 pt-3 border-t border-gray-600">
+                        <h5 className="text-xs font-semibold text-gray-400 mb-2">Ostatnia aktywność</h5>
+                        <div className="max-h-20 overflow-y-auto text-xs space-y-1">
+                            {statistics.recent_activity.slice(0, 5).map((log, idx) => (
+                                <div key={idx} className="text-gray-500">
+                                    <span className={`
+                                        ${log.level === 'ERROR' ? 'text-red-400' : 
+                                          log.level === 'SUCCESS' ? 'text-green-400' : 
+                                          log.level === 'WARNING' ? 'text-yellow-400' : 
+                                          'text-gray-400'}
+                                    `}>
+                                        {log.level}
+                                    </span>: {log.message.substring(0, 50)}...
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+};
 // --- Komponent Widoku Szczegółów ---
 const DetailsView = ({ type, id, favorites, onToggleFavorite, onDownload }) => {
     const [details, setDetails] = useState(null);
