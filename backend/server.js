@@ -202,6 +202,175 @@ async function sendDiscordNotification(message) {
 app.use(cors());
 app.use(express.json());
 
+
+// Dodaj te endpoint'y do server.js
+
+// --- API: Ręczna synchronizacja TMDB ---
+app.post('/api/tmdb/sync', async (req, res) => {
+    const { limit = 100 } = req.body;
+    
+    try {
+        let settings;
+        try {
+            const rows = await dbAll(`SELECT key, value FROM settings WHERE key = 'tmdbApi'`);
+            if (rows.length === 0 || !rows[0].value) {
+                return res.status(400).json({ error: 'Brak klucza API do TMDB w ustawieniach.' });
+            }
+            settings = { tmdbApi: rows[0].value };
+        } catch (err) {
+            return res.status(500).json({ error: 'Błąd odczytu ustawień.' });
+        }
+
+        // Sprawdź ile pozycji potrzebuje aktualizacji
+        const itemsToUpdate = await dbAll(`
+            SELECT m.stream_id, m.tmdb_id, m.stream_type, m.name
+            FROM media m
+            LEFT JOIN media_genres mg ON m.stream_id = mg.media_stream_id AND m.stream_type = mg.media_stream_type
+            WHERE m.tmdb_id IS NOT NULL AND m.tmdb_id != '' AND mg.genre_id IS NULL
+            GROUP BY m.stream_id, m.stream_type
+            LIMIT ?
+        `, [limit]);
+
+        if (itemsToUpdate.length === 0) {
+            return res.json({ 
+                message: 'Wszystkie pozycje mają już przypisane gatunki TMDB.',
+                processed: 0,
+                total: 0
+            });
+        }
+
+        console.log(`Ręczna synchronizacja TMDB: ${itemsToUpdate.length} pozycji do zaktualizowania`);
+
+        const tmdbBaseUrl = 'https://api.themoviedb.org/3';
+        const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+        
+        const insertGenreSql = `INSERT OR IGNORE INTO genres (id, name) VALUES (?, ?)`;
+        const insertMediaGenreSql = `INSERT OR IGNORE INTO media_genres (media_stream_id, media_stream_type, genre_id) VALUES (?, ?, ?)`;
+        
+        const genreStmt = db.prepare(insertGenreSql);
+        const mediaGenreStmt = db.prepare(insertMediaGenreSql);
+
+        let processed = 0;
+        let errors = 0;
+
+        for (const item of itemsToUpdate) {
+            const tmdbId = item.tmdb_id;
+            try {
+                const tmdbType = item.stream_type === 'series' ? 'tv' : 'movie';
+                const tmdbUrl = `${tmdbBaseUrl}/${tmdbType}/${tmdbId}?api_key=${settings.tmdbApi}&language=pl-PL`;
+                
+                console.log(`Pobieranie TMDB dla: ${item.name} (ID: ${tmdbId})`);
+                const tmdbRes = await axios.get(tmdbUrl, { timeout: 10000 });
+                
+                if (tmdbRes.data && tmdbRes.data.genres && tmdbRes.data.genres.length > 0) {
+                    console.log(`✅ Pobrano ${tmdbRes.data.genres.length} gatunków dla: ${item.name}`);
+                    for (const genre of tmdbRes.data.genres) {
+                        await stmtRun(genreStmt, [genre.id, genre.name]);
+                        await stmtRun(mediaGenreStmt, [item.stream_id, item.stream_type, genre.id]);
+                    }
+                } else {
+                    console.log(`⚠️ Brak gatunków dla: ${item.name}, dodaję domyślny`);
+                    await stmtRun(mediaGenreStmt, [item.stream_id, item.stream_type, -1]);
+                }
+                
+                processed++;
+                await delay(100); // Opóźnienie dla TMDB API
+                
+            } catch (tmdbError) {
+                errors++;
+                if (tmdbError.response && tmdbError.response.status === 404) {
+                    console.warn(`❌ TMDB ID ${tmdbId} nie znaleziono (404) dla: ${item.name}`);
+                    await stmtRun(mediaGenreStmt, [item.stream_id, item.stream_type, -1]);
+                } else {
+                    console.error(`❌ Błąd TMDB dla ${item.name} (ID: ${tmdbId}): ${tmdbError.message}`);
+                    // Dodaj domyślny gatunek przy błędzie
+                    await stmtRun(mediaGenreStmt, [item.stream_id, item.stream_type, -1]);
+                }
+            }
+        }
+        
+        genreStmt.finalize();
+        mediaGenreStmt.finalize();
+        
+        const summary = `Synchronizacja TMDB zakończona. Przetworzono: ${processed}/${itemsToUpdate.length}, Błędy: ${errors}`;
+        console.log(summary);
+        
+        res.json({
+            message: summary,
+            processed: processed,
+            total: itemsToUpdate.length,
+            errors: errors
+        });
+
+    } catch (error) {
+        console.error('Błąd synchronizacji TMDB:', error.message);
+        res.status(500).json({ error: `Błąd synchronizacji TMDB: ${error.message}` });
+    }
+});
+
+// --- API: Status synchronizacji TMDB ---
+// Poprawiona wersja endpoint'u /api/tmdb/status
+
+// --- API: Status synchronizacji TMDB ---
+app.get('/api/tmdb/status', async (req, res) => {
+    try {
+        // Sprawdź ile pozycji bez gatunków
+        const withoutGenres = await dbAll(`
+            SELECT COUNT(*) as count
+            FROM media m
+            LEFT JOIN media_genres mg ON m.stream_id = mg.media_stream_id AND m.stream_type = mg.media_stream_type
+            WHERE m.tmdb_id IS NOT NULL AND m.tmdb_id != '' AND mg.genre_id IS NULL
+        `);
+
+        // Sprawdź ile pozycji z gatunkami - POPRAWIONA WERSJA dla SQLite
+        const withGenres = await dbAll(`
+            SELECT COUNT(*) as count
+            FROM (
+                SELECT DISTINCT m.stream_id, m.stream_type
+                FROM media m
+                JOIN media_genres mg ON m.stream_id = mg.media_stream_id AND m.stream_type = mg.media_stream_type
+                WHERE m.tmdb_id IS NOT NULL AND m.tmdb_id != '' AND mg.genre_id != -1
+            ) as distinct_media
+        `);
+
+        // Sprawdź ile pozycji bez TMDB ID
+        const withoutTmdb = await dbAll(`
+            SELECT COUNT(*) as count
+            FROM media m
+            WHERE m.tmdb_id IS NULL OR m.tmdb_id = ''
+        `);
+
+        // Sprawdź ostatnie gatunki
+        const recentGenres = await dbAll(`
+            SELECT g.name, COUNT(*) as count
+            FROM genres g
+            JOIN media_genres mg ON g.id = mg.genre_id
+            WHERE g.id != -1
+            GROUP BY g.id, g.name
+            ORDER BY COUNT(*) DESC
+            LIMIT 10
+        `);
+
+        // Sprawdź całkowitą liczbę pozycji w bazie
+        const totalMedia = await dbAll(`
+            SELECT COUNT(*) as count
+            FROM media
+        `);
+
+        res.json({
+            without_genres: withoutGenres[0].count,
+            with_genres: withGenres[0].count,
+            without_tmdb_id: withoutTmdb[0].count,
+            total_media: totalMedia[0].count,
+            top_genres: recentGenres
+        });
+
+    } catch (error) {
+        console.error('Błąd pobierania statusu TMDB:', error);
+        res.status(500).json({ error: 'Błąd pobierania statusu TMDB.' });
+    }
+});
+
 // --- API: Image Proxy ---
 app.get('/api/image-proxy', async (req, res) => {
     const { url } = req.query;
@@ -850,10 +1019,43 @@ async function processDownloadQueue() {
         const settings = settingsRows.reduce((acc, row) => ({...acc, [row.key]: row.value }), {});
         const { serverUrl, username, password } = settings;
         
-        // Pobierz szczegóły media
+        // NOWA LOGIKA: Najpierw pobierz szczegóły, potem generuj URL z prawidłowym rozszerzeniem
+        console.log(`Fetching media details for ${job.stream_type} ID: ${job.stream_id}`);
         const mediaDetailsRes = await axios.get(`http://localhost:${PORT}/api/media/details/${job.stream_type}/${job.stream_id}`);
         const { tmdb_details, xtream_details } = mediaDetailsRes.data;
         
+        // Określ prawidłowe rozszerzenie NA PODSTAWIE DANYCH Z XTREAM
+        let extension = 'mp4'; // domyślne
+        let downloadUrl;
+        
+        if (job.stream_type === 'movie') {
+            // Dla filmów: weź rozszerzenie z container_extension w info
+            extension = xtream_details?.info?.container_extension || 'mp4';
+            
+            // Generuj URL z prawidłowym rozszerzeniem
+            downloadUrl = `${serverUrl}/movie/${username}/${password}/${job.stream_id}.${extension}`;
+            
+            console.log(`🎬 MOVIE URL WITH CORRECT EXTENSION:`);
+            console.log(`  - Stream ID: ${job.stream_id}`);
+            console.log(`  - Container Extension from Xtream: ${xtream_details?.info?.container_extension}`);
+            console.log(`  - Final Extension: ${extension}`);
+            console.log(`  - Final URL: ${downloadUrl}`);
+            
+        } else {
+            // Dla seriali: znajdź konkretny odcinek i weź jego rozszerzenie
+            const episodeData = Object.values(xtream_details.episodes).flat().find(ep => ep.id == job.episode_id);
+            extension = episodeData?.container_extension || 'mp4';
+            
+            downloadUrl = `${serverUrl}/series/${username}/${password}/${job.episode_id}.${extension}`;
+            
+            console.log(`📺 SERIES URL:`);
+            console.log(`  - Episode ID: ${job.episode_id}`);
+            console.log(`  - Episode Extension: ${episodeData?.container_extension}`);
+            console.log(`  - Final Extension: ${extension}`);
+            console.log(`  - Final URL: ${downloadUrl}`);
+        }
+        
+        // Reszta logiki nazewnictwa plików
         const title = tmdb_details?.title || tmdb_details?.name || xtream_details?.info?.name || job.filename;
         const year = (tmdb_details?.release_date || tmdb_details?.first_air_date || xtream_details?.info?.releasedate)?.substring(0, 4) || 'UnknownYear';
         
@@ -862,26 +1064,23 @@ async function processDownloadQueue() {
             ? path.join('/downloads/movies', `${safeName} (${year})`)
             : path.join('/downloads/series', `${safeName} (${year})`);
         
-        let extension = 'mp4';
-        if (job.stream_type === 'movie') {
-            extension = xtream_details?.info?.container_extension || extension;
-        } else {
+        // Dla seriali dodaj folder sezonu
+        if (job.stream_type === 'series') {
             const episodeData = Object.values(xtream_details.episodes).flat().find(ep => ep.id == job.episode_id);
-            extension = episodeData?.container_extension || extension;
             if (episodeData?.season) {
                 folderPath = path.join(folderPath, `Season ${String(episodeData.season).padStart(2, '0')}`);
             }
         }
         
-        const safeFilename = `${job.filename.replace(/\.mp4$/, '')}.${extension}`;
+        const safeFilename = `${job.filename.replace(/\.(mp4|mkv|avi|mov)$/, '')}.${extension}`;
         const filePath = path.join(folderPath, safeFilename);
-        const downloadUrl = `${serverUrl}/${job.stream_type}/${username}/${password}/${job.episode_id}.${extension}`;
 
         // Aktualizuj szczegóły w bazie z URL pobierania
         await dbRun('UPDATE downloads SET filename = ?, filepath = ?, download_url = ? WHERE id = ?', 
                     [safeFilename, filePath, downloadUrl, job.id]);
         
         console.log(`Starting download job ${job.id}: ${safeFilename}`);
+        console.log(`Download URL: ${downloadUrl}`);
 
         // Użyj download_manager.py
         await new Promise((resolve, reject) => {
@@ -1137,20 +1336,65 @@ app.listen(PORT, () => {
     setTimeout(autoStartDownloadManager, 3000); // Czekaj 3s na inicjalizację bazy
 });
 
+// Zamień istniejący cron job na końcu server.js na:
+
 cron.schedule('0 * * * *', async () => { // Uruchamia się co godzinę
-    console.log('Uruchamianie zaplanowanych zadań...');
+    const currentTime = new Date().toLocaleString('pl-PL');
+    console.log(`🕐 [${currentTime}] Uruchamianie zaplanowanych zadań...`);
     
-    const settingsRows = await dbAll(`SELECT key, value FROM settings WHERE key = 'checkFrequency'`);
-    const frequency = parseInt(settingsRows[0]?.value || '12', 10);
-    const currentHour = new Date().getHours();
+    try {
+        const settingsRows = await dbAll(`SELECT key, value FROM settings WHERE key = 'checkFrequency'`);
+        const frequency = parseInt(settingsRows[0]?.value || '12', 10);
+        const currentHour = new Date().getHours();
 
-    // Uruchom monitorowanie ulubionych zgodnie z ustawioną częstotliwością
-    if (currentHour % frequency === 0) {
-        monitorFavorites();
-    } else {
-        console.log(`Pominięto monitorowanie ulubionych. Następne sprawdzenie za ${frequency - (currentHour % frequency)}h.`);
+        // Uruchom monitorowanie ulubionych zgodnie z ustawioną częstotliwością
+        if (currentHour % frequency === 0) {
+            console.log(`📺 Uruchamianie monitorowania ulubionych (częstotliwość: co ${frequency}h)`);
+            try {
+                await monitorFavorites();
+                console.log(`✅ Monitorowanie ulubionych zakończone pomyślnie`);
+            } catch (error) {
+                console.error(`❌ Błąd monitorowania ulubionych: ${error.message}`);
+            }
+        } else {
+            const nextCheck = frequency - (currentHour % frequency);
+            console.log(`⏳ Pominięto monitorowanie ulubionych. Następne sprawdzenie za ${nextCheck}h (o ${(currentHour + nextCheck) % 24}:00).`);
+        }
+
+        // Zawsze uruchamiaj uzupełnianie brakujących gatunków
+        console.log(`🎭 Uruchamianie uzupełniania gatunków TMDB...`);
+        try {
+            await backfillTmdbGenres(50);
+            console.log(`✅ Uzupełnianie gatunków TMDB zakończone pomyślnie`);
+        } catch (error) {
+            console.error(`❌ Błąd uzupełniania gatunków TMDB: ${error.message}`);
+        }
+        
+    } catch (error) {
+        console.error(`❌ Krytyczny błąd w cron job: ${error.message}`);
     }
+    
+    console.log(`🏁 [${new Date().toLocaleString('pl-PL')}] Zaplanowane zadania zakończone`);
+});
 
-    // Zawsze uruchamiaj uzupełnianie brakujących gatunków
-    backfillTmdbGenres(50);
+// Dodaj również cron job do testowania (uruchamia się co 5 minut - tylko do debugowania)
+cron.schedule('*/5 * * * *', async () => {
+    const now = new Date();
+    console.log(`🔍 [DEBUG] Cron job test - ${now.toLocaleString('pl-PL')} (minuty: ${now.getMinutes()})`);
+    
+    // Sprawdź status TMDB
+    try {
+        const withoutGenres = await dbAll(`
+            SELECT COUNT(*) as count
+            FROM media m
+            LEFT JOIN media_genres mg ON m.stream_id = mg.media_stream_id AND m.stream_type = mg.media_stream_type
+            WHERE m.tmdb_id IS NOT NULL AND m.tmdb_id != '' AND mg.genre_id IS NULL
+        `);
+        
+        if (withoutGenres[0].count > 0) {
+            console.log(`📊 [DEBUG] Pozycji bez gatunków TMDB: ${withoutGenres[0].count}`);
+        }
+    } catch (error) {
+        console.error(`❌ [DEBUG] Błąd sprawdzania statusu TMDB: ${error.message}`);
+    }
 });

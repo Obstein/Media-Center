@@ -550,7 +550,7 @@ const HomeView = ({ queryParams, onNavigate, favorites, onToggleFavorite }) => {
     );
 };
 
-// --- Komponent Ustawień ---
+/*// --- Komponent Ustawień ---
 const SettingsView = () => {
     const [settings, setSettings] = useState({ serverUrl: '', username: '', password: '', tmdbApi: '', discordWebhook: '', checkFrequency: '12' });
     const [message, setMessage] = useState('');
@@ -639,7 +639,227 @@ const SettingsView = () => {
         </div>
     );
 };
+*/
+// Zaktualizowany komponent Ustawień z synchronizacją TMDB
+const SettingsView = () => {
+    const [settings, setSettings] = useState({ 
+        serverUrl: '', username: '', password: '', tmdbApi: '', 
+        discordWebhook: '', checkFrequency: '12' 
+    });
+    const [message, setMessage] = useState('');
+    const [isRefreshing, setIsRefreshing] = useState(false);
+    const [isSyncingTmdb, setIsSyncingTmdb] = useState(false);
+    const [tmdbStatus, setTmdbStatus] = useState(null);
 
+    useEffect(() => {
+        const fetchSettings = async () => {
+            try {
+                const response = await axios.get('/api/settings');
+                if (response.data) { 
+                    setSettings(prev => ({ ...prev, ...response.data })); 
+                }
+            } catch (error) { 
+                console.error('Nie udało się pobrać ustawień:', error); 
+            }
+        };
+        fetchSettings();
+    }, []);
+
+    // Pobierz status TMDB
+    useEffect(() => {
+        const fetchTmdbStatus = async () => {
+            try {
+                const response = await axios.get('/api/tmdb/status');
+                setTmdbStatus(response.data);
+            } catch (error) {
+                console.error('Nie udało się pobrać statusu TMDB:', error);
+            }
+        };
+        fetchTmdbStatus();
+    }, []);
+
+    const handleChange = (e) => {
+        const { name, value } = e.target;
+        setSettings(prevSettings => ({ ...prevSettings, [name]: value }));
+    };
+
+    const handleSave = async (e) => {
+        e.preventDefault();
+        setMessage('');
+        try {
+            await axios.post('/api/settings', settings);
+            setMessage('Ustawienia zostały pomyślnie zapisane!');
+            setTimeout(() => setMessage(''), 3000);
+        } catch (error) {
+            setMessage('Błąd podczas zapisu ustawień.');
+            console.error('Błąd zapisu:', error);
+        }
+    };
+
+    const handleRefresh = async () => {
+        setMessage('');
+        setIsRefreshing(true);
+        try {
+            const response = await axios.post('/api/media/refresh');
+            setMessage(response.data.message || 'Lista mediów została odświeżona.');
+        } catch (error) {
+            setMessage(error.response?.data?.error || 'Wystąpił błąd podczas odświeżania.');
+        } finally {
+            setIsRefreshing(false);
+            setTimeout(() => setMessage(''), 5000);
+        }
+    };
+
+    const handleTmdbSync = async () => {
+        setMessage('');
+        setIsSyncingTmdb(true);
+        try {
+            const response = await axios.post('/api/tmdb/sync', { limit: 200 });
+            setMessage(response.data.message || 'Synchronizacja TMDB zakończona.');
+            
+            // Odśwież status TMDB
+            const statusResponse = await axios.get('/api/tmdb/status');
+            setTmdbStatus(statusResponse.data);
+        } catch (error) {
+            setMessage(error.response?.data?.error || 'Wystąpił błąd podczas synchronizacji TMDB.');
+        } finally {
+            setIsSyncingTmdb(false);
+            setTimeout(() => setMessage(''), 5000);
+        }
+    };
+
+    return (
+        <div>
+            <h2 className="text-3xl font-bold mb-6 text-white border-l-4 border-red-500 pl-4">Ustawienia Aplikacji</h2>
+            
+           {/* Status TMDB - POPRAWIONA WERSJA */}
+            {tmdbStatus && (
+                <div className="mb-6 bg-gray-800 p-4 rounded-lg">
+                    <h3 className="text-lg font-semibold mb-3 text-white">Status synchronizacji TMDB</h3>
+                    <div className="grid grid-cols-2 md:grid-cols-5 gap-4 text-sm">
+                        <div className="bg-gray-900/50 p-3 rounded">
+                            <div className="text-gray-300 font-semibold text-lg">{tmdbStatus.total_media}</div>
+                            <div className="text-gray-400">Łącznie mediów</div>
+                        </div>
+                        <div className="bg-blue-900/50 p-3 rounded">
+                            <div className="text-blue-300 font-semibold text-lg">{tmdbStatus.with_genres}</div>
+                            <div className="text-gray-400">Z gatunkami</div>
+                        </div>
+                        <div className="bg-yellow-900/50 p-3 rounded">
+                            <div className="text-yellow-300 font-semibold text-lg">{tmdbStatus.without_genres}</div>
+                            <div className="text-gray-400">Bez gatunków</div>
+                        </div>
+                        <div className="bg-red-900/50 p-3 rounded">
+                            <div className="text-red-300 font-semibold text-lg">{tmdbStatus.without_tmdb_id}</div>
+                            <div className="text-gray-400">Bez TMDB ID</div>
+                        </div>
+                        <div className="bg-green-900/50 p-3 rounded">
+                            <div className="text-green-300 font-semibold text-lg">{tmdbStatus.top_genres?.length || 0}</div>
+                            <div className="text-gray-400">Gatunki w bazie</div>
+                        </div>
+                    </div>
+                    
+                    {/* Progress bar */}
+                    {tmdbStatus.total_media > 0 && (
+                        <div className="mt-4">
+                            <div className="flex justify-between text-sm text-gray-400 mb-1">
+                                <span>Postęp synchronizacji</span>
+                                <span>{Math.round((tmdbStatus.with_genres / (tmdbStatus.total_media - tmdbStatus.without_tmdb_id)) * 100)}%</span>
+                            </div>
+                            <div className="w-full bg-gray-700 rounded-full h-2">
+                                <div 
+                                    className="bg-blue-500 h-2 rounded-full transition-all duration-300" 
+                                    style={{
+                                        width: `${Math.round((tmdbStatus.with_genres / (tmdbStatus.total_media - tmdbStatus.without_tmdb_id)) * 100)}%`
+                                    }}
+                                ></div>
+                            </div>
+                        </div>
+                    )}
+                    
+                    {tmdbStatus.top_genres && tmdbStatus.top_genres.length > 0 && (
+                        <div className="mt-3">
+                            <p className="text-sm text-gray-400 mb-2">Najpopularniejsze gatunki:</p>
+                            <div className="flex flex-wrap gap-2">
+                                {tmdbStatus.top_genres.slice(0, 5).map((genre, idx) => (
+                                    <span key={idx} className="px-2 py-1 bg-gray-700 rounded text-xs">
+                                        {genre.name} ({genre.count})
+                                    </span>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+                </div>
+            )}
+
+            <div className="max-w-2xl mx-auto bg-gray-800 p-8 rounded-lg shadow-2xl">
+                <form onSubmit={handleSave} className="space-y-6">
+                    <div className="p-4 border border-gray-700 rounded-lg">
+                        <h3 className="text-lg font-semibold mb-3 text-white">Dane logowania Xtream</h3>
+                        <div className="space-y-4">
+                            <div>
+                                <label htmlFor="serverUrl" className="block text-sm font-medium text-gray-300">Server URL</label>
+                                <input type="text" id="serverUrl" name="serverUrl" value={settings.serverUrl || ''} onChange={handleChange} className="mt-1 w-full bg-gray-700 border border-gray-600 rounded-md p-2 text-white focus:outline-none focus:ring-2 focus:ring-red-500" placeholder="http://line.example.com:80"/>
+                            </div>
+                            <div>
+                                <label htmlFor="username" className="block text-sm font-medium text-gray-300">Username</label>
+                                <input type="text" id="username" name="username" value={settings.username || ''} onChange={handleChange} className="mt-1 w-full bg-gray-700 border border-gray-600 rounded-md p-2 text-white focus:outline-none focus:ring-2 focus:ring-red-500" placeholder="twoja_nazwa_uzytkownika"/>
+                            </div>
+                            <div>
+                                <label htmlFor="password" className="block text-sm font-medium text-gray-300">Password</label>
+                                <input type="password" id="password" name="password" value={settings.password || ''} onChange={handleChange} className="mt-1 w-full bg-gray-700 border border-gray-600 rounded-md p-2 text-white focus:outline-none focus:ring-2 focus:ring-red-500" placeholder="••••••••"/>
+                            </div>
+                        </div>
+                    </div>
+                    <div>
+                        <label htmlFor="tmdbApi" className="block text-sm font-medium text-gray-300">Klucz API do TMDB</label>
+                        <input type="password" id="tmdbApi" name="tmdbApi" value={settings.tmdbApi || ''} onChange={handleChange} className="mt-1 w-full bg-gray-700 border border-gray-600 rounded-md p-2 text-white focus:outline-none focus:ring-2 focus:ring-red-500" placeholder="••••••••••••••••••••••••••••••••"/>
+                    </div>
+                    <div>
+                        <label htmlFor="discordWebhook" className="block text-sm font-medium text-gray-300">Webhook Discord</label>
+                        <input type="text" id="discordWebhook" name="discordWebhook" value={settings.discordWebhook || ''} onChange={handleChange} className="mt-1 w-full bg-gray-700 border border-gray-600 rounded-md p-2 text-white focus:outline-none focus:ring-2 focus:ring-red-500" placeholder="https://discord.com/api/webhooks/..."/>
+                    </div>
+                    <div>
+                        <label htmlFor="checkFrequency" className="block text-sm font-medium text-gray-300">Częstotliwość sprawdzania nowości (w godzinach)</label>
+                        <select id="checkFrequency" name="checkFrequency" value={settings.checkFrequency} onChange={handleChange} className="mt-1 w-full bg-gray-700 border border-gray-600 rounded-md p-2 text-white focus:outline-none focus:ring-2 focus:ring-red-500">
+                            <option value="1">Co godzinę</option>
+                            <option value="6">Co 6 godzin</option>
+                            <option value="12">Co 12 godzin</option>
+                            <option value="24">Raz dziennie</option>
+                        </select>
+                    </div>
+                    <div className="pt-4 space-y-4">
+                        <button type="submit" className="w-full bg-red-600 hover:bg-red-700 text-white font-bold py-3 px-4 rounded-lg transition duration-300">
+                            Zapisz Ustawienia
+                        </button>
+                        
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <button 
+                                type="button" 
+                                onClick={handleRefresh} 
+                                disabled={isRefreshing} 
+                                className="bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-4 rounded-lg transition duration-300 disabled:bg-blue-800 disabled:cursor-not-allowed"
+                            >
+                                {isRefreshing ? 'Odświeżanie...' : 'Odśwież listę mediów'}
+                            </button>
+                            
+                            <button 
+                                type="button" 
+                                onClick={handleTmdbSync} 
+                                disabled={isSyncingTmdb} 
+                                className="bg-purple-600 hover:bg-purple-700 text-white font-bold py-3 px-4 rounded-lg transition duration-300 disabled:bg-purple-800 disabled:cursor-not-allowed"
+                            >
+                                {isSyncingTmdb ? 'Synchronizacja...' : 'Synchronizuj TMDB'}
+                            </button>
+                        </div>
+                        
+                        {message && <p className={`text-center mt-4 ${message.includes('Błąd') || message.includes('błąd') ? 'text-red-400' : 'text-green-400'}`}>{message}</p>}
+                    </div>
+                </form>
+            </div>
+        </div>
+    );
+};
 // --- Główny Komponent Aplikacji ---
 function App() {
   const [route, setRoute] = useState({ path: 'home', params: {} });
