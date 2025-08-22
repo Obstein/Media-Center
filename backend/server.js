@@ -1019,32 +1019,76 @@ async function processDownloadQueue() {
         const settings = settingsRows.reduce((acc, row) => ({...acc, [row.key]: row.value }), {});
         const { serverUrl, username, password } = settings;
         
-        // NOWA LOGIKA: Najpierw pobierz szczegóły, potem generuj URL z prawidłowym rozszerzeniem
+        // Pobierz szczegóły media
         console.log(`Fetching media details for ${job.stream_type} ID: ${job.stream_id}`);
         const mediaDetailsRes = await axios.get(`http://localhost:${PORT}/api/media/details/${job.stream_type}/${job.stream_id}`);
-        const { tmdb_details, xtream_details } = mediaDetailsRes.data;
-        
-        // Określ prawidłowe rozszerzenie NA PODSTAWIE DANYCH Z XTREAM
+        const details = mediaDetailsRes.data;
+        const { tmdb_details, xtream_details } = details;
+
+        console.log(`🔍 DEBUG: Szczegóły filmu dla ID ${job.stream_id}:`);
+        console.log(`  - job.filename: ${job.filename}`);
+        console.log(`  - details.container_extension: ${details.container_extension}`);
+        console.log(`  - xtream_details struktura:`, Object.keys(xtream_details || {}));
+
+        if (xtream_details?.info) {
+            console.log(`  - xtream_details.info keys:`, Object.keys(xtream_details.info));
+            console.log(`  - xtream_details.info.container_extension: ${xtream_details.info.container_extension}`);
+        }
+
+        if (xtream_details?.movie_data) {
+            console.log(`  - xtream_details.movie_data keys:`, Object.keys(xtream_details.movie_data));
+            console.log(`  - xtream_details.movie_data.container_extension: ${xtream_details.movie_data.container_extension}`);
+        }
+
+        // Sprawdź czy w nazwie pliku jest rozszerzenie
+        const filenameMatch = job.filename?.match(/\.(mp4|mkv|avi|mov|m4v|wmv|flv|ts|m2ts)$/i);
+        if (filenameMatch) {
+            console.log(`  - Rozszerzenie z nazwy pliku: ${filenameMatch[1]}`);
+        }
+
+        // Określ prawidłowe rozszerzenie
         let extension = 'mp4'; // domyślne
         let downloadUrl;
-        
+
         if (job.stream_type === 'movie') {
-            // Dla filmów: weź rozszerzenie z container_extension w info
-            extension = xtream_details?.info?.container_extension || 'mp4';
+            // Dla filmów: sprawdź różne źródła rozszerzenia
+            let movieExtension = null;
             
-            // Generuj URL z prawidłowym rozszerzeniem
+            // 1. Spróbuj z danych podstawowych media (najbardziej niezawodne)
+            if (details.container_extension) {
+                movieExtension = details.container_extension;
+                console.log(`✅ Znaleziono rozszerzenie w details.container_extension: ${movieExtension}`);
+            }
+            // 2. Spróbuj z xtream_details.info.container_extension
+            else if (xtream_details?.info?.container_extension) {
+                movieExtension = xtream_details.info.container_extension;
+                console.log(`✅ Znaleziono rozszerzenie w xtream_details.info: ${movieExtension}`);
+            }
+            // 3. Jeśli nadal brak, sprawdź czy w movie_data jest coś użytecznego
+            else if (xtream_details?.movie_data?.container_extension) {
+                movieExtension = xtream_details.movie_data.container_extension;
+                console.log(`✅ Znaleziono rozszerzenie w xtream_details.movie_data: ${movieExtension}`);
+            }
+            // 4. Jeśli nadal nie mamy rozszerzenia, spróbuj odgadnąć na podstawie nazwy pliku
+            else if (filenameMatch) {
+                movieExtension = filenameMatch[1].toLowerCase();
+                console.log(`✅ Znaleziono rozszerzenie w nazwie pliku: ${movieExtension}`);
+            }
+            
+            // W ostateczności użyj mkv jako domyślnego
+            extension = movieExtension || 'mkv';
+            
             downloadUrl = `${serverUrl}/movie/${username}/${password}/${job.stream_id}.${extension}`;
             
             console.log(`🎬 MOVIE URL WITH CORRECT EXTENSION:`);
             console.log(`  - Stream ID: ${job.stream_id}`);
-            console.log(`  - Container Extension from Xtream: ${xtream_details?.info?.container_extension}`);
             console.log(`  - Final Extension: ${extension}`);
             console.log(`  - Final URL: ${downloadUrl}`);
             
         } else {
             // Dla seriali: znajdź konkretny odcinek i weź jego rozszerzenie
             const episodeData = Object.values(xtream_details.episodes).flat().find(ep => ep.id == job.episode_id);
-            extension = episodeData?.container_extension || 'mp4';
+            extension = episodeData?.container_extension || 'mkv';
             
             downloadUrl = `${serverUrl}/series/${username}/${password}/${job.episode_id}.${extension}`;
             
