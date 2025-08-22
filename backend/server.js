@@ -1199,44 +1199,159 @@ async function monitorFavorites() {
         let newDownloadsAdded = false;
 
         for (const series of favoriteSeries) {
-            const seriesInfoRes = await axios.get(`http://localhost:${PORT}/api/media/details/series/${series.stream_id}`);
-            const allEpisodes = Object.values(seriesInfoRes.data.xtream_details.episodes).flat();
+            console.log(`🔍 Sprawdzanie serialu ID: ${series.stream_id}...`);
             
-            const downloadedEpisodes = await dbAll('SELECT episode_id FROM downloads WHERE stream_id = ?', [series.stream_id]);
-            const downloadedEpisodeIds = new Set(downloadedEpisodes.map(ep => ep.episode_id));
+            try {
+                const seriesInfoRes = await axios.get(`http://localhost:${PORT}/api/media/details/series/${series.stream_id}`);
+                const allEpisodes = Object.values(seriesInfoRes.data.xtream_details.episodes).flat();
+                
+                // Sprawdź odcinki które są completed, downloading, lub mają już 3+ nieudane próby
+                const existingDownloads = await dbAll(`
+                    SELECT 
+                        episode_id,
+                        COUNT(*) as attempt_count,
+                        MAX(CASE WHEN worker_status = 'completed' THEN 1 ELSE 0 END) as is_completed,
+                        MAX(CASE WHEN worker_status = 'downloading' THEN 1 ELSE 0 END) as is_downloading
+                    FROM downloads 
+                    WHERE stream_id = ? AND stream_type = ?
+                    GROUP BY episode_id
+                    HAVING 
+                        is_completed = 1 
+                        OR is_downloading = 1 
+                        OR attempt_count >= 3
+                `, [series.stream_id, 'series']);
 
-            const newEpisodes = allEpisodes.filter(ep => !downloadedEpisodeIds.has(ep.id));
+                const excludedEpisodeIds = new Set(existingDownloads.map(row => row.episode_id));
 
-            if (newEpisodes.length > 0) {
-                console.log(`Znaleziono ${newEpisodes.length} nowych odcinków dla serialu: ${seriesInfoRes.data.name}`);
-                newDownloadsAdded = true;
+                console.log(`  - Wszystkich odcinków: ${allEpisodes.length}`);
+                console.log(`  - Wykluczonych (completed/downloading/3+ prób): ${excludedEpisodeIds.size}`);
 
-                const episodesToQueue = newEpisodes.map(ep => {
-                    const title = seriesInfoRes.data.tmdb_details?.name || seriesInfoRes.data.name;
-                    const filename = `${title.replace(/[^\w\s.-]/gi, '').trim()} - S${String(ep.season).padStart(2, '0')}E${String(ep.episode_num).padStart(2, '0')}`;
-                    return { id: ep.id, filename };
-                });
+                // Sprawdź ile jest failed z mniej niż 3 próbami (do retry)
+                const retryableDownloads = await dbAll(`
+                    SELECT 
+                        episode_id,
+                        COUNT(*) as attempt_count
+                    FROM downloads 
+                    WHERE stream_id = ? AND stream_type = ? 
+                    AND worker_status = 'failed'
+                    GROUP BY episode_id
+                    HAVING attempt_count < 3
+                `, [series.stream_id, 'series']);
 
-                await axios.post(`http://localhost:${PORT}/api/downloads/start`, {
-                    stream_id: series.stream_id,
-                    stream_type: 'series',
-                    episodes: episodesToQueue
-                });
+                console.log(`  - Do retry (< 3 próby): ${retryableDownloads.length}`);
 
-                const episodeList = newEpisodes.map(ep => `S${String(ep.season).padStart(2, '0')}E${String(ep.episode_num).padStart(2, '0')}`).join(', ');
-                await sendDiscordNotification(`✅ Nowe odcinki dla **${seriesInfoRes.data.name}** dodane do kolejki: **${episodeList}**`);
+                // Sprawdź ile ma już 3+ prób (do usunięcia)
+                const maxAttemptsDownloads = await dbAll(`
+                    SELECT 
+                        episode_id,
+                        COUNT(*) as attempt_count
+                    FROM downloads 
+                    WHERE stream_id = ? AND stream_type = ? 
+                    AND worker_status = 'failed'
+                    GROUP BY episode_id
+                    HAVING attempt_count >= 3
+                `, [series.stream_id, 'series']);
+
+                // Usuń downloads które mają już 3+ nieudane próby (będą dodane ponownie jako nowe)
+                if (maxAttemptsDownloads.length > 0) {
+                    console.log(`🗑️ Usuwanie ${maxAttemptsDownloads.length} odcinków z 3+ nieudanymi próbami...`);
+                    
+                    for (const item of maxAttemptsDownloads) {
+                        try {
+                            // Usuń wszystkie próby dla tego odcinka
+                            await dbRun(`
+                                DELETE FROM downloads 
+                                WHERE stream_id = ? AND stream_type = ? AND episode_id = ?
+                            `, [series.stream_id, 'series', item.episode_id]);
+                            
+                            console.log(`  - Usunięto historie pobierania dla odcinka: ${item.episode_id}`);
+                        } catch (error) {
+                            console.error(`❌ Błąd usuwania downloads dla odcinka ${item.episode_id}:`, error);
+                        }
+                    }
+                    
+                    // Zaktualizuj listę wykluczonych po usunięciu
+                    const updatedExistingDownloads = await dbAll(`
+                        SELECT 
+                            episode_id,
+                            COUNT(*) as attempt_count,
+                            MAX(CASE WHEN worker_status = 'completed' THEN 1 ELSE 0 END) as is_completed,
+                            MAX(CASE WHEN worker_status = 'downloading' THEN 1 ELSE 0 END) as is_downloading
+                        FROM downloads 
+                        WHERE stream_id = ? AND stream_type = ?
+                        GROUP BY episode_id
+                        HAVING 
+                            is_completed = 1 
+                            OR is_downloading = 1 
+                            OR attempt_count >= 3
+                    `, [series.stream_id, 'series']);
+                    
+                    excludedEpisodeIds.clear();
+                    updatedExistingDownloads.forEach(row => excludedEpisodeIds.add(row.episode_id));
+                    
+                    console.log(`  - Zaktualizowana lista wykluczonych: ${excludedEpisodeIds.size}`);
+                }
+
+                // Filtruj odcinki do dodania (nowe + te które zostały oczyszczone po 3 próbach)
+                const newEpisodes = allEpisodes.filter(ep => !excludedEpisodeIds.has(ep.id));
+                console.log(`  - Nowych + retry po cleanup: ${newEpisodes.length}`);
+
+                if (newEpisodes.length > 0) {
+                    console.log(`✨ Znaleziono ${newEpisodes.length} odcinków do dodania dla serialu: ${seriesInfoRes.data.name}`);
+                    newDownloadsAdded = true;
+
+                    const episodesToQueue = newEpisodes.map(ep => {
+                        const title = seriesInfoRes.data.tmdb_details?.name || seriesInfoRes.data.name;
+                        const filename = `${title.replace(/[^\w\s.-]/gi, '').trim()} - S${String(ep.season).padStart(2, '0')}E${String(ep.episode_num).padStart(2, '0')}`;
+                        return { id: ep.id, filename };
+                    });
+
+                    console.log(`  - Dodawanie do kolejki:`, episodesToQueue.map(ep => `${ep.id}:${ep.filename}`));
+
+                    await axios.post(`http://localhost:${PORT}/api/downloads/start`, {
+                        stream_id: series.stream_id,
+                        stream_type: 'series',
+                        episodes: episodesToQueue
+                    });
+
+                    const episodeList = newEpisodes.map(ep => 
+                        `S${String(ep.season).padStart(2, '0')}E${String(ep.episode_num).padStart(2, '0')}`
+                    ).join(', ');
+                    
+                    // Rozróżnij czy to nowe odcinki czy retry
+                    const retryCount = retryableDownloads.length;
+                    const cleanupCount = maxAttemptsDownloads.length;
+                    const newCount = newEpisodes.length - retryCount;
+                    
+                    let notificationMessage = `✅ **${seriesInfoRes.data.name}** - dodano do kolejki: **${episodeList}**`;
+                    if (retryCount > 0 || cleanupCount > 0) {
+                        notificationMessage += `\n`;
+                        if (retryCount > 0) notificationMessage += `🔄 Retry: ${retryCount} `;
+                        if (cleanupCount > 0) notificationMessage += `🆕 Po cleanup: ${cleanupCount} `;
+                        if (newCount > 0) notificationMessage += `✨ Nowe: ${newCount}`;
+                    }
+                    
+                    await sendDiscordNotification(notificationMessage);
+                } else {
+                    console.log(`  - Brak nowych odcinków dla: ${seriesInfoRes.data.name}`);
+                }
+
+            } catch (seriesError) {
+                console.error(`❌ Błąd podczas sprawdzania serialu ID ${series.stream_id}:`, seriesError.message);
+                continue; // Przejdź do następnego serialu
             }
         }
 
         if (!newDownloadsAdded) {
-            console.log('Monitorowanie zakończone: nie znaleziono nowych odcinków.');
+            console.log('✅ Monitorowanie zakończone: nie znaleziono nowych odcinków.');
+        } else {
+            console.log('✅ Monitorowanie zakończone: znaleziono i dodano nowe odcinki.');
         }
 
     } catch (error) {
-        console.error("Wystąpił błąd podczas monitorowania ulubionych:", error.message);
+        console.error("❌ Wystąpił błąd podczas monitorowania ulubionych:", error.message);
     }
 }
-
 // Auto-start download manager przy starcie serwera
 async function autoStartDownloadManager() {
     try {
