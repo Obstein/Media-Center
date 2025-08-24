@@ -21,7 +21,8 @@ const Pagination = ({ currentPage, totalPages, onPageChange }) => {
 };
 
 // === KOMPONENTY PLAYLIST MANAGER ===
-const PlaylistCard = ({ playlist, onEdit, onDelete, onToggle, onSync }) => {
+
+const PlaylistCard = ({ playlist, onEdit, onDelete, onToggle, onSync, syncing = false }) => { // NOWE: prop syncing
     const [isExpanded, setIsExpanded] = useState(false);
     
     return (
@@ -37,6 +38,13 @@ const PlaylistCard = ({ playlist, onEdit, onDelete, onToggle, onSync }) => {
                     }`}>
                         {playlist.is_active ? '🟢 Aktywna' : '⚪ Nieaktywna'}
                     </div>
+                    {/* NOWY: Wskaźnik synchronizacji */}
+                    {syncing && (
+                        <div className="flex items-center gap-1 px-2 py-1 bg-purple-900/50 text-purple-300 rounded text-xs">
+                            <div className="animate-spin rounded-full h-3 w-3 border-b border-purple-300"></div>
+                            Sync...
+                        </div>
+                    )}
                 </div>
                 
                 <div className="flex items-center gap-2">
@@ -75,6 +83,9 @@ const PlaylistCard = ({ playlist, onEdit, onDelete, onToggle, onSync }) => {
                         <div><strong>Server:</strong> {playlist.server_url}</div>
                         <div><strong>Username:</strong> {playlist.username}</div>
                         <div><strong>Utworzona:</strong> {new Date(playlist.created_at).toLocaleString()}</div>
+                        {playlist.last_sync && (
+                            <div><strong>Ostatnia synchronizacja:</strong> {new Date(playlist.last_sync).toLocaleString()}</div>
+                        )}
                     </div>
                 </div>
             )}
@@ -83,7 +94,8 @@ const PlaylistCard = ({ playlist, onEdit, onDelete, onToggle, onSync }) => {
             <div className="flex gap-2">
                 <button
                     onClick={() => onToggle(playlist.id)}
-                    className={`flex-1 px-3 py-2 rounded text-sm font-medium transition-colors ${
+                    disabled={syncing}
+                    className={`flex-1 px-3 py-2 rounded text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
                         playlist.is_active 
                             ? 'bg-gray-600 hover:bg-gray-700 text-gray-200' 
                             : 'bg-green-600 hover:bg-green-700 text-white'
@@ -94,23 +106,32 @@ const PlaylistCard = ({ playlist, onEdit, onDelete, onToggle, onSync }) => {
                 
                 <button
                     onClick={() => onSync(playlist.id)}
-                    className="px-3 py-2 rounded text-sm font-medium bg-blue-600 hover:bg-blue-700 text-white transition-colors"
-                    title="Synchronizuj playlistę"
+                    disabled={syncing || !playlist.is_active}
+                    className="px-3 py-2 rounded text-sm font-medium bg-blue-600 hover:bg-blue-700 disabled:bg-blue-800 disabled:cursor-not-allowed text-white transition-colors flex items-center gap-1"
+                    title={!playlist.is_active ? 'Tylko aktywne playlisty można synchronizować' : 'Synchronizuj playlistę'}
                 >
-                    🔄 Sync
+                    {syncing ? (
+                        <>
+                            <div className="animate-spin rounded-full h-3 w-3 border-b border-white"></div>
+                            Sync
+                        </>
+                    ) : (
+                        <>🔄 Sync</>
+                    )}
                 </button>
                 
                 <button
                     onClick={() => onEdit(playlist)}
-                    className="px-3 py-2 rounded text-sm font-medium bg-yellow-600 hover:bg-yellow-700 text-white transition-colors"
+                    disabled={syncing}
+                    className="px-3 py-2 rounded text-sm font-medium bg-yellow-600 hover:bg-yellow-700 disabled:bg-yellow-800 disabled:cursor-not-allowed text-white transition-colors"
                 >
                     ✏️ Edytuj
                 </button>
                 
                 <button
                     onClick={() => onDelete(playlist.id, playlist.name)}
-                    className="px-3 py-2 rounded text-sm font-medium bg-red-600 hover:bg-red-700 text-white transition-colors"
-                    disabled={playlist.media_count > 0}
+                    disabled={playlist.media_count > 0 || syncing}
+                    className="px-3 py-2 rounded text-sm font-medium bg-red-600 hover:bg-red-700 disabled:bg-red-800 disabled:cursor-not-allowed text-white transition-colors"
                     title={playlist.media_count > 0 ? 'Nie można usunąć playlisty z mediami' : 'Usuń playlistę'}
                 >
                     🗑️
@@ -282,6 +303,8 @@ const PlaylistForm = ({ playlist, onSave, onCancel, isEditing = false }) => {
     );
 };
 
+// W App.js, zaktualizuj komponent PlaylistManager:
+
 const PlaylistManager = () => {
     const [playlists, setPlaylists] = useState([]);
     const [loading, setLoading] = useState(true);
@@ -289,6 +312,7 @@ const PlaylistManager = () => {
     const [editingPlaylist, setEditingPlaylist] = useState(null);
     const [message, setMessage] = useState('');
     const [overview, setOverview] = useState(null);
+    const [syncing, setSyncing] = useState({ all: false, single: {} }); // NOWE: Stan synchronizacji
 
     // Pobierz playlisty
     const fetchPlaylists = async () => {
@@ -325,7 +349,7 @@ const PlaylistManager = () => {
         try {
             if (editingPlaylist) {
                 // Edytuj istniejącą
-                await axios.put(`/api/playlists/${editingPlaylist.id}`, formData);
+                await axios.post(`/api/playlists/${editingPlaylist.id}`, formData);
                 setMessage('Playlista została zaktualizowana.');
             } else {
                 // Dodaj nową
@@ -375,10 +399,64 @@ const PlaylistManager = () => {
         }
     };
 
-    // Synchronizuj playlistę (placeholder - zaimplementujemy później)
+    // NOWE: Synchronizuj pojedynczą playlistę
     const handleSyncPlaylist = async (id) => {
-        setMessage('Synchronizacja playlist zostanie dodana w następnej fazie.');
-        setTimeout(() => setMessage(''), 3000);
+        setSyncing(prev => ({ ...prev, single: { ...prev.single, [id]: true } }));
+        
+        try {
+            const response = await axios.post(`/api/playlists/${id}/sync`);
+            setMessage(response.data.message || 'Synchronizacja playlisty zakończona.');
+            await Promise.all([fetchPlaylists(), fetchOverview()]);
+            setTimeout(() => setMessage(''), 5000);
+        } catch (error) {
+            console.error('Błąd synchronizacji playlisty:', error);
+            setMessage(error.response?.data?.error || 'Błąd synchronizacji playlisty.');
+            setTimeout(() => setMessage(''), 5000);
+        } finally {
+            setSyncing(prev => ({ ...prev, single: { ...prev.single, [id]: false } }));
+        }
+    };
+
+    // NOWE: Synchronizuj wszystkie playlisty
+    const handleSyncAllPlaylists = async () => {
+        setSyncing(prev => ({ ...prev, all: true }));
+        
+        try {
+            const response = await axios.post('/api/playlists/sync-all');
+            const result = response.data;
+            
+            let messageText = result.message;
+            if (result.results && result.results.length > 0) {
+                const successCount = result.results.filter(r => !r.error).length;
+                const errorCount = result.results.filter(r => r.error).length;
+                
+                messageText += `\n\n📊 Szczegóły:\n`;
+                messageText += `✅ Udane: ${successCount}\n`;
+                if (errorCount > 0) {
+                    messageText += `❌ Błędy: ${errorCount}\n`;
+                }
+                
+                // Pokaż pierwsze kilka wyników
+                result.results.slice(0, 3).forEach(r => {
+                    if (r.error) {
+                        messageText += `• ${r.playlist_name}: ERROR - ${r.error}\n`;
+                    } else {
+                        messageText += `• ${r.playlist_name}: +${r.added || 0} -${r.removed || 0}\n`;
+                    }
+                });
+            }
+            
+            setMessage(messageText);
+            await Promise.all([fetchPlaylists(), fetchOverview()]);
+            setTimeout(() => setMessage(''), 10000);
+            
+        } catch (error) {
+            console.error('Błąd synchronizacji wszystkich playlist:', error);
+            setMessage(error.response?.data?.error || 'Błąd synchronizacji playlist.');
+            setTimeout(() => setMessage(''), 5000);
+        } finally {
+            setSyncing(prev => ({ ...prev, all: false }));
+        }
     };
 
     if (loading) {
@@ -388,6 +466,8 @@ const PlaylistManager = () => {
             </div>
         );
     }
+
+    const activePlaylists = playlists.filter(p => p.is_active);
 
     return (
         <div className="space-y-6">
@@ -420,8 +500,8 @@ const PlaylistManager = () => {
 
             {/* Komunikaty */}
             {message && (
-                <div className={`p-4 rounded-lg ${
-                    message.includes('Błąd') || message.includes('błąd') ? 
+                <div className={`p-4 rounded-lg whitespace-pre-line ${
+                    message.includes('Błąd') || message.includes('błąd') || message.includes('ERROR') ? 
                     'bg-red-900/50 text-red-300 border border-red-700' : 
                     'bg-green-900/50 text-green-300 border border-green-700'
                 }`}>
@@ -432,15 +512,33 @@ const PlaylistManager = () => {
             {/* Przyciski akcji */}
             <div className="flex justify-between items-center">
                 <h3 className="text-xl font-bold text-white">Zarządzaj Playlistami</h3>
-                <button
-                    onClick={() => {
-                        setShowForm(true);
-                        setEditingPlaylist(null);
-                    }}
-                    className="bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-4 rounded-lg transition duration-300"
-                >
-                    ➕ Dodaj Playlistę
-                </button>
+                <div className="flex gap-3">
+                    {/* NOWY: Przycisk synchronizacji wszystkich */}
+                    <button
+                        onClick={handleSyncAllPlaylists}
+                        disabled={syncing.all || activePlaylists.length === 0}
+                        className="bg-purple-600 hover:bg-purple-700 disabled:bg-purple-800 disabled:cursor-not-allowed text-white font-bold py-2 px-4 rounded-lg transition duration-300 flex items-center gap-2"
+                    >
+                        {syncing.all ? (
+                            <>
+                                <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white"></div>
+                                Synchronizacja...
+                            </>
+                        ) : (
+                            <>🔄 Synchronizuj Wszystkie ({activePlaylists.length})</>
+                        )}
+                    </button>
+                    
+                    <button
+                        onClick={() => {
+                            setShowForm(true);
+                            setEditingPlaylist(null);
+                        }}
+                        className="bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-4 rounded-lg transition duration-300"
+                    >
+                        ➕ Dodaj Playlistę
+                    </button>
+                </div>
             </div>
 
             {/* Formularz dodawania/edycji */}
@@ -480,6 +578,7 @@ const PlaylistManager = () => {
                             onDelete={handleDeletePlaylist}
                             onToggle={handleTogglePlaylist}
                             onSync={handleSyncPlaylist}
+                            syncing={syncing.single[playlist.id] || false} // NOWE: Przekaż stan synchronizacji
                         />
                     ))
                 )}

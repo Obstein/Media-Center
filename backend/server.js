@@ -563,6 +563,275 @@ app.get('/api/playlists/overview', async (req, res) => {
         res.status(500).json({ error: 'Nie udało się pobrać przeglądu playlist.' });
     }
 });
+
+// Dodaj te endpointy do server.js, po istniejących API playlist:
+
+// Synchronizuj pojedynczą playlistę
+app.post('/api/playlists/:id/sync', async (req, res) => {
+    const { id } = req.params;
+    
+    try {
+        // Sprawdź czy playlista istnieje i jest aktywna
+        const playlist = await dbAll('SELECT * FROM playlists WHERE id = ? AND is_active = 1', [id]);
+        if (playlist.length === 0) {
+            return res.status(404).json({ error: 'Playlista nie znaleziona lub nieaktywna.' });
+        }
+        
+        const playlistData = playlist[0];
+        console.log(`🔄 Rozpoczynanie synchronizacji playlisty: ${playlistData.name}`);
+        
+        const result = await syncSinglePlaylist(playlistData);
+        
+        res.json({
+            message: `Synchronizacja playlisty "${playlistData.name}" zakończona.`,
+            playlist_id: id,
+            playlist_name: playlistData.name,
+            ...result
+        });
+        
+    } catch (error) {
+        console.error(`Błąd synchronizacji playlisty ${id}:`, error);
+        res.status(500).json({ error: `Błąd synchronizacji: ${error.message}` });
+    }
+});
+
+// Synchronizuj wszystkie aktywne playlisty
+app.post('/api/playlists/sync-all', async (req, res) => {
+    try {
+        // Pobierz wszystkie aktywne playlisty
+        const activePlaylists = await dbAll('SELECT * FROM playlists WHERE is_active = 1 ORDER BY id');
+        
+        if (activePlaylists.length === 0) {
+            return res.json({ message: 'Brak aktywnych playlist do synchronizacji.' });
+        }
+        
+        console.log(`🔄 Rozpoczynanie synchronizacji ${activePlaylists.length} aktywnych playlist...`);
+        
+        const results = [];
+        let totalAdded = 0;
+        let totalRemoved = 0;
+        let errors = 0;
+        
+        // Synchronizuj każdą playlistę po kolei
+        for (const playlist of activePlaylists) {
+            try {
+                console.log(`📺 Synchronizacja: ${playlist.name}...`);
+                const result = await syncSinglePlaylist(playlist);
+                
+                results.push({
+                    playlist_id: playlist.id,
+                    playlist_name: playlist.name,
+                    ...result
+                });
+                
+                totalAdded += result.added || 0;
+                totalRemoved += result.removed || 0;
+                
+                // Krótka przerwa między playlistami
+                await new Promise(resolve => setTimeout(resolve, 1000));
+                
+            } catch (playlistError) {
+                console.error(`❌ Błąd synchronizacji playlisty ${playlist.name}:`, playlistError);
+                errors++;
+                results.push({
+                    playlist_id: playlist.id,
+                    playlist_name: playlist.name,
+                    error: playlistError.message
+                });
+            }
+        }
+        
+        const summary = `Synchronizacja zakończona. Playlist: ${activePlaylists.length}, Dodano: ${totalAdded}, Usunięto: ${totalRemoved}, Błędy: ${errors}`;
+        console.log(`✅ ${summary}`);
+        
+        res.json({
+            message: summary,
+            total_playlists: activePlaylists.length,
+            total_added: totalAdded,
+            total_removed: totalRemoved,
+            errors: errors,
+            results: results
+        });
+        
+    } catch (error) {
+        console.error('Błąd synchronizacji wszystkich playlist:', error);
+        res.status(500).json({ error: `Błąd synchronizacji: ${error.message}` });
+    }
+});
+
+// Funkcja pomocnicza do synchronizacji pojedynczej playlisty
+async function syncSinglePlaylist(playlist) {
+    const { id: playlistId, server_url, username, password, name } = playlist;
+    
+    try {
+        const xtreamBaseUrl = `${server_url}/player_api.php?username=${username}&password=${password}`;
+        
+        // Pobierz filmy i seriale z tej playlisty
+        console.log(`  📡 Pobieranie danych z: ${server_url}...`);
+        
+        let moviesList = [];
+        let seriesList = [];
+        
+        // Pobierz filmy
+        try {
+            const moviesRes = await axios.get(`${xtreamBaseUrl}&action=get_vod_streams`, { timeout: 30000 });
+            moviesList = Array.isArray(moviesRes.data) ? moviesRes.data.map(m => ({ ...m, stream_type: 'movie' })) : [];
+            console.log(`  🎬 Pobrano ${moviesList.length} filmów`);
+        } catch (error) {
+            console.warn(`  ⚠️ Błąd pobierania filmów z ${name}: ${error.message}`);
+        }
+        
+        // Pobierz seriale
+        try {
+            const seriesRes = await axios.get(`${xtreamBaseUrl}&action=get_series`, { timeout: 30000 });
+            seriesList = Array.isArray(seriesRes.data) ? seriesRes.data.map(s => ({ ...s, stream_type: 'series', stream_id: s.series_id })) : [];
+            console.log(`  📺 Pobrano ${seriesList.length} seriali`);
+        } catch (error) {
+            console.warn(`  ⚠️ Błąd pobierania seriali z ${name}: ${error.message}`);
+        }
+        
+        const incomingList = [...moviesList, ...seriesList];
+        
+        if (incomingList.length === 0) {
+            console.warn(`  ⚠️ Brak danych z playlisty ${name}`);
+            return { added: 0, removed: 0, message: 'Brak danych z serwera' };
+        }
+        
+        // Pobierz istniejące media dla tej playlisty
+        const existingMedia = await dbAll('SELECT stream_id, stream_type FROM media WHERE playlist_id = ?', [playlistId]);
+        
+        const incomingMediaSet = new Set(incomingList.map(item => `${item.stream_id}_${item.stream_type}`));
+        const existingMediaSet = new Set(existingMedia.map(m => `${m.stream_id}_${m.stream_type}`));
+        
+        const itemsToAdd = incomingList.filter(item => !existingMediaSet.has(`${item.stream_id}_${item.stream_type}`));
+        const itemsToDelete = existingMedia.filter(m => !incomingMediaSet.has(`${m.stream_id}_${m.stream_type}`));
+        
+        console.log(`  ➕ Do dodania: ${itemsToAdd.length}, ➖ Do usunięcia: ${itemsToDelete.length}`);
+        
+        let transactionActive = false;
+        
+        try {
+            // Rozpocznij transakcję
+            await dbRun('BEGIN TRANSACTION');
+            transactionActive = true;
+            
+            // Usuń stare pozycje
+            if (itemsToDelete.length > 0) {
+                const deleteMediaStmt = db.prepare('DELETE FROM media WHERE stream_id = ? AND stream_type = ? AND playlist_id = ?');
+                const deleteGenresStmt = db.prepare('DELETE FROM media_genres WHERE media_stream_id = ? AND media_stream_type = ?');
+                const deleteFavoritesStmt = db.prepare('DELETE FROM favorites WHERE stream_id = ? AND stream_type = ? AND playlist_id = ?');
+                
+                try {
+                    for (const item of itemsToDelete) {
+                        await stmtRun(deleteMediaStmt, [item.stream_id, item.stream_type, playlistId]);
+                        await stmtRun(deleteGenresStmt, [item.stream_id, item.stream_type]);
+                        await stmtRun(deleteFavoritesStmt, [item.stream_id, item.stream_type, playlistId]);
+                    }
+                } finally {
+                    deleteMediaStmt.finalize();
+                    deleteGenresStmt.finalize();
+                    deleteFavoritesStmt.finalize();
+                }
+            }
+            
+            // Dodaj nowe pozycje
+            if (itemsToAdd.length > 0) {
+                // Pobierz klucz TMDB API
+                const tmdbApiRows = await dbAll(`SELECT value FROM settings WHERE key = 'tmdbApi'`);
+                const tmdbApi = tmdbApiRows[0]?.value;
+                
+                const insertMediaSql = `INSERT OR REPLACE INTO media (stream_id, name, stream_icon, rating, tmdb_id, stream_type, container_extension, playlist_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`;
+                const insertGenreSql = `INSERT OR IGNORE INTO genres (id, name) VALUES (?, ?)`;
+                const insertMediaGenreSql = `INSERT OR IGNORE INTO media_genres (media_stream_id, media_stream_type, genre_id) VALUES (?, ?, ?)`;
+                
+                const mediaStmt = db.prepare(insertMediaSql);
+                const genreStmt = db.prepare(insertGenreSql);
+                const mediaGenreStmt = db.prepare(insertMediaGenreSql);
+                
+                try {
+                    let processedCount = 0;
+                    for (const item of itemsToAdd) {
+                        const tmdbId = item.tmdb;
+                        
+                        // Dodaj media z playlist_id
+                        await stmtRun(mediaStmt, [
+                            item.stream_id,
+                            item.name,
+                            item.stream_icon || item.cover,
+                            item.rating_5based || item.rating,
+                            tmdbId,
+                            item.stream_type,
+                            item.container_extension,
+                            playlistId // WAŻNE: przypisz do konkretnej playlisty
+                        ]);
+                        
+                        // Pobierz gatunki z TMDB jeśli mamy ID i klucz API
+                        if (tmdbId && tmdbApi) {
+                            try {
+                                const tmdbType = item.stream_type === 'series' ? 'tv' : 'movie';
+                                const tmdbUrl = `https://api.themoviedb.org/3/${tmdbType}/${tmdbId}?api_key=${tmdbApi}&language=pl-PL`;
+                                
+                                const tmdbRes = await axios.get(tmdbUrl, { timeout: 10000 });
+                                
+                                if (tmdbRes.data && tmdbRes.data.genres) {
+                                    for (const genre of tmdbRes.data.genres) {
+                                        await stmtRun(genreStmt, [genre.id, genre.name]);
+                                        await stmtRun(mediaGenreStmt, [item.stream_id, item.stream_type, genre.id]);
+                                    }
+                                }
+                                
+                                // Krótkie opóźnienie dla TMDB API
+                                await new Promise(resolve => setTimeout(resolve, 50));
+                            } catch (tmdbError) {
+                                // Dodaj domyślny gatunek przy błędzie TMDB
+                                await stmtRun(mediaGenreStmt, [item.stream_id, item.stream_type, -1]);
+                            }
+                        } else {
+                            // Brak TMDB ID lub API - dodaj domyślny gatunek
+                            await stmtRun(mediaGenreStmt, [item.stream_id, item.stream_type, -1]);
+                        }
+                        
+                        processedCount++;
+                        if (processedCount % 100 === 0) {
+                            console.log(`  📈 Przetworzono ${processedCount}/${itemsToAdd.length} pozycji...`);
+                        }
+                    }
+                } finally {
+                    mediaStmt.finalize();
+                    genreStmt.finalize();
+                    mediaGenreStmt.finalize();
+                }
+            }
+            
+            // Zaktualizuj licznik mediów i datę synchronizacji
+            const newMediaCount = await dbAll('SELECT COUNT(*) as count FROM media WHERE playlist_id = ?', [playlistId]);
+            await dbRun('UPDATE playlists SET media_count = ?, last_sync = ? WHERE id = ?', [
+                newMediaCount[0].count, 
+                new Date().toISOString(), 
+                playlistId
+            ]);
+            
+            // Zatwierdź transakcję
+            await dbRun('COMMIT');
+            transactionActive = false;
+            
+            return {
+                added: itemsToAdd.length,
+                removed: itemsToDelete.length,
+                total_media: newMediaCount[0].count
+            };
+            
+        } catch (dbError) {
+            if (transactionActive) {
+                await dbRun('ROLLBACK');
+            }
+            throw dbError;
+        }
+        
+    } catch (error) {
+        throw new Error(`Synchronizacja playlisty ${name}: ${error.message}`);
+    }
+}
 // --- API: Ręczna synchronizacja TMDB ---
 app.post('/api/tmdb/sync', async (req, res) => {
     const { limit = 100 } = req.body;
