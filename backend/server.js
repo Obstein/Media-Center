@@ -30,10 +30,92 @@ function initializeDb() {
         db.run(`CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)`);
         
         db.run(`
+            CREATE TABLE IF NOT EXISTS playlists (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                server_url TEXT NOT NULL,
+                username TEXT NOT NULL,
+                password TEXT NOT NULL,
+                is_active BOOLEAN DEFAULT 1,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_sync DATETIME,
+                media_count INTEGER DEFAULT 0
+            )
+        `);
+        / Sprawdź czy tabela media ma kolumnę playlist_id
+        db.all("PRAGMA table_info(media)", [], (err, columns) => {
+            if (err) {
+                console.error("Błąd sprawdzania struktury tabeli media:", err);
+                return;
+            }
+            
+            const columnNames = columns.map(col => col.name);
+            
+            if (!columnNames.includes('playlist_id')) {
+                console.log("Dodawanie kolumny playlist_id do tabeli media...");
+                db.run("ALTER TABLE media ADD COLUMN playlist_id INTEGER", (alterErr) => {
+                    if (alterErr) {
+                        console.error("Błąd dodawania kolumny playlist_id do media:", alterErr);
+                    } else {
+                        console.log("✅ Dodano kolumnę playlist_id do media");
+                        // Po dodaniu kolumny, uruchom migrację danych
+                        setTimeout(migrateExistingDataToPlaylists, 1000);
+                    }
+                });
+            } else {
+                console.log("Kolumna playlist_id już istnieje w tabeli media");
+            }
+        });
+        
+        // Dodaj playlist_id do favorites
+        db.all("PRAGMA table_info(favorites)", [], (err, columns) => {
+            if (err) {
+                console.error("Błąd sprawdzania struktury tabeli favorites:", err);
+                return;
+            }
+            
+            const columnNames = columns.map(col => col.name);
+            
+            if (!columnNames.includes('playlist_id')) {
+                console.log("Dodawanie kolumny playlist_id do tabeli favorites...");
+                db.run("ALTER TABLE favorites ADD COLUMN playlist_id INTEGER", (alterErr) => {
+                    if (alterErr) {
+                        console.error("Błąd dodawania kolumny playlist_id do favorites:", alterErr);
+                    } else {
+                        console.log("✅ Dodano kolumnę playlist_id do favorites");
+                    }
+                });
+            }
+        });
+        
+        // Dodaj playlist_id do downloads
+        db.all("PRAGMA table_info(downloads)", [], (err, columns) => {
+            if (err) {
+                console.error("Błąd sprawdzania struktury tabeli downloads:", err);
+                return;
+            }
+            
+            const columnNames = columns.map(col => col.name);
+            
+            if (!columnNames.includes('playlist_id')) {
+                console.log("Dodawanie kolumny playlist_id do tabeli downloads...");
+                db.run("ALTER TABLE downloads ADD COLUMN playlist_id INTEGER", (alterErr) => {
+                    if (alterErr) {
+                        console.error("Błąd dodawania kolumny playlist_id do downloads:", alterErr);
+                    } else {
+                        console.log("✅ Dodano kolumnę playlist_id do downloads");
+                    }
+                });
+            }
+        });
+
+        db.run(`
             CREATE TABLE IF NOT EXISTS media (
                 stream_id INTEGER, name TEXT, stream_icon TEXT, rating REAL,
                 tmdb_id TEXT, stream_type TEXT, container_extension TEXT,
-                PRIMARY KEY (stream_id, stream_type)
+                playlist_id INTEGER,
+                PRIMARY KEY (stream_id, stream_type),
+                FOREIGN KEY (playlist_id) REFERENCES playlists(id)
             )
         `);
         
@@ -50,31 +132,34 @@ function initializeDb() {
         
         db.run(`
             CREATE TABLE IF NOT EXISTS favorites (
-                stream_id INTEGER, stream_type TEXT, added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (stream_id, stream_type)
+                stream_id INTEGER, stream_type TEXT, playlist_id INTEGER,
+                added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (stream_id, stream_type, playlist_id),
+                FOREIGN KEY (playlist_id) REFERENCES playlists(id)
             )
         `);
         
-        // Rozszerzona tabela downloads z nowymi kolumnami
+        // Zaktualizowana tabela downloads
         db.run(`
             CREATE TABLE IF NOT EXISTS downloads (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 stream_id INTEGER,
                 stream_type TEXT,
+                playlist_id INTEGER,
                 episode_id TEXT,
                 filename TEXT,
                 filepath TEXT,
-                status TEXT DEFAULT 'queued', -- queued, downloading, completed, failed
-                worker_status TEXT DEFAULT 'queued', -- queued, downloading, completed, failed
-                download_status TEXT DEFAULT 'pending', -- pending, downloading, completed, failed
+                status TEXT DEFAULT 'queued',
+                worker_status TEXT DEFAULT 'queued',
+                download_status TEXT DEFAULT 'pending',
                 progress INTEGER DEFAULT 0,
                 error_message TEXT,
                 download_url TEXT,
-                added_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (playlist_id) REFERENCES playlists(id)
             )
         `);
         
-        // Tabela logów pobierania
         db.run(`
             CREATE TABLE IF NOT EXISTS download_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -85,6 +170,8 @@ function initializeDb() {
                 FOREIGN KEY (download_id) REFERENCES downloads(id)
             )
         `);
+        
+        console.log("Baza danych zainicjalizowana z systemem playlist");
         
         // Dodaj nowe kolumny do istniejącej tabeli downloads jeśli nie istnieją
         db.all("PRAGMA table_info(downloads)", [], (err, columns) => {
@@ -138,6 +225,69 @@ function stmtRun(stmt, params = []) {
     });
 }
 
+// === FUNKCJA MIGRACJI ISTNIEJĄCYCH DANYCH ===
+async function migrateExistingDataToPlaylists() {
+    console.log('🔄 Rozpoczynanie migracji do systemu wielu playlist...');
+    
+    try {
+        // Sprawdź czy już istnieje domyślna playlista
+        const existingPlaylists = await dbAll('SELECT * FROM playlists');
+        
+        if (existingPlaylists.length === 0) {
+            console.log('Tworzenie domyślnej playlisty...');
+            
+            // Pobierz istniejące ustawienia Xtream
+            const settingsRows = await dbAll(`SELECT key, value FROM settings WHERE key IN ('serverUrl', 'username', 'password')`);
+            const settings = settingsRows.reduce((acc, row) => ({...acc, [row.key]: row.value }), {});
+            
+            if (settings.serverUrl && settings.username && settings.password) {
+                // Utwórz domyślną playlistę z istniejących ustawień
+                const defaultPlaylistResult = await dbRun(`
+                    INSERT INTO playlists (name, server_url, username, password, is_active, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                `, ['Domyślna Playlista', settings.serverUrl, settings.username, settings.password, 1, new Date().toISOString()]);
+                
+                const defaultPlaylistId = defaultPlaylistResult.lastID;
+                console.log(`✅ Utworzono domyślną playlistę z ID: ${defaultPlaylistId}`);
+                
+                // Przypisz wszystkie istniejące media do domyślnej playlisty
+                const mediaUpdateResult = await dbRun(`
+                    UPDATE media SET playlist_id = ? WHERE playlist_id IS NULL
+                `, [defaultPlaylistId]);
+                
+                console.log(`✅ Zaktualizowano ${mediaUpdateResult.changes} pozycji media`);
+                
+                // Przypisz wszystkie istniejące ulubione do domyślnej playlisty  
+                const favoritesUpdateResult = await dbRun(`
+                    UPDATE favorites SET playlist_id = ? WHERE playlist_id IS NULL
+                `, [defaultPlaylistId]);
+                
+                console.log(`✅ Zaktualizowano ${favoritesUpdateResult.changes} ulubionych`);
+                
+                // Przypisz wszystkie istniejące pobierania do domyślnej playlisty
+                const downloadsUpdateResult = await dbRun(`
+                    UPDATE downloads SET playlist_id = ? WHERE playlist_id IS NULL
+                `, [defaultPlaylistId]);
+                
+                console.log(`✅ Zaktualizowano ${downloadsUpdateResult.changes} pobierań`);
+                
+                // Zaktualizuj licznik mediów w playliście
+                const mediaCount = await dbAll(`SELECT COUNT(*) as count FROM media WHERE playlist_id = ?`, [defaultPlaylistId]);
+                await dbRun(`UPDATE playlists SET media_count = ? WHERE id = ?`, [mediaCount[0].count, defaultPlaylistId]);
+                
+                console.log('🎉 Migracja do systemu playlist zakończona pomyślnie!');
+                
+            } else {
+                console.log('⚠️ Brak ustawień Xtream - migracja zostanie wykonana po pierwszym zapisie ustawień');
+            }
+        } else {
+            console.log('Playlisty już istnieją - pomijanie migracji');
+        }
+        
+    } catch (error) {
+        console.error('❌ Błąd podczas migracji playlist:', error);
+    }
+}
 // --- Funkcja retry dla API calls ---
 async function makeRetryRequest(url, options = {}, maxRetries = 3, delay = 1000) {
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -204,7 +354,215 @@ app.use(express.json());
 
 
 // Dodaj te endpoint'y do server.js
+// === API PLAYLISTS ===
 
+// Pobierz wszystkie playlisty
+app.get('/api/playlists', async (req, res) => {
+    try {
+        const playlists = await dbAll(`
+            SELECT 
+                p.*,
+                COUNT(m.stream_id) as media_count,
+                COUNT(CASE WHEN f.stream_id IS NOT NULL THEN 1 END) as favorites_count
+            FROM playlists p
+            LEFT JOIN media m ON p.id = m.playlist_id
+            LEFT JOIN favorites f ON p.id = f.playlist_id
+            GROUP BY p.id
+            ORDER BY p.created_at DESC
+        `);
+        
+        res.json(playlists);
+    } catch (error) {
+        console.error('Błąd pobierania playlist:', error);
+        res.status(500).json({ error: 'Nie udało się pobrać playlist.' });
+    }
+});
+
+// Pobierz jedną playlistę
+app.get('/api/playlists/:id', async (req, res) => {
+    const { id } = req.params;
+    try {
+        const playlist = await dbAll(`
+            SELECT 
+                p.*,
+                COUNT(m.stream_id) as media_count,
+                COUNT(CASE WHEN f.stream_id IS NOT NULL THEN 1 END) as favorites_count
+            FROM playlists p
+            LEFT JOIN media m ON p.id = m.playlist_id
+            LEFT JOIN favorites f ON p.id = f.playlist_id
+            WHERE p.id = ?
+            GROUP BY p.id
+        `, [id]);
+        
+        if (playlist.length === 0) {
+            return res.status(404).json({ error: 'Playlista nie znaleziona.' });
+        }
+        
+        res.json(playlist[0]);
+    } catch (error) {
+        console.error('Błąd pobierania playlisty:', error);
+        res.status(500).json({ error: 'Nie udało się pobrać playlisty.' });
+    }
+});
+
+// Dodaj nową playlistę
+app.post('/api/playlists', async (req, res) => {
+    const { name, server_url, username, password, is_active = true } = req.body;
+    
+    if (!name || !server_url || !username || !password) {
+        return res.status(400).json({ error: 'Wszystkie pola są wymagane.' });
+    }
+    
+    try {
+        // Sprawdź czy nazwa nie jest zajęta
+        const existing = await dbAll('SELECT id FROM playlists WHERE name = ?', [name]);
+        if (existing.length > 0) {
+            return res.status(400).json({ error: 'Playlista o tej nazwie już istnieje.' });
+        }
+        
+        const result = await dbRun(`
+            INSERT INTO playlists (name, server_url, username, password, is_active, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        `, [name, server_url, username, password, is_active ? 1 : 0, new Date().toISOString()]);
+        
+        const newPlaylist = await dbAll('SELECT * FROM playlists WHERE id = ?', [result.lastID]);
+        
+        console.log(`✅ Utworzono nową playlistę: ${name} (ID: ${result.lastID})`);
+        res.status(201).json(newPlaylist[0]);
+        
+    } catch (error) {
+        console.error('Błąd tworzenia playlisty:', error);
+        res.status(500).json({ error: 'Nie udało się utworzyć playlisty.' });
+    }
+});
+
+// Edytuj playlistę
+app.put('/api/playlists/:id', async (req, res) => {
+    const { id } = req.params;
+    const { name, server_url, username, password, is_active } = req.body;
+    
+    if (!name || !server_url || !username || !password) {
+        return res.status(400).json({ error: 'Wszystkie pola są wymagane.' });
+    }
+    
+    try {
+        // Sprawdź czy playlista istnieje
+        const existing = await dbAll('SELECT * FROM playlists WHERE id = ?', [id]);
+        if (existing.length === 0) {
+            return res.status(404).json({ error: 'Playlista nie znaleziona.' });
+        }
+        
+        // Sprawdź czy nazwa nie koliduje z inną playlistą
+        const nameConflict = await dbAll('SELECT id FROM playlists WHERE name = ? AND id != ?', [name, id]);
+        if (nameConflict.length > 0) {
+            return res.status(400).json({ error: 'Playlista o tej nazwie już istnieje.' });
+        }
+        
+        await dbRun(`
+            UPDATE playlists 
+            SET name = ?, server_url = ?, username = ?, password = ?, is_active = ?
+            WHERE id = ?
+        `, [name, server_url, username, password, is_active ? 1 : 0, id]);
+        
+        const updatedPlaylist = await dbAll('SELECT * FROM playlists WHERE id = ?', [id]);
+        
+        console.log(`✅ Zaktualizowano playlistę: ${name} (ID: ${id})`);
+        res.json(updatedPlaylist[0]);
+        
+    } catch (error) {
+        console.error('Błąd edycji playlisty:', error);
+        res.status(500).json({ error: 'Nie udało się zaktualizować playlisty.' });
+    }
+});
+
+// Usuń playlistę
+app.delete('/api/playlists/:id', async (req, res) => {
+    const { id } = req.params;
+    
+    try {
+        // Sprawdź czy playlista istnieje
+        const playlist = await dbAll('SELECT * FROM playlists WHERE id = ?', [id]);
+        if (playlist.length === 0) {
+            return res.status(404).json({ error: 'Playlista nie znaleziona.' });
+        }
+        
+        // Sprawdź ile ma mediów
+        const mediaCount = await dbAll('SELECT COUNT(*) as count FROM media WHERE playlist_id = ?', [id]);
+        
+        if (mediaCount[0].count > 0) {
+            return res.status(400).json({ 
+                error: `Nie można usunąć playlisty zawierającej ${mediaCount[0].count} pozycji. Usuń najpierw media lub przenieś je do innej playlisty.` 
+            });
+        }
+        
+        // Usuń powiązane dane
+        await dbRun('DELETE FROM favorites WHERE playlist_id = ?', [id]);
+        await dbRun('DELETE FROM downloads WHERE playlist_id = ?', [id]);
+        await dbRun('DELETE FROM playlists WHERE id = ?', [id]);
+        
+        console.log(`🗑️ Usunięto playlistę: ${playlist[0].name} (ID: ${id})`);
+        res.json({ message: 'Playlista została usunięta.' });
+        
+    } catch (error) {
+        console.error('Błąd usuwania playlisty:', error);
+        res.status(500).json({ error: 'Nie udało się usunąć playlisty.' });
+    }
+});
+
+// Przełącz aktywność playlisty
+app.post('/api/playlists/:id/toggle', async (req, res) => {
+    const { id } = req.params;
+    
+    try {
+        const playlist = await dbAll('SELECT * FROM playlists WHERE id = ?', [id]);
+        if (playlist.length === 0) {
+            return res.status(404).json({ error: 'Playlista nie znaleziona.' });
+        }
+        
+        const newStatus = playlist[0].is_active ? 0 : 1;
+        await dbRun('UPDATE playlists SET is_active = ? WHERE id = ?', [newStatus, id]);
+        
+        const updatedPlaylist = await dbAll('SELECT * FROM playlists WHERE id = ?', [id]);
+        
+        console.log(`🔄 Przełączono status playlisty ${playlist[0].name}: ${newStatus ? 'aktywna' : 'nieaktywna'}`);
+        res.json(updatedPlaylist[0]);
+        
+    } catch (error) {
+        console.error('Błąd przełączania statusu playlisty:', error);
+        res.status(500).json({ error: 'Nie udało się zmienić statusu playlisty.' });
+    }
+});
+
+// Status wszystkich playlist - przegląd
+app.get('/api/playlists/overview', async (req, res) => {
+    try {
+        const overview = await dbAll(`
+            SELECT 
+                COUNT(*) as total_playlists,
+                COUNT(CASE WHEN is_active = 1 THEN 1 END) as active_playlists,
+                SUM(media_count) as total_media,
+                AVG(media_count) as avg_media_per_playlist
+            FROM playlists
+        `);
+        
+        const recentActivity = await dbAll(`
+            SELECT name, last_sync, media_count
+            FROM playlists 
+            WHERE last_sync IS NOT NULL
+            ORDER BY last_sync DESC
+            LIMIT 5
+        `);
+        
+        res.json({
+            overview: overview[0],
+            recent_activity: recentActivity
+        });
+        
+    } catch (error) {
+        console.error('Błąd pobierania przeglądu playlist:', error);
+        res.status(500).json({ error: 'Nie udało się pobrać przeglądu playlist.' });
+    }
+});
 // --- API: Ręczna synchronizacja TMDB ---
 app.post('/api/tmdb/sync', async (req, res) => {
     const { limit = 100 } = req.body;
@@ -432,65 +790,182 @@ app.get('/api/genres', (req, res) => {
 });
 
 // --- API ULUBIONE ---
+// W server.js, zamień istniejące API ulubionych:
+
+// --- API ULUBIONE (ZAKTUALIZOWANE) ---
 app.get('/api/favorites', async (req, res) => {
     try {
-        const rows = await dbAll('SELECT stream_id, stream_type FROM favorites');
+        const rows = await dbAll(`
+            SELECT f.stream_id, f.stream_type, f.playlist_id, p.name as playlist_name
+            FROM favorites f
+            LEFT JOIN playlists p ON f.playlist_id = p.id
+        `);
         res.json(rows);
     } catch (error) {
+        console.error('Błąd pobierania ulubionych:', error);
         res.status(500).json({ error: 'Nie udało się pobrać ulubionych.' });
     }
 });
 
 app.post('/api/favorites/toggle', async (req, res) => {
-    const { stream_id, stream_type } = req.body;
+    const { stream_id, stream_type, playlist_id } = req.body;
+    
     if (!stream_id || !stream_type) {
-        return res.status(400).json({ error: 'Brakujące dane.' });
+        return res.status(400).json({ error: 'Brakujące stream_id lub stream_type.' });
     }
-    try {
-        const existing = await dbAll('SELECT * FROM favorites WHERE stream_id = ? AND stream_type = ?', [stream_id, stream_type]);
-        if (existing.length > 0) {
-            await dbRun('DELETE FROM favorites WHERE stream_id = ? AND stream_type = ?', [stream_id, stream_type]);
-            res.json({ status: 'removed' });
-        } else {
-            await dbRun('INSERT INTO favorites (stream_id, stream_type) VALUES (?, ?)', [stream_id, stream_type]);
-            res.json({ status: 'added' });
+    
+    // Jeśli nie podano playlist_id, spróbuj go znaleźć z tabeli media
+    let finalPlaylistId = playlist_id;
+    if (!finalPlaylistId) {
+        try {
+            const mediaItem = await dbAll(
+                'SELECT playlist_id FROM media WHERE stream_id = ? AND stream_type = ? LIMIT 1', 
+                [stream_id, stream_type]
+            );
+            if (mediaItem.length > 0) {
+                finalPlaylistId = mediaItem[0].playlist_id;
+            }
+        } catch (error) {
+            console.error('Błąd znajdowania playlist_id:', error);
         }
+    }
+    
+    if (!finalPlaylistId) {
+        return res.status(400).json({ error: 'Nie można określić playlist_id dla tego elementu.' });
+    }
+    
+    try {
+        // Sprawdź czy już istnieje w ulubionych
+        const existing = await dbAll(
+            'SELECT * FROM favorites WHERE stream_id = ? AND stream_type = ? AND playlist_id = ?', 
+            [stream_id, stream_type, finalPlaylistId]
+        );
+        
+        if (existing.length > 0) {
+            // Usuń z ulubionych
+            await dbRun(
+                'DELETE FROM favorites WHERE stream_id = ? AND stream_type = ? AND playlist_id = ?', 
+                [stream_id, stream_type, finalPlaylistId]
+            );
+            res.json({ status: 'removed', playlist_id: finalPlaylistId });
+        } else {
+            // Dodaj do ulubionych
+            await dbRun(
+                'INSERT INTO favorites (stream_id, stream_type, playlist_id) VALUES (?, ?, ?)', 
+                [stream_id, stream_type, finalPlaylistId]
+            );
+            res.json({ status: 'added', playlist_id: finalPlaylistId });
+        }
+        
     } catch (error) {
+        console.error('Błąd zmiany statusu ulubionych:', error);
         res.status(500).json({ error: 'Błąd podczas zmiany statusu ulubionych.' });
     }
 });
 
 // --- API MEDIA ---
+// W server.js, zamień istniejący endpoint /api/media na ten zaktualizowany:
+
 app.get('/api/media', (req, res) => {
-    const { page = 1, limit = 30, search = '', genre = 'all', filter = '' } = req.query;
+    const { 
+        page = 1, 
+        limit = 30, 
+        search = '', 
+        genre = 'all', 
+        filter = '',
+        playlist = 'all'  // NOWY PARAMETR
+    } = req.query;
+    
     const offset = (page - 1) * limit;
     let params = [];
-    let fromClause = 'FROM media m';
+    
+    // Dodaj JOIN z playlistami żeby mieć nazwę playlisty
+    let fromClause = `
+        FROM media m 
+        LEFT JOIN playlists p ON m.playlist_id = p.id
+    `;
+    let selectClause = 'SELECT DISTINCT m.*, p.name as playlist_name';
+    
     let whereClauses = [];
+    
+    // Filtr ulubione
     if (filter === 'favorites') {
-        fromClause += ' JOIN favorites f ON m.stream_id = f.stream_id AND m.stream_type = f.stream_type';
+        fromClause += ' JOIN favorites f ON m.stream_id = f.stream_id AND m.stream_type = f.stream_type AND m.playlist_id = f.playlist_id';
     }
+    
+    // Filtr gatunków
     if (genre && genre !== 'all') {
         fromClause += ' JOIN media_genres mg ON m.stream_id = mg.media_stream_id AND m.stream_type = mg.media_stream_type';
         whereClauses.push('mg.genre_id = ?');
         params.push(genre);
     }
+    
+    // Filtr wyszukiwania
     if (search) {
         whereClauses.push(`m.name LIKE ?`);
         params.push(`%${search}%`);
     }
+    
+    // NOWY: Filtr playlist
+    if (playlist && playlist !== 'all') {
+        if (playlist.includes(',')) {
+            // Wiele playlist - playlist=1,2,3
+            const playlistIds = playlist.split(',').map(id => parseInt(id)).filter(id => !isNaN(id));
+            if (playlistIds.length > 0) {
+                whereClauses.push(`m.playlist_id IN (${playlistIds.map(() => '?').join(',')})`);
+                params.push(...playlistIds);
+            }
+        } else {
+            // Pojedyncza playlista
+            const playlistId = parseInt(playlist);
+            if (!isNaN(playlistId)) {
+                whereClauses.push('m.playlist_id = ?');
+                params.push(playlistId);
+            }
+        }
+    }
+    
     const whereString = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
-    const dataSql = `SELECT DISTINCT m.* ${fromClause} ${whereString} ORDER BY m.name ASC LIMIT ? OFFSET ?`;
-    const countSql = `SELECT COUNT(DISTINCT m.stream_id) as total ${fromClause} ${whereString}`;
+    
+    // Zapytania SQL
+    const dataSql = `${selectClause} ${fromClause} ${whereString} ORDER BY m.name ASC LIMIT ? OFFSET ?`;
+    const countSql = `SELECT COUNT(DISTINCT m.stream_id, m.stream_type, m.playlist_id) as total ${fromClause} ${whereString}`;
+    
     const countParams = [...params];
     params.push(limit, offset);
+    
+    // Wykonaj zapytanie liczące
     db.get(countSql, countParams, (err, row) => {
-        if (err) { res.status(500).json({ error: err.message }); return; }
+        if (err) { 
+            console.error('Błąd zapytania count:', err);
+            res.status(500).json({ error: err.message }); 
+            return; 
+        }
+        
         const totalItems = row.total;
         const totalPages = Math.ceil(totalItems / limit);
+        
+        // Wykonaj zapytanie główne
         db.all(dataSql, params, (err, rows) => {
-            if (err) { res.status(500).json({ error: err.message }); return; }
-            res.json({ items: rows, totalPages, currentPage: parseInt(page), totalItems });
+            if (err) { 
+                console.error('Błąd zapytania media:', err);
+                res.status(500).json({ error: err.message }); 
+                return; 
+            }
+            
+            res.json({ 
+                items: rows, 
+                totalPages, 
+                currentPage: parseInt(page), 
+                totalItems,
+                // DODATKOWE INFO
+                applied_filters: {
+                    search: search || null,
+                    genre: genre !== 'all' ? genre : null,
+                    filter: filter || null,
+                    playlist: playlist !== 'all' ? playlist : null
+                }
+            });
         });
     });
 });
