@@ -2246,7 +2246,7 @@ app.listen(PORT, () => {
     setTimeout(autoStartDownloadManager, 3000); // Czekaj 3s na inicjalizację bazy
 });
 
-// Zamień istniejący cron job na końcu server.js na:
+// W server.js, zamień istniejący cron job na ten zaktualizowany:
 
 cron.schedule('0 * * * *', async () => { // Uruchamia się co godzinę
     const currentTime = new Date().toLocaleString('pl-PL');
@@ -2257,18 +2257,71 @@ cron.schedule('0 * * * *', async () => { // Uruchamia się co godzinę
         const frequency = parseInt(settingsRows[0]?.value || '12', 10);
         const currentHour = new Date().getHours();
 
-        // Uruchom monitorowanie ulubionych zgodnie z ustawioną częstotliwością
+        // === NOWE: ODŚWIEŻANIE WSZYSTKICH AKTYWNYCH PLAYLIST ===
         if (currentHour % frequency === 0) {
-            console.log(`📺 Uruchamianie monitorowania ulubionych (częstotliwość: co ${frequency}h)`);
+            console.log(`📡 Uruchamianie automatycznego odświeżania playlist (częstotliwość: co ${frequency}h)`);
             try {
-                await monitorFavorites();
+                // Pobierz wszystkie aktywne playlisty
+                const activePlaylists = await dbAll('SELECT * FROM playlists WHERE is_active = 1');
+                
+                if (activePlaylists.length > 0) {
+                    console.log(`🔄 Znaleziono ${activePlaylists.length} aktywnych playlist do odświeżenia`);
+                    
+                    let successCount = 0;
+                    let errorCount = 0;
+                    
+                    // Synchronizuj każdą aktywną playlistę
+                    for (const playlist of activePlaylists) {
+                        try {
+                            console.log(`📺 Auto-sync: ${playlist.name}...`);
+                            const result = await syncSinglePlaylist(playlist);
+                            console.log(`✅ ${playlist.name}: +${result.added} -${result.removed} (${result.total_media} total)`);
+                            successCount++;
+                        } catch (playlistError) {
+                            console.error(`❌ Błąd auto-sync ${playlist.name}: ${playlistError.message}`);
+                            errorCount++;
+                        }
+                        
+                        // Krótka przerwa między playlistami
+                        await new Promise(resolve => setTimeout(resolve, 2000));
+                    }
+                    
+                    console.log(`📊 Auto-sync zakończony: ${successCount} udanych, ${errorCount} błędów`);
+                    
+                    // Wyślij powiadomienie Discord o wynikach
+                    if (successCount > 0 || errorCount > 0) {
+                        try {
+                            const webhookUrl = await dbAll('SELECT value FROM settings WHERE key = ?', ['discordWebhook']);
+                            if (webhookUrl && webhookUrl[0] && webhookUrl[0].value) {
+                                await axios.post(webhookUrl[0].value, {
+                                    content: `🔄 **Automatyczne odświeżanie playlist zakończone**\n✅ Udane: ${successCount}\n❌ Błędy: ${errorCount}`,
+                                    username: "Media Center Auto-Sync"
+                                });
+                            }
+                        } catch (discordError) {
+                            console.error("Nie udało się wysłać powiadomienia Discord:", discordError.message);
+                        }
+                    }
+                } else {
+                    console.log(`⏳ Brak aktywnych playlist do synchronizacji`);
+                }
+            } catch (error) {
+                console.error(`❌ Błąd automatycznego odświeżania playlist: ${error.message}`);
+            }
+        } else {
+            const nextCheck = frequency - (currentHour % frequency);
+            console.log(`⏳ Pominięto odświeżanie playlist. Następne sprawdzenie za ${nextCheck}h (o ${(currentHour + nextCheck) % 24}:00).`);
+        }
+
+        // === NOWE: MONITOROWANIE ULUBIONYCH Z WSZYSTKICH PLAYLIST ===
+        if (currentHour % frequency === 0) {
+            console.log(`📺 Uruchamianie monitorowania ulubionych...`);
+            try {
+                await monitorFavoritesMultiPlaylist(); // NOWA FUNKCJA
                 console.log(`✅ Monitorowanie ulubionych zakończone pomyślnie`);
             } catch (error) {
                 console.error(`❌ Błąd monitorowania ulubionych: ${error.message}`);
             }
-        } else {
-            const nextCheck = frequency - (currentHour % frequency);
-            console.log(`⏳ Pominięto monitorowanie ulubionych. Następne sprawdzenie za ${nextCheck}h (o ${(currentHour + nextCheck) % 24}:00).`);
         }
 
         // Zawsze uruchamiaj uzupełnianie brakujących gatunków
@@ -2286,6 +2339,195 @@ cron.schedule('0 * * * *', async () => { // Uruchamia się co godzinę
     
     console.log(`🏁 [${new Date().toLocaleString('pl-PL')}] Zaplanowane zadania zakończone`);
 });
+
+// === NOWA FUNKCJA: Monitorowanie ulubionych z wielu playlist ===
+async function monitorFavoritesMultiPlaylist() {
+    console.log('Uruchamianie zadania monitorowania ulubionych (multi-playlist)...');
+    
+    try {
+        // Pobierz wszystkie ulubione seriale z wszystkich playlist
+        const favoriteSeries = await dbAll(`
+            SELECT f.*, p.server_url, p.username, p.password, p.name as playlist_name, p.is_active
+            FROM favorites f
+            JOIN playlists p ON f.playlist_id = p.id
+            WHERE f.stream_type = 'series' AND p.is_active = 1
+        `);
+        
+        if (favoriteSeries.length === 0) {
+            console.log('Monitorowanie zakończone: brak ulubionych seriali do sprawdzenia.');
+            return;
+        }
+
+        console.log(`Znaleziono ${favoriteSeries.length} ulubionych seriali z aktywnych playlist do sprawdzenia...`);
+        let newDownloadsAdded = false;
+
+        // Grupuj ulubione według playlist dla lepszej wydajności
+        const playlistGroups = {};
+        favoriteSeries.forEach(series => {
+            if (!playlistGroups[series.playlist_id]) {
+                playlistGroups[series.playlist_id] = {
+                    playlist: series,
+                    series: []
+                };
+            }
+            playlistGroups[series.playlist_id].series.push(series);
+        });
+
+        for (const [playlistId, group] of Object.entries(playlistGroups)) {
+            const { playlist, series: playlistSeries } = group;
+            console.log(`🔍 Sprawdzanie playlist: ${playlist.playlist_name} (${playlistSeries.length} seriali)...`);
+
+            for (const series of playlistSeries) {
+                try {
+                    // Pobierz szczegóły serialu z odpowiedniej playlisty
+                    const xtreamBaseUrl = `${playlist.server_url}/player_api.php?username=${playlist.username}&password=${playlist.password}`;
+                    const seriesInfoUrl = `${xtreamBaseUrl}&action=get_series_info&series_id=${series.stream_id}`;
+                    
+                    const seriesInfoRes = await axios.get(seriesInfoUrl, { timeout: 15000 });
+                    
+                    if (!seriesInfoRes.data?.episodes) {
+                        console.warn(`⚠️ Brak odcinków dla serialu ${series.stream_id} z ${playlist.playlist_name}`);
+                        continue;
+                    }
+
+                    const allEpisodes = Object.values(seriesInfoRes.data.episodes).flat();
+                    
+                    // Sprawdź odcinki które są completed, downloading, lub mają już 3+ nieudane próby
+                    const existingDownloads = await dbAll(`
+                        SELECT 
+                            episode_id,
+                            COUNT(*) as attempt_count,
+                            MAX(CASE WHEN worker_status = 'completed' THEN 1 ELSE 0 END) as is_completed,
+                            MAX(CASE WHEN worker_status = 'downloading' THEN 1 ELSE 0 END) as is_downloading
+                        FROM downloads 
+                        WHERE stream_id = ? AND stream_type = ? AND playlist_id = ?
+                        GROUP BY episode_id
+                        HAVING 
+                            is_completed = 1 
+                            OR is_downloading = 1 
+                            OR attempt_count >= 3
+                    `, [series.stream_id, 'series', playlist.playlist_id]);
+
+                    const excludedEpisodeIds = new Set(existingDownloads.map(row => row.episode_id));
+
+                    console.log(`  - ${playlist.playlist_name}/${series.stream_id}: ${allEpisodes.length} odcinków, ${excludedEpisodeIds.size} wykluczonych`);
+
+                    // Sprawdź ile jest failed z mniej niż 3 próbami (do retry)
+                    const retryableDownloads = await dbAll(`
+                        SELECT 
+                            episode_id,
+                            COUNT(*) as attempt_count
+                        FROM downloads 
+                        WHERE stream_id = ? AND stream_type = ? AND playlist_id = ?
+                        AND worker_status = 'failed'
+                        GROUP BY episode_id
+                        HAVING attempt_count < 3
+                    `, [series.stream_id, 'series', playlist.playlist_id]);
+
+                    // Sprawdź ile ma już 3+ prób (do usunięcia)
+                    const maxAttemptsDownloads = await dbAll(`
+                        SELECT 
+                            episode_id,
+                            COUNT(*) as attempt_count
+                        FROM downloads 
+                        WHERE stream_id = ? AND stream_type = ? AND playlist_id = ?
+                        AND worker_status = 'failed'
+                        GROUP BY episode_id
+                        HAVING attempt_count >= 3
+                    `, [series.stream_id, 'series', playlist.playlist_id]);
+
+                    // Usuń downloads które mają już 3+ nieudane próby
+                    if (maxAttemptsDownloads.length > 0) {
+                        console.log(`🗑️ Usuwanie ${maxAttemptsDownloads.length} odcinków z 3+ nieudanymi próbami z ${playlist.playlist_name}...`);
+                        
+                        for (const item of maxAttemptsDownloads) {
+                            try {
+                                await dbRun(`
+                                    DELETE FROM downloads 
+                                    WHERE stream_id = ? AND stream_type = ? AND playlist_id = ? AND episode_id = ?
+                                `, [series.stream_id, 'series', playlist.playlist_id, item.episode_id]);
+                            } catch (error) {
+                                console.error(`❌ Błąd usuwania downloads dla odcinka ${item.episode_id}:`, error);
+                            }
+                        }
+                        
+                        // Zaktualizuj listę wykluczonych po usunięciu
+                        const updatedExistingDownloads = await dbAll(`
+                            SELECT 
+                                episode_id,
+                                COUNT(*) as attempt_count,
+                                MAX(CASE WHEN worker_status = 'completed' THEN 1 ELSE 0 END) as is_completed,
+                                MAX(CASE WHEN worker_status = 'downloading' THEN 1 ELSE 0 END) as is_downloading
+                            FROM downloads 
+                            WHERE stream_id = ? AND stream_type = ? AND playlist_id = ?
+                            GROUP BY episode_id
+                            HAVING 
+                                is_completed = 1 
+                                OR is_downloading = 1 
+                                OR attempt_count >= 3
+                        `, [series.stream_id, 'series', playlist.playlist_id]);
+                        
+                        excludedEpisodeIds.clear();
+                        updatedExistingDownloads.forEach(row => excludedEpisodeIds.add(row.episode_id));
+                    }
+
+                    // Filtruj odcinki do dodania
+                    const newEpisodes = allEpisodes.filter(ep => !excludedEpisodeIds.has(ep.id));
+
+                    if (newEpisodes.length > 0) {
+                        console.log(`✨ Znaleziono ${newEpisodes.length} odcinków do dodania dla serialu z ${playlist.playlist_name}`);
+                        newDownloadsAdded = true;
+
+                        const seriesName = seriesInfoRes.data?.info?.name || `Serial ${series.stream_id}`;
+                        const episodesToQueue = newEpisodes.map(ep => {
+                            const filename = `${seriesName.replace(/[^\w\s.-]/gi, '').trim()} - S${String(ep.season).padStart(2, '0')}E${String(ep.episode_num).padStart(2, '0')}`;
+                            return { id: ep.id, filename };
+                        });
+
+                        await axios.post(`http://localhost:${PORT}/api/downloads/start`, {
+                            stream_id: series.stream_id,
+                            stream_type: 'series',
+                            playlist_id: playlist.playlist_id,
+                            episodes: episodesToQueue
+                        });
+
+                        const episodeList = newEpisodes.map(ep => 
+                            `S${String(ep.season).padStart(2, '0')}E${String(ep.episode_num).padStart(2, '0')}`
+                        ).join(', ');
+                        
+                        // Wyślij powiadomienie Discord
+                        try {
+                            await sendDiscordNotification(
+                                `✅ **${seriesName}** (${playlist.playlist_name}) - dodano do kolejki: **${episodeList}**`
+                            );
+                        } catch (discordError) {
+                            console.error("Błąd wysyłania powiadomienia Discord:", discordError.message);
+                        }
+                    }
+
+                } catch (seriesError) {
+                    console.error(`❌ Błąd podczas sprawdzania serialu ID ${series.stream_id} z ${playlist.playlist_name}:`, seriesError.message);
+                    continue;
+                }
+                
+                // Krótka przerwa między serialami
+                await new Promise(resolve => setTimeout(resolve, 500));
+            }
+            
+            // Przerwa między playlistami
+            await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+
+        if (!newDownloadsAdded) {
+            console.log('✅ Monitorowanie zakończone: nie znaleziono nowych odcinków.');
+        } else {
+            console.log('✅ Monitorowanie zakończone: znaleziono i dodano nowe odcinki.');
+        }
+
+    } catch (error) {
+        console.error("❌ Wystąpił błąd podczas monitorowania ulubionych (multi-playlist):", error.message);
+    }
+}
 
 // Dodaj również cron job do testowania (uruchamia się co 5 minut - tylko do debugowania)
 cron.schedule('*/5 * * * *', async () => {
