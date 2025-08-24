@@ -864,7 +864,6 @@ app.post('/api/favorites/toggle', async (req, res) => {
 });
 
 // --- API MEDIA ---
-// W server.js, zamień istniejący endpoint /api/media na ten zaktualizowany:
 
 app.get('/api/media', (req, res) => {
     const { 
@@ -873,7 +872,7 @@ app.get('/api/media', (req, res) => {
         search = '', 
         genre = 'all', 
         filter = '',
-        playlist = 'all'  // NOWY PARAMETR
+        playlist = 'all'
     } = req.query;
     
     const offset = (page - 1) * limit;
@@ -927,9 +926,18 @@ app.get('/api/media', (req, res) => {
     
     const whereString = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
     
-    // Zapytania SQL
+    // POPRAWIONE ZAPYTANIA SQL
     const dataSql = `${selectClause} ${fromClause} ${whereString} ORDER BY m.name ASC LIMIT ? OFFSET ?`;
-    const countSql = `SELECT COUNT(DISTINCT m.stream_id, m.stream_type, m.playlist_id) as total ${fromClause} ${whereString}`;
+    
+    // POPRAWKA: Użyj subquery dla COUNT z DISTINCT
+    const countSql = `
+        SELECT COUNT(*) as total 
+        FROM (
+            SELECT DISTINCT m.stream_id, m.stream_type, m.playlist_id
+            ${fromClause} 
+            ${whereString}
+        ) as distinct_items
+    `;
     
     const countParams = [...params];
     params.push(limit, offset);
@@ -958,7 +966,6 @@ app.get('/api/media', (req, res) => {
                 totalPages, 
                 currentPage: parseInt(page), 
                 totalItems,
-                // DODATKOWE INFO
                 applied_filters: {
                     search: search || null,
                     genre: genre !== 'all' ? genre : null,
