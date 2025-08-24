@@ -1207,8 +1207,11 @@ const SettingsView = () => {
                         </div>
                     )}
 
+                    // Zamień całą końcówkę SettingsView (od formularza) na tę poprawioną:
+
                     {/* Formularz ustawień */}
                     <div className="max-w-2xl mx-auto bg-gray-800 p-8 rounded-lg shadow-2xl">
+                        <form onSubmit={handleSave} className="space-y-6">
                             <div className="p-4 border border-gray-700 rounded-lg">
                                 <h3 className="text-lg font-semibold mb-3 text-white">Dane logowania Xtream (Domyślne)</h3>
                                 <div className="text-sm text-gray-400 mb-4">
@@ -1230,14 +1233,17 @@ const SettingsView = () => {
                                     </div>
                                 </div>
                             </div>
+                            
                             <div>
                                 <label htmlFor="tmdbApi" className="block text-sm font-medium text-gray-300">Klucz API do TMDB</label>
                                 <input type="password" id="tmdbApi" name="tmdbApi" value={settings.tmdbApi || ''} onChange={handleChange} className="mt-1 w-full bg-gray-700 border border-gray-600 rounded-md p-2 text-white focus:outline-none focus:ring-2 focus:ring-red-500" placeholder="••••••••••••••••••••••••••••••••"/>
                             </div>
+                            
                             <div>
                                 <label htmlFor="discordWebhook" className="block text-sm font-medium text-gray-300">Webhook Discord</label>
                                 <input type="text" id="discordWebhook" name="discordWebhook" value={settings.discordWebhook || ''} onChange={handleChange} className="mt-1 w-full bg-gray-700 border border-gray-600 rounded-md p-2 text-white focus:outline-none focus:ring-2 focus:ring-red-500" placeholder="https://discord.com/api/webhooks/..."/>
                             </div>
+                            
                             <div>
                                 <label htmlFor="checkFrequency" className="block text-sm font-medium text-gray-300">Częstotliwość sprawdzania nowości (w godzinach)</label>
                                 <select id="checkFrequency" name="checkFrequency" value={settings.checkFrequency} onChange={handleChange} className="mt-1 w-full bg-gray-700 border border-gray-600 rounded-md p-2 text-white focus:outline-none focus:ring-2 focus:ring-red-500">
@@ -1247,6 +1253,7 @@ const SettingsView = () => {
                                     <option value="24">Raz dziennie</option>
                                 </select>
                             </div>
+                            
                             <div className="pt-4 space-y-4">
                                 <button type="submit" className="w-full bg-red-600 hover:bg-red-700 text-white font-bold py-3 px-4 rounded-lg transition duration-300">
                                     Zapisz Ustawienia
