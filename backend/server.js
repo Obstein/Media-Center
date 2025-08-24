@@ -42,7 +42,7 @@ function initializeDb() {
                 media_count INTEGER DEFAULT 0
             )
         `);
-        / Sprawdź czy tabela media ma kolumnę playlist_id
+        // Sprawdź czy tabela media ma kolumnę playlist_id
         db.all("PRAGMA table_info(media)", [], (err, columns) => {
             if (err) {
                 console.error("Błąd sprawdzania struktury tabeli media:", err);
