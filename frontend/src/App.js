@@ -347,7 +347,7 @@ const PlaylistManager = () => {
 
     // Usuń playlistę
     const handleDeletePlaylist = async (id, name) => {
-        if (!confirm(`Czy na pewno chcesz usunąć playlistę "${name}"?`)) {
+        if (!window.confirm(`Czy na pewno chcesz usunąć playlistę "${name}"?`)) {
             return;
         }
 
@@ -1207,7 +1207,7 @@ const SettingsView = () => {
                         </div>
                     )}
 
-                    // Zamień całą końcówkę SettingsView (od formularza) na tę poprawioną:
+                    
 
                     {/* Formularz ustawień */}
                     <div className="max-w-2xl mx-auto bg-gray-800 p-8 rounded-lg shadow-2xl">
