@@ -2109,6 +2109,227 @@ app.get('/api/debug/serial-mismatch', async (req, res) => {
     }
 });
 
+app.get('/api/debug/xtream-series-mismatch/:stream_id', async (req, res) => {
+    const { stream_id } = req.params;
+    
+    try {
+        console.log(`🔍 DEBUG: Szczegółowa analiza Stream ID: ${stream_id}`);
+        
+        // 1. Sprawdź co jest w naszej bazie dla tego Stream ID
+        const mediaInDB = await dbAll(`
+            SELECT m.*, p.name as playlist_name, p.server_url, p.username, p.password
+            FROM media m
+            LEFT JOIN playlists p ON m.playlist_id = p.id
+            WHERE m.stream_id = ? AND m.stream_type = 'series'
+        `, [stream_id]);
+        
+        if (mediaInDB.length === 0) {
+            return res.status(404).json({ error: 'Stream ID nie znaleziony w bazie' });
+        }
+        
+        const results = [];
+        
+        // 2. Dla każdej playlisty sprawdź co zwraca Xtream API
+        for (const media of mediaInDB) {
+            console.log(`📡 Sprawdzanie Stream ID ${stream_id} w playliście: ${media.playlist_name}`);
+            
+            const xtreamBaseUrl = `${media.server_url}/player_api.php?username=${media.username}&password=${media.password}`;
+            
+            try {
+                // A. Sprawdź listę seriali - czy Stream ID 44840 rzeczywiście to Scheda?
+                console.log(`🔍 Pobieranie listy seriali z ${media.playlist_name}...`);
+                const seriesListRes = await axios.get(`${xtreamBaseUrl}&action=get_series`, { timeout: 15000 });
+                
+                const seriesInList = seriesListRes.data.find(s => s.series_id == stream_id);
+                
+                // B. Pobierz szczegóły tego konkretnego serialu
+                console.log(`🔍 Pobieranie szczegółów serialu ${stream_id} z ${media.playlist_name}...`);
+                const seriesDetailsRes = await axios.get(`${xtreamBaseUrl}&action=get_series_info&series_id=${stream_id}`, { timeout: 15000 });
+                
+                const seriesDetails = seriesDetailsRes.data;
+                const episodes = Object.values(seriesDetails.episodes || {}).flat();
+                
+                console.log(`📺 Wyniki dla playlisty ${media.playlist_name}:`);
+                console.log(`  - Nazwa w liście: "${seriesInList?.name}"`);
+                console.log(`  - Nazwa w szczegółach: "${seriesDetails?.info?.name}"`);
+                console.log(`  - Liczba odcinków: ${episodes.length}`);
+                console.log(`  - TMDB ID w szczegółach: ${seriesDetails?.info?.tmdb}`);
+                
+                if (episodes.length > 0) {
+                    console.log(`  - Pierwszy odcinek: ID=${episodes[0].id}, Nazwa="${episodes[0].title}"`);
+                    console.log(`  - URL pierwszego odcinka: ${media.server_url}/series/${media.username}/${media.password}/${episodes[0].id}.${episodes[0].container_extension || 'mkv'}`);
+                }
+                
+                results.push({
+                    playlist_id: media.playlist_id,
+                    playlist_name: media.playlist_name,
+                    media_name_in_db: media.name,
+                    media_tmdb_in_db: media.tmdb_id,
+                    
+                    // Z listy seriali
+                    series_in_list: seriesInList ? {
+                        name: seriesInList.name,
+                        series_id: seriesInList.series_id,
+                        cover: seriesInList.cover,
+                        plot: seriesInList.plot,
+                        tmdb: seriesInList.tmdb,
+                        rating: seriesInList.rating_5based
+                    } : null,
+                    
+                    // Ze szczegółów
+                    series_details: {
+                        name: seriesDetails?.info?.name,
+                        tmdb: seriesDetails?.info?.tmdb,
+                        plot: seriesDetails?.info?.plot,
+                        rating: seriesDetails?.info?.rating_5based,
+                        release_date: seriesDetails?.info?.releasedate,
+                        episodes_count: episodes.length
+                    },
+                    
+                    // Próbka odcinków
+                    episode_sample: episodes.slice(0, 3).map(ep => ({
+                        id: ep.id,
+                        title: ep.title,
+                        season: ep.season,
+                        episode_num: ep.episode_num,
+                        container_extension: ep.container_extension
+                    })),
+                    
+                    // Test czy rzeczywiście pobiera prawidłowy content
+                    download_test: {
+                        url: episodes[0] ? `${media.server_url}/series/${media.username}/${media.password}/${episodes[0].id}.${episodes[0].container_extension || 'mkv'}` : null,
+                        episode_id: episodes[0]?.id
+                    }
+                });
+                
+            } catch (apiError) {
+                console.error(`❌ Błąd API dla playlisty ${media.playlist_name}:`, apiError.message);
+                results.push({
+                    playlist_id: media.playlist_id,
+                    playlist_name: media.playlist_name,
+                    error: apiError.message
+                });
+            }
+        }
+        
+        // 3. Sprawdź czy są inne seriale o podobnej nazwie
+        console.log(`🔍 Szukanie seriali o podobnych nazwach...`);
+        const similarSeries = await dbAll(`
+            SELECT m.*, p.name as playlist_name
+            FROM media m
+            LEFT JOIN playlists p ON m.playlist_id = p.id
+            WHERE (m.name LIKE '%Scheda%' OR m.name LIKE '%Heritage%') 
+            AND m.stream_type = 'series'
+            ORDER BY m.stream_id
+        `);
+        
+        // 4. Sprawdź czy episode_id 1250637 należy do jakiegoś innego serialu
+        console.log(`🔍 Sprawdzanie do którego serialu należy episode_id 1250637...`);
+        const episodeOwnership = [];
+        
+        // Sprawdź kilka seriali z Heritage w nazwie
+        for (const similar of similarSeries) {
+            if (similar.name.toLowerCase().includes('heritage')) {
+                try {
+                    const xtreamBaseUrl = `${similar.server_url}/player_api.php?username=${similar.username}&password=${similar.password}`;
+                    const seriesDetailsRes = await axios.get(`${xtreamBaseUrl}&action=get_series_info&series_id=${similar.stream_id}`, { timeout: 15000 });
+                    
+                    const episodes = Object.values(seriesDetailsRes.data.episodes || {}).flat();
+                    const hasEpisode1250637 = episodes.find(ep => ep.id == '1250637');
+                    
+                    if (hasEpisode1250637) {
+                        console.log(`🎯 ZNALEZIONO! Episode ID 1250637 należy do serialu: "${similar.name}" (Stream ID: ${similar.stream_id})`);
+                        episodeOwnership.push({
+                            stream_id: similar.stream_id,
+                            series_name: similar.name,
+                            playlist_name: similar.playlist_name,
+                            has_episode_1250637: true,
+                            episode_title: hasEpisode1250637.title
+                        });
+                    }
+                } catch (err) {
+                    console.error(`Błąd sprawdzania serialu ${similar.stream_id}:`, err.message);
+                }
+            }
+        }
+        
+        const response = {
+            stream_id: parseInt(stream_id),
+            media_in_database: mediaInDB,
+            xtream_api_results: results,
+            similar_series: similarSeries,
+            episode_ownership: episodeOwnership,
+            
+            diagnosis: {
+                issue_type: "CONTENT_MISMATCH",
+                description: "Stream ID w bazie wskazuje na jeden serial, ale Xtream API zwraca odcinki z innego serialu",
+                likely_cause: episodeOwnership.length > 0 ? 
+                    "Episode ID należą do innego serialu - błąd w konfiguracji serwera IPTV" :
+                    "Serwer IPTV ma błędną konfigurację lub nastąpiło przemieszanie zawartości"
+            }
+        };
+        
+        res.json(response);
+        
+    } catch (error) {
+        console.error('Błąd debugowania:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// === DODATKOWY ENDPOINT: Test pobierania konkretnego episode_id ===
+app.get('/api/debug/test-episode/:episode_id', async (req, res) => {
+    const { episode_id } = req.params;
+    
+    try {
+        // Znajdź wszystkie playlisty i spróbuj pobrać ten episode_id
+        const playlists = await dbAll('SELECT * FROM playlists WHERE is_active = 1');
+        const results = [];
+        
+        for (const playlist of playlists) {
+            try {
+                const testUrl = `${playlist.server_url}/series/${playlist.username}/${playlist.password}/${episode_id}.mkv`;
+                
+                console.log(`🔍 Testowanie episode_id ${episode_id} w playliście ${playlist.name}...`);
+                console.log(`URL: ${testUrl}`);
+                
+                // Spróbuj HEAD request żeby sprawdzić czy URL istnieje
+                const headResponse = await axios.head(testUrl, { timeout: 10000 });
+                
+                results.push({
+                    playlist_name: playlist.name,
+                    playlist_id: playlist.id,
+                    url: testUrl,
+                    status: headResponse.status,
+                    content_length: headResponse.headers['content-length'],
+                    content_type: headResponse.headers['content-type'],
+                    exists: true
+                });
+                
+            } catch (error) {
+                results.push({
+                    playlist_name: playlist.name,
+                    playlist_id: playlist.id,
+                    error: error.response?.status || error.message,
+                    exists: false
+                });
+            }
+        }
+        
+        res.json({
+            episode_id,
+            results,
+            summary: {
+                total_playlists_tested: playlists.length,
+                accessible_in: results.filter(r => r.exists).length,
+                inaccessible_in: results.filter(r => !r.exists).length
+            }
+        });
+        
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
 
 // Wyszukaj w TMDB (do dodawania do wishlisty)
 app.get('/api/tmdb/search', async (req, res) => {
