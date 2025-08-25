@@ -25,6 +25,7 @@ const db = new sqlite3.Database(dbPath, (err) => {
     }
 });
 
+const WishlistManager = require('./wishlist_manager');
 
 function initializeDb() {
     db.serialize(() => {
@@ -1799,9 +1800,7 @@ app.get('/api/downloads/daemon-status', (req, res) => {
 // === API ROUTES WISHLIST === 
 // Dodaj te endpointy do server.js po istniejących API
 
-// Inicjalizacja Wishlist Manager
-const WishlistManager = require('./wishlist_manager');
-const wishlistManager = new WishlistManager(db, dbAll, dbRun, stmtRun);
+
 
 // === WISHLIST API ===
 
