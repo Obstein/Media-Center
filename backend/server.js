@@ -44,6 +44,33 @@ function initializeDb() {
                 media_count INTEGER DEFAULT 0
             )
         `);
+      db.all("PRAGMA table_info(media)", [], (err, columns) => {
+    if (err) {
+        console.error("Błąd sprawdzania struktury tabeli media:", err);
+        return;
+    }
+    
+    const columnNames = columns.map(col => col.name);
+    
+    if (!columnNames.includes('original_name')) {
+        console.log("Dodawanie kolumny original_name do tabeli media...");
+        db.run("ALTER TABLE media ADD COLUMN original_name TEXT", (alterErr) => {
+            if (alterErr) {
+                console.error("Błąd dodawania kolumny original_name do media:", alterErr);
+            } else {
+                console.log("✅ Dodano kolumnę original_name do media");
+                // Wypełnij istniejące rekordy
+                db.run("UPDATE media SET original_name = name WHERE original_name IS NULL", (updateErr) => {
+                    if (!updateErr) {
+                        console.log("✅ Zaktualizowano original_name dla istniejących mediów");
+                    }
+                });
+            }
+        });
+    } else {
+        console.log("Kolumna original_name już istnieje w tabeli media");
+    }
+});
         // Sprawdź czy tabela media ma kolumnę playlist_id
         db.all("PRAGMA table_info(media)", [], (err, columns) => {
             if (err) {
@@ -668,7 +695,6 @@ app.post('/api/playlists/sync-all', async (req, res) => {
 });
 
 // Funkcja pomocnicza do synchronizacji pojedynczej playlisty
-// Funkcja pomocnicza do synchronizacji pojedynczej playlisty
 async function syncSinglePlaylist(playlist) {
     const { id: playlistId, server_url, username, password, name } = playlist;
     
@@ -706,7 +732,7 @@ async function syncSinglePlaylist(playlist) {
             return { added: 0, removed: 0, message: 'Brak danych z serwera' };
         }
         
-        // ✅ POPRAWKA: Pobierz istniejące media TYLKO dla tej konkretnej playlisty
+        // Pobierz istniejące media TYLKO dla tej konkretnej playlisty
         const existingMedia = await dbAll(
             'SELECT stream_id, stream_type FROM media WHERE playlist_id = ?', 
             [playlistId]
@@ -723,14 +749,12 @@ async function syncSinglePlaylist(playlist) {
         let transactionActive = false;
         
         try {
-            // Rozpocznij transakcję
             await dbRun('BEGIN TRANSACTION');
             transactionActive = true;
             
-            // ✅ POPRAWKA: Usuń stare pozycje tylko z tej playlisty
+            // Usuń stare pozycje tylko z tej playlisty
             if (itemsToDelete.length > 0) {
                 const deleteMediaStmt = db.prepare('DELETE FROM media WHERE stream_id = ? AND stream_type = ? AND playlist_id = ?');
-                // ✅ POPRAWKA: Usuń gatunki tylko jeśli nie są używane przez inne playlisty
                 const deleteGenresStmt = db.prepare(`
                     DELETE FROM media_genres 
                     WHERE media_stream_id = ? AND media_stream_type = ? 
@@ -744,17 +768,12 @@ async function syncSinglePlaylist(playlist) {
                 
                 try {
                     for (const item of itemsToDelete) {
-                        // Usuń z media dla tej playlisty
                         await stmtRun(deleteMediaStmt, [item.stream_id, item.stream_type, playlistId]);
-                        
-                        // ✅ POPRAWKA: Usuń gatunki tylko jeśli ta pozycja nie istnieje w innych playlistach
                         await stmtRun(deleteGenresStmt, [
                             item.stream_id, item.stream_type, 
                             item.stream_id, item.stream_type, 
                             playlistId
                         ]);
-                        
-                        // Usuń z ulubionych dla tej playlisty
                         await stmtRun(deleteFavoritesStmt, [item.stream_id, item.stream_type, playlistId]);
                     }
                 } finally {
@@ -766,11 +785,14 @@ async function syncSinglePlaylist(playlist) {
             
             // Dodaj nowe pozycje
             if (itemsToAdd.length > 0) {
-                // Pobierz klucz TMDB API
                 const tmdbApiRows = await dbAll(`SELECT value FROM settings WHERE key = 'tmdbApi'`);
                 const tmdbApi = tmdbApiRows[0]?.value;
                 
-                const insertMediaSql = `INSERT OR REPLACE INTO media (stream_id, name, stream_icon, rating, tmdb_id, stream_type, container_extension, playlist_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`;
+                // ✅ POPRAWKA: ZACHOWAJ ORYGINALNĄ NAZWĘ Z IPTV
+                const insertMediaSql = `INSERT OR REPLACE INTO media 
+                    (stream_id, name, stream_icon, rating, tmdb_id, stream_type, container_extension, playlist_id, original_name) 
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+                    
                 const insertGenreSql = `INSERT OR IGNORE INTO genres (id, name) VALUES (?, ?)`;
                 const insertMediaGenreSql = `INSERT OR IGNORE INTO media_genres (media_stream_id, media_stream_type, genre_id) VALUES (?, ?, ?)`;
                 
@@ -782,20 +804,22 @@ async function syncSinglePlaylist(playlist) {
                     let processedCount = 0;
                     for (const item of itemsToAdd) {
                         const tmdbId = item.tmdb;
+                        const originalName = item.name; // ✅ ZACHOWAJ ORYGINALNĄ NAZWĘ
                         
-                        // Dodaj media z playlist_id
+                        // Dodaj media z ORYGINALNĄ nazwą z IPTV
                         await stmtRun(mediaStmt, [
                             item.stream_id,
-                            item.name,
+                            originalName, // ✅ UŻYJ ORYGINALNEJ NAZWY ZAMIAST TMDB
                             item.stream_icon || item.cover,
                             item.rating_5based || item.rating,
                             tmdbId,
                             item.stream_type,
                             item.container_extension,
-                            playlistId // ✅ WAŻNE: przypisz do konkretnej playlisty
+                            playlistId,
+                            originalName // ✅ ZAPISZ TAKŻE JAKO original_name
                         ]);
                         
-                        // ✅ POPRAWKA: Sprawdź czy gatunki już istnieją dla tego media (z dowolnej playlisty)
+                        // Sprawdź czy gatunki już istnieją dla tego media
                         const existingGenres = await dbAll(`
                             SELECT COUNT(*) as count 
                             FROM media_genres 
@@ -806,31 +830,39 @@ async function syncSinglePlaylist(playlist) {
                         if (existingGenres[0].count === 0 && tmdbId && tmdbApi) {
                             try {
                                 const tmdbType = item.stream_type === 'series' ? 'tv' : 'movie';
-                                const tmdbUrl = `https://api.themoviedb.org/3/${tmdbType}/${tmdbId}?api_key=${tmdbApi}&language=pl-PL`;
+                                // ✅ POPRAWKA: UŻYJ JĘZYKA POLSKIEGO + FALLBACK NA ANGIELSKI
+                                const tmdbUrl = `https://api.themoviedb.org/3/${tmdbType}/${tmdbId}?api_key=${tmdbApi}&language=pl-PL&append_to_response=translations`;
                                 
                                 const tmdbRes = await axios.get(tmdbUrl, { timeout: 10000 });
+                                let tmdbData = tmdbRes.data;
                                 
-                                if (tmdbRes.data && tmdbRes.data.genres) {
-                                    for (const genre of tmdbRes.data.genres) {
+                                // ✅ PRIORYTET DLA POLSKIEGO TŁUMACZENIA
+                                if (tmdbData.translations?.translations) {
+                                    const polishTranslation = tmdbData.translations.translations.find(t => t.iso_639_1 === 'pl');
+                                    if (polishTranslation?.data) {
+                                        // Jeśli mamy polskie tłumaczenie, użyj go TYLKO dla opisów, NIE dla tytułów
+                                        console.log(`  🇵🇱 Znaleziono polskie tłumaczenie dla ${originalName}`);
+                                        // NIE NADPISUJ NAZWY! Zachowaj oryginalną z IPTV
+                                    }
+                                }
+                                
+                                // Dodaj gatunki (niezależnie od języka)
+                                if (tmdbData.genres) {
+                                    for (const genre of tmdbData.genres) {
                                         await stmtRun(genreStmt, [genre.id, genre.name]);
                                         await stmtRun(mediaGenreStmt, [item.stream_id, item.stream_type, genre.id]);
                                     }
                                 } else {
-                                    // Dodaj domyślny gatunek
                                     await stmtRun(mediaGenreStmt, [item.stream_id, item.stream_type, -1]);
                                 }
                                 
-                                // Krótkie opóźnienie dla TMDB API
                                 await new Promise(resolve => setTimeout(resolve, 50));
                             } catch (tmdbError) {
-                                // Dodaj domyślny gatunek przy błędzie TMDB
                                 await stmtRun(mediaGenreStmt, [item.stream_id, item.stream_type, -1]);
                             }
                         } else if (existingGenres[0].count === 0) {
-                            // Brak TMDB ID lub API - dodaj domyślny gatunek
                             await stmtRun(mediaGenreStmt, [item.stream_id, item.stream_type, -1]);
                         }
-                        // ✅ Jeśli gatunki już istnieją, nie rób nic - są współdzielone między playlistami
                         
                         processedCount++;
                         if (processedCount % 100 === 0) {
@@ -852,7 +884,6 @@ async function syncSinglePlaylist(playlist) {
                 playlistId
             ]);
             
-            // Zatwierdź transakcję
             await dbRun('COMMIT');
             transactionActive = false;
             
@@ -1339,17 +1370,21 @@ app.get('/api/media/details/:type/:id', async (req, res) => {
         // TMDB API call z retry
         if (tmdbIdToUse) {
             const tmdbType = finalDetails.stream_type === 'series' ? 'tv' : 'movie';
-            const tmdbUrl = `https://api.themoviedb.org/3/${tmdbType}/${tmdbIdToUse}?api_key=${tmdbApi}&append_to_response=videos,credits,translations`;
+            const tmdbUrl = `https://api.themoviedb.org/3/${tmdbType}/${tmdbIdToUse}?api_key=${tmdbApi}&language=pl-PL&append_to_response=videos,credits,translations`;
             try {
                 console.log(`Fetching TMDB details for ID: ${tmdbIdToUse}`);
                 const tmdbRes = await makeRetryRequest(tmdbUrl);
                 let tmdbData = tmdbRes.data;
                 const polishTranslation = tmdbData.translations?.translations?.find(t => t.iso_639_1 === 'pl');
-                if (polishTranslation?.data) {
-                    tmdbData.title = polishTranslation.data.title || tmdbData.title;
-                    tmdbData.name = polishTranslation.data.name || tmdbData.name;
-                    tmdbData.overview = polishTranslation.data.overview || tmdbData.overview;
-                }
+if (polishTranslation?.data) {
+    // TYLKO opis po polsku, NIE tytuł
+    tmdbData.overview = polishTranslation.data.overview || tmdbData.overview;
+    console.log(`📝 Używam polskiego opisu dla: ${finalDetails.name}`);
+    
+    // NIE NADPISUJ TYTUŁÓW:
+    // tmdbData.title = polishTranslation.data.title || tmdbData.title; // ❌ USUŃ
+    // tmdbData.name = polishTranslation.data.name || tmdbData.name;   // ❌ USUŃ
+}
                 finalDetails.tmdb_details = tmdbData;
             } catch(tmdbError) {
                 console.error(`Failed to fetch TMDB details after retries: ${tmdbError.message}`);
