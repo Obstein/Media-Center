@@ -25,6 +25,9 @@ const db = new sqlite3.Database(dbPath, (err) => {
     }
 });
 
+// Import Wishlist Manager
+const WishlistManager = require('./wishlist_manager');
+
 function initializeDb() {
     db.serialize(() => {
         db.run(`CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)`);
@@ -207,6 +210,12 @@ function initializeDb() {
         console.log("Baza danych zainicjalizowana z tabelami pobierania");
     });
 }
+
+// Inicjalizacja Wishlist Manager
+let wishlistManager;
+setTimeout(() => {
+    wishlistManager = new WishlistManager(db, dbAll, dbRun, stmtRun);
+}, 2000); // Opóźnienie aby baza była gotowa
 
 // --- Funkcje pomocnicze DB ---
 function dbRun(query, params = []) {
@@ -1789,6 +1798,224 @@ app.get('/api/downloads/daemon-status', (req, res) => {
     });
 });
 
+// === API ROUTES WISHLIST === 
+// Dodaj te endpointy do server.js po istniejących API
+
+// Inicjalizacja Wishlist Manager
+const WishlistManager = require('./wishlist_manager');
+const WishlistManager = new WishlistManager(db, dbAll, dbRun, stmtRun);
+
+// === WISHLIST API ===
+
+// Pobierz wishlistę
+app.get('/api/wishlist', async (req, res) => {
+    try {
+        const { status, media_type, priority, sort_by } = req.query;
+        const filters = { status, media_type, priority, sort_by };
+        
+        const wishlist = await wishlistManager.getWishlist(filters);
+        res.json(wishlist);
+    } catch (error) {
+        console.error('Błąd pobierania wishlisty:', error);
+        res.status(500).json({ error: 'Nie udało się pobrać wishlisty.' });
+    }
+});
+
+// Dodaj do wishlisty
+app.post('/api/wishlist', async (req, res) => {
+    try {
+        const { tmdb_id, media_type, priority = 1, auto_download = true, search_keywords = '', notes = '' } = req.body;
+        
+        if (!tmdb_id || !media_type) {
+            return res.status(400).json({ error: 'tmdb_id i media_type są wymagane.' });
+        }
+
+        if (!['movie', 'tv'].includes(media_type)) {
+            return res.status(400).json({ error: 'media_type musi być "movie" lub "tv".' });
+        }
+
+        const result = await wishlistManager.addToWishlist(tmdb_id, media_type, {
+            priority,
+            autoDownload: auto_download,
+            searchKeywords: search_keywords,
+            notes
+        });
+
+        res.status(201).json(result);
+    } catch (error) {
+        console.error('Błąd dodawania do wishlisty:', error);
+        const statusCode = error.message.includes('już istnieje') ? 409 : 500;
+        res.status(statusCode).json({ error: error.message });
+    }
+});
+
+// Aktualizuj pozycję wishlisty
+app.put('/api/wishlist/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const updates = req.body;
+
+        await wishlistManager.updateWishlistItem(parseInt(id), updates);
+        res.json({ message: 'Pozycja wishlisty została zaktualizowana.' });
+    } catch (error) {
+        console.error('Błąd aktualizacji wishlisty:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Usuń z wishlisty
+app.delete('/api/wishlist/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        await wishlistManager.removeFromWishlist(parseInt(id));
+        res.json({ message: 'Pozycja została usunięta z wishlisty.' });
+    } catch (error) {
+        console.error('Błąd usuwania z wishlisty:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Sprawdź wishlistę (ręcznie)
+app.post('/api/wishlist/check', async (req, res) => {
+    try {
+        const result = await wishlistManager.checkWishlistMatches();
+        res.json({
+            message: `Sprawdzono ${result.checked} pozycji, znaleziono ${result.found} matchy.`,
+            ...result
+        });
+    } catch (error) {
+        console.error('Błąd sprawdzania wishlisty:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Pobierz statystyki wishlisty
+app.get('/api/wishlist/stats', async (req, res) => {
+    try {
+        const stats = await wishlistManager.getWishlistStats();
+        res.json(stats);
+    } catch (error) {
+        console.error('Błąd pobierania statystyk wishlisty:', error);
+        res.status(500).json({ error: 'Nie udało się pobrać statystyk wishlisty.' });
+    }
+});
+
+// Pobierz matche dla pozycji wishlisty
+app.get('/api/wishlist/:id/matches', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const matches = await dbAll(`
+            SELECT 
+                wm.*,
+                m.name as media_name,
+                m.stream_icon,
+                p.name as playlist_name
+            FROM wishlist_matches wm
+            LEFT JOIN media m ON wm.media_stream_id = m.stream_id AND wm.media_stream_type = m.stream_type
+            LEFT JOIN playlists p ON wm.playlist_id = p.id
+            WHERE wm.wishlist_id = ?
+            ORDER BY wm.match_score DESC, wm.created_at DESC
+        `, [id]);
+
+        res.json(matches);
+    } catch (error) {
+        console.error('Błąd pobierania matchy wishlist:', error);
+        res.status(500).json({ error: 'Nie udało się pobrać matchy.' });
+    }
+});
+
+// Ręcznie pobierz konkretny match z wishlisty
+app.post('/api/wishlist/:wishlistId/download/:matchId', async (req, res) => {
+    try {
+        const { wishlistId, matchId } = req.params;
+        
+        // Pobierz szczegóły wishlist item i match
+        const wishlistItem = await dbAll('SELECT * FROM wishlist WHERE id = ?', [wishlistId]);
+        const match = await dbAll(`
+            SELECT wm.*, m.* 
+            FROM wishlist_matches wm
+            LEFT JOIN media m ON wm.media_stream_id = m.stream_id AND wm.media_stream_type = m.stream_type
+            WHERE wm.id = ? AND wm.wishlist_id = ?
+        `, [matchId, wishlistId]);
+
+        if (wishlistItem.length === 0 || match.length === 0) {
+            return res.status(404).json({ error: 'Nie znaleziono pozycji lub matcha.' });
+        }
+
+        const item = wishlistItem[0];
+        const matchData = match[0];
+
+        // Rozpocznij pobieranie
+        await wishlistManager.initiateAutoDownload(item, matchData);
+        
+        res.json({ message: 'Pobieranie rozpoczęte pomyślnie.' });
+    } catch (error) {
+        console.error('Błąd ręcznego pobierania z wishlisty:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Wyszukaj w TMDB (do dodawania do wishlisty)
+app.get('/api/tmdb/search', async (req, res) => {
+    try {
+        const { query, type = 'multi', page = 1 } = req.query;
+        
+        if (!query || query.length < 2) {
+            return res.status(400).json({ error: 'Query musi mieć minimum 2 znaki.' });
+        }
+
+        const tmdbApiRows = await dbAll('SELECT value FROM settings WHERE key = ?', ['tmdbApi']);
+        const tmdbApi = tmdbApiRows[0]?.value;
+        
+        if (!tmdbApi) {
+            return res.status(400).json({ error: 'Brak klucza API TMDB.' });
+        }
+
+        const tmdbUrl = `https://api.themoviedb.org/3/search/${type}?api_key=${tmdbApi}&language=pl-PL&query=${encodeURIComponent(query)}&page=${page}`;
+        
+        const response = await axios.get(tmdbUrl, { timeout: 10000 });
+        
+        // Filtruj tylko filmy i seriale, dodaj flagę czy już jest w wishliście
+        const results = response.data.results
+            .filter(item => item.media_type === 'movie' || item.media_type === 'tv' || type !== 'multi')
+            .map(item => ({
+                ...item,
+                media_type: item.media_type || type
+            }));
+
+        // Sprawdź które pozycje już są w wishliście
+        if (results.length > 0) {
+            const tmdbIds = results.map(r => r.id);
+            const existingInWishlist = await dbAll(`
+                SELECT tmdb_id, media_type, status 
+                FROM wishlist 
+                WHERE tmdb_id IN (${tmdbIds.map(() => '?').join(',')})
+            `, tmdbIds);
+
+            const wishlistMap = new Map();
+            existingInWishlist.forEach(w => {
+                wishlistMap.set(`${w.tmdb_id}_${w.media_type}`, w.status);
+            });
+
+            results.forEach(item => {
+                const key = `${item.id}_${item.media_type}`;
+                item.in_wishlist = wishlistMap.has(key);
+                item.wishlist_status = wishlistMap.get(key) || null;
+            });
+        }
+
+        res.json({
+            ...response.data,
+            results
+        });
+    } catch (error) {
+        console.error('Błąd wyszukiwania TMDB:', error);
+        res.status(500).json({ error: 'Nie udało się wyszukać w TMDB.' });
+    }
+});
+
+
+
 async function processDownloadQueue() {
     if (isProcessing || downloadQueue.length === 0) {
         return;
@@ -2347,6 +2574,31 @@ cron.schedule('0 * * * *', async () => { // Uruchamia się co godzinę
             const nextCheck = frequency - (currentHour % frequency);
             console.log(`⏳ Pominięto odświeżanie playlist. Następne sprawdzenie za ${nextCheck}h (o ${(currentHour + nextCheck) % 24}:00).`);
         }
+
+        if (currentHour % frequency === 0) {
+    console.log(`🎯 Uruchamianie sprawdzania wishlisty...`);
+    try {
+        const wishlistResult = await wishlistManager.checkWishlistMatches();
+        console.log(`✅ Sprawdzanie wishlisty zakończone: ${wishlistResult.found}/${wishlistResult.checked} znaleziono`);
+        
+        // Wyślij powiadomienie Discord o wynikach wishlisty
+        if (wishlistResult.found > 0) {
+            try {
+                const webhookUrl = await dbAll('SELECT value FROM settings WHERE key = ?', ['discordWebhook']);
+                if (webhookUrl && webhookUrl[0] && webhookUrl[0].value) {
+                    await axios.post(webhookUrl[0].value, {
+                        content: `🎯 **Wishlist Check Complete**\n✅ Znalezionych pozycji: ${wishlistResult.found}/${wishlistResult.checked}`,
+                        username: "Media Center Wishlist"
+                    });
+                }
+            } catch (discordError) {
+                console.error("Nie udało się wysłać powiadomienia Discord o wishlist:", discordError.message);
+            }
+        }
+    } catch (error) {
+        console.error(`❌ Błąd sprawdzania wishlisty: ${error.message}`);
+    }
+}
 
         // === NOWE: MONITOROWANIE ULUBIONYCH Z WSZYSTKICH PLAYLIST ===
         if (currentHour % frequency === 0) {

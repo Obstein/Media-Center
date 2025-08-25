@@ -1393,6 +1393,451 @@ const SettingsView = () => {
     );
 };
 
+// === GŁÓWNY KOMPONENT WISHLISTY ===
+// Dodaj do App.js
+
+const WishlistView = () => {
+    const [wishlist, setWishlist] = useState([]);
+    const [stats, setStats] = useState(null);
+    const [loading, setLoading] = useState(true);
+    const [message, setMessage] = useState('');
+    const [activeTab, setActiveTab] = useState('wishlist');
+    const [filters, setFilters] = useState({
+        status: '',
+        media_type: '',
+        priority: '',
+        sort_by: 'priority ASC, added_at DESC'
+    });
+
+    // Search/Add states
+    const [searchQuery, setSearchQuery] = useState('');
+    const [searchResults, setSearchResults] = useState([]);
+    const [searching, setSearching] = useState(false);
+
+    // Modal states
+    const [selectedItem, setSelectedItem] = useState(null);
+    const [selectedMatches, setSelectedMatches] = useState(null);
+    const [showMatchesModal, setShowMatchesModal] = useState(false);
+
+    // Wczytaj dane
+    useEffect(() => {
+        fetchData();
+    }, [filters]);
+
+    const fetchData = async () => {
+        try {
+            setLoading(true);
+            const [wishlistRes, statsRes] = await Promise.all([
+                axios.get('/api/wishlist', { params: filters }),
+                axios.get('/api/wishlist/stats')
+            ]);
+            
+            setWishlist(wishlistRes.data);
+            setStats(statsRes.data);
+        } catch (error) {
+            console.error('Błąd ładowania wishlisty:', error);
+            setMessage('Błąd ładowania danych wishlisty.');
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    // Wyszukiwanie w TMDB
+    const searchTMDB = async () => {
+        if (!searchQuery.trim() || searchQuery.length < 2) {
+            setSearchResults([]);
+            return;
+        }
+
+        setSearching(true);
+        try {
+            const response = await axios.get('/api/tmdb/search', {
+                params: { query: searchQuery, type: 'multi' }
+            });
+            setSearchResults(response.data.results || []);
+        } catch (error) {
+            console.error('Błąd wyszukiwania TMDB:', error);
+            setMessage('Błąd wyszukiwania w TMDB.');
+        } finally {
+            setSearching(false);
+        }
+    };
+
+    // Debounced search
+    useEffect(() => {
+        const timer = setTimeout(() => {
+            if (activeTab === 'add') {
+                searchTMDB();
+            }
+        }, 500);
+        return () => clearTimeout(timer);
+    }, [searchQuery, activeTab]);
+
+    // Dodaj do wishlisty
+    const handleAddToWishlist = async (tmdbItem) => {
+        try {
+            await axios.post('/api/wishlist', {
+                tmdb_id: tmdbItem.id,
+                media_type: tmdbItem.media_type,
+                priority: 1,
+                auto_download: true
+            });
+            
+            setMessage(`Dodano "${tmdbItem.title || tmdbItem.name}" do wishlisty!`);
+            setTimeout(() => setMessage(''), 3000);
+            
+            // Odśwież wishlistę
+            fetchData();
+            
+            // Oznacz w wynikach wyszukiwania
+            setSearchResults(prev => prev.map(item => 
+                item.id === tmdbItem.id && item.media_type === tmdbItem.media_type
+                    ? { ...item, in_wishlist: true, wishlist_status: 'wanted' }
+                    : item
+            ));
+        } catch (error) {
+            console.error('Błąd dodawania do wishlisty:', error);
+            setMessage(error.response?.data?.error || 'Błąd dodawania do wishlisty.');
+        }
+    };
+
+    // Aktualizuj pozycję wishlisty
+    const handleUpdateWishlist = async (id, updates) => {
+        try {
+            await axios.put(`/api/wishlist/${id}`, updates);
+            setMessage('Pozycja wishlisty została zaktualizowana.');
+            setTimeout(() => setMessage(''), 3000);
+            fetchData();
+        } catch (error) {
+            console.error('Błąd aktualizacji wishlisty:', error);
+            setMessage('Błąd aktualizacji pozycji wishlisty.');
+        }
+    };
+
+    // Usuń z wishlisty
+    const handleDeleteFromWishlist = async (id) => {
+        if (!window.confirm('Czy na pewno chcesz usunąć tę pozycję z wishlisty?')) {
+            return;
+        }
+
+        try {
+            await axios.delete(`/api/wishlist/${id}`);
+            setMessage('Pozycja została usunięta z wishlisty.');
+            setTimeout(() => setMessage(''), 3000);
+            fetchData();
+        } catch (error) {
+            console.error('Błąd usuwania z wishlisty:', error);
+            setMessage('Błąd usuwania z wishlisty.');
+        }
+    };
+
+    // Ręczne sprawdzenie wishlisty
+    const handleCheckWishlist = async () => {
+        try {
+            setMessage('Sprawdzanie wishlisty...');
+            const response = await axios.post('/api/wishlist/check');
+            setMessage(response.data.message);
+            setTimeout(() => setMessage(''), 5000);
+            fetchData();
+        } catch (error) {
+            console.error('Błąd sprawdzania wishlisty:', error);
+            setMessage('Błąd sprawdzania wishlisty.');
+        }
+    };
+
+    // Zobacz matche
+    const handleViewMatches = async (item) => {
+        try {
+            const response = await axios.get(`/api/wishlist/${item.id}/matches`);
+            setSelectedItem(item);
+            setSelectedMatches(response.data);
+            setShowMatchesModal(true);
+        } catch (error) {
+            console.error('Błąd pobierania matchy:', error);
+            setMessage('Błąd pobierania matchy.');
+        }
+    };
+
+    // Pobierz konkretny match
+    const handleDownloadMatch = async (wishlistId, matchId) => {
+        try {
+            await axios.post(`/api/wishlist/${wishlistId}/download/${matchId}`);
+            setMessage('Pobieranie rozpoczęte!');
+            setTimeout(() => setMessage(''), 3000);
+            setShowMatchesModal(false);
+            fetchData();
+        } catch (error) {
+            console.error('Błąd pobierania matcha:', error);
+            setMessage('Błąd rozpoczynania pobierania.');
+        }
+    };
+
+    // Auto-download najlepszego matcha
+    const handleAutoDownload = async (item) => {
+        if (item.match_count === 0) {
+            setMessage('Brak matchy do pobrania.');
+            return;
+        }
+
+        try {
+            const matchesResponse = await axios.get(`/api/wishlist/${item.id}/matches`);
+            const bestMatch = matchesResponse.data[0]; // Najlepszy match
+            
+            if (bestMatch) {
+                await handleDownloadMatch(item.id, bestMatch.id);
+            }
+        } catch (error) {
+            console.error('Błąd auto-download:', error);
+            setMessage('Błąd auto-download.');
+        }
+    };
+
+    const handleFilterChange = (key, value) => {
+        setFilters(prev => ({ ...prev, [key]: value }));
+    };
+
+    if (loading) {
+        return (
+            <div className="flex justify-center items-center py-8">
+                <div className="text-gray-400">Ładowanie wishlisty...</div>
+            </div>
+        );
+    }
+
+    return (
+        <div className="space-y-6">
+            {/* Header z statystykami */}
+            {stats && (
+                <div className="bg-gray-800 rounded-lg p-6">
+                    <h3 className="text-lg font-semibold text-white mb-4">Statystyki Wishlisty</h3>
+                    <div className="grid grid-cols-2 md:grid-cols-6 gap-4 text-center">
+                        <div className="bg-blue-900/50 p-4 rounded">
+                            <div className="text-2xl font-bold text-blue-300">{stats.statistics.total || 0}</div>
+                            <div className="text-gray-400">Łącznie</div>
+                        </div>
+                        <div className="bg-yellow-900/50 p-4 rounded">
+                            <div className="text-2xl font-bold text-yellow-300">{stats.statistics.wanted || 0}</div>
+                            <div className="text-gray-400">Poszukiwane</div>
+                        </div>
+                        <div className="bg-green-900/50 p-4 rounded">
+                            <div className="text-2xl font-bold text-green-300">{stats.statistics.found || 0}</div>
+                            <div className="text-gray-400">Znalezione</div>
+                        </div>
+                        <div className="bg-purple-900/50 p-4 rounded">
+                            <div className="text-2xl font-bold text-purple-300">{stats.statistics.downloading || 0}</div>
+                            <div className="text-gray-400">Pobierane</div>
+                        </div>
+                        <div className="bg-gray-900/50 p-4 rounded">
+                            <div className="text-2xl font-bold text-gray-300">{stats.statistics.completed || 0}</div>
+                            <div className="text-gray-400">Ukończone</div>
+                        </div>
+                        <div className="bg-red-900/50 p-4 rounded">
+                            <div className="text-2xl font-bold text-red-300">{stats.statistics.auto_download_enabled || 0}</div>
+                            <div className="text-gray-400">Auto-DL</div>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* Komunikaty */}
+            {message && (
+                <div className={`p-4 rounded-lg ${
+                    message.includes('Błąd') || message.includes('błąd') ? 
+                    'bg-red-900/50 text-red-300 border border-red-700' : 
+                    'bg-green-900/50 text-green-300 border border-green-700'
+                }`}>
+                    {message}
+                </div>
+            )}
+
+            {/* Zakładki */}
+            <div className="flex justify-between items-center">
+                <nav className="flex space-x-8">
+                    <button
+                        onClick={() => setActiveTab('wishlist')}
+                        className={`py-2 px-1 border-b-2 font-medium text-sm ${
+                            activeTab === 'wishlist'
+                                ? 'border-red-500 text-red-400'
+                                : 'border-transparent text-gray-400 hover:text-gray-300'
+                        }`}
+                    >
+                        Moja Wishlist ({wishlist.length})
+                    </button>
+                    <button
+                        onClick={() => setActiveTab('add')}
+                        className={`py-2 px-1 border-b-2 font-medium text-sm ${
+                            activeTab === 'add'
+                                ? 'border-red-500 text-red-400'
+                                : 'border-transparent text-gray-400 hover:text-gray-300'
+                        }`}
+                    >
+                        Dodaj Nowe
+                    </button>
+                </nav>
+
+                {activeTab === 'wishlist' && (
+                    <button
+                        onClick={handleCheckWishlist}
+                        className="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg transition duration-300"
+                    >
+                        🔍 Sprawdź Wishlistę
+                    </button>
+                )}
+            </div>
+
+            {/* Zawartość zakładek */}
+            {activeTab === 'wishlist' && (
+                <div>
+                    {/* Filtry */}
+                    <div className="bg-gray-800 rounded-lg p-4 mb-6">
+                        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                            <div>
+                                <label className="block text-sm font-medium text-gray-300 mb-1">Status</label>
+                                <select
+                                    value={filters.status}
+                                    onChange={(e) => handleFilterChange('status', e.target.value)}
+                                    className="w-full bg-gray-700 border border-gray-600 rounded-md p-2 text-white text-sm"
+                                >
+                                    <option value="">Wszystkie</option>
+                                    <option value="wanted">Poszukiwane</option>
+                                    <option value="found">Znalezione</option>
+                                    <option value="downloading">Pobierane</option>
+                                    <option value="completed">Ukończone</option>
+                                </select>
+                            </div>
+
+                            <div>
+                                <label className="block text-sm font-medium text-gray-300 mb-1">Typ</label>
+                                <select
+                                    value={filters.media_type}
+                                    onChange={(e) => handleFilterChange('media_type', e.target.value)}
+                                    className="w-full bg-gray-700 border border-gray-600 rounded-md p-2 text-white text-sm"
+                                >
+                                    <option value="">Wszystkie</option>
+                                    <option value="movie">Filmy</option>
+                                    <option value="tv">Seriale</option>
+                                </select>
+                            </div>
+
+                            <div>
+                                <label className="block text-sm font-medium text-gray-300 mb-1">Priorytet</label>
+                                <select
+                                    value={filters.priority}
+                                    onChange={(e) => handleFilterChange('priority', e.target.value)}
+                                    className="w-full bg-gray-700 border border-gray-600 rounded-md p-2 text-white text-sm"
+                                >
+                                    <option value="">Wszystkie</option>
+                                    <option value="1">1 - Najwyższy</option>
+                                    <option value="2">2 - Wysoki</option>
+                                    <option value="3">3 - Średni</option>
+                                    <option value="4">4 - Niski</option>
+                                    <option value="5">5 - Najniższy</option>
+                                </select>
+                            </div>
+
+                            <div>
+                                <label className="block text-sm font-medium text-gray-300 mb-1">Sortowanie</label>
+                                <select
+                                    value={filters.sort_by}
+                                    onChange={(e) => handleFilterChange('sort_by', e.target.value)}
+                                    className="w-full bg-gray-700 border border-gray-600 rounded-md p-2 text-white text-sm"
+                                >
+                                    <option value="priority ASC, added_at DESC">Priorytet rosnąco</option>
+                                    <option value="priority DESC, added_at DESC">Priorytet malejąco</option>
+                                    <option value="added_at DESC">Najnowsze</option>
+                                    <option value="added_at ASC">Najstarsze</option>
+                                    <option value="title ASC">Nazwa A-Z</option>
+                                    <option value="title DESC">Nazwa Z-A</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Lista wishlisty */}
+                    <div className="space-y-4">
+                        {wishlist.length === 0 ? (
+                            <div className="bg-gray-800 rounded-lg p-8 text-center">
+                                <div className="text-gray-400 mb-4">Twoja wishlist jest pusta</div>
+                                <button
+                                    onClick={() => setActiveTab('add')}
+                                    className="bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-4 rounded-lg transition duration-300"
+                                >
+                                    Dodaj Pierwszą Pozycję
+                                </button>
+                            </div>
+                        ) : (
+                            wishlist.map(item => (
+                                <WishlistCard
+                                    key={item.id}
+                                    item={item}
+                                    onUpdate={handleUpdateWishlist}
+                                    onDelete={handleDeleteFromWishlist}
+                                    onDownload={handleAutoDownload}
+                                    onViewMatches={handleViewMatches}
+                                />
+                            ))
+                        )}
+                    </div>
+                </div>
+            )}
+
+            {/* Zakładka dodawania */}
+            {activeTab === 'add' && (
+                <div>
+                    {/* Wyszukiwanie */}
+                    <div className="bg-gray-800 rounded-lg p-6 mb-6">
+                        <h3 className="text-lg font-semibold text-white mb-4">Wyszukaj w TMDB</h3>
+                        <div className="flex gap-3">
+                            <input
+                                type="text"
+                                value={searchQuery}
+                                onChange={(e) => setSearchQuery(e.target.value)}
+                                placeholder="Wpisz nazwę filmu lub serialu..."
+                                className="flex-1 bg-gray-700 border border-gray-600 rounded-md p-3 text-white focus:outline-none focus:ring-2 focus:ring-red-500"
+                            />
+                            <button
+                                onClick={searchTMDB}
+                                disabled={searching}
+                                className="bg-red-600 hover:bg-red-700 disabled:bg-red-800 text-white font-bold py-3 px-6 rounded-lg transition duration-300"
+                            >
+                                {searching ? 'Szukam...' : 'Szukaj'}
+                            </button>
+                        </div>
+                    </div>
+
+                    {/* Wyniki wyszukiwania */}
+                    <div className="space-y-3">
+                        {searchResults.length === 0 && searchQuery.length >= 2 && !searching && (
+                            <div className="bg-gray-800 rounded-lg p-6 text-center text-gray-400">
+                                Brak wyników dla "{searchQuery}"
+                            </div>
+                        )}
+                        
+                        {searchResults.map((item) => (
+                            <TMDBSearchResult
+                                key={`${item.id}_${item.media_type}`}
+                                item={item}
+                                onAdd={handleAddToWishlist}
+                                inWishlist={item.in_wishlist}
+                            />
+                        ))}
+                    </div>
+                </div>
+            )}
+
+            {/* Modal z matchami */}
+            {showMatchesModal && (
+                <WishlistMatchesModal
+                    item={selectedItem}
+                    matches={selectedMatches}
+                    onClose={() => setShowMatchesModal(false)}
+                    onDownload={handleDownloadMatch}
+                />
+            )}
+        </div>
+    );
+};
+
 // --- Główny Komponent Aplikacji ---
 function App() {
   const [route, setRoute] = useState({ path: 'home', params: {} });
@@ -1513,6 +1958,8 @@ function App() {
     switch (route.path) {
         case 'settings':
             return <SettingsView />;
+        case 'wishlist':  
+            return <WishlistView />;
         case 'details':
             return <DetailsView type={route.params.type} id={route.params.id} favorites={favorites} onToggleFavorite={handleToggleFavorite} onDownload={handleDownload} />;
         case 'home':
