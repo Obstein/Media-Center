@@ -1987,6 +1987,129 @@ app.post('/api/wishlist/:wishlistId/download/:matchId', async (req, res) => {
     }
 });
 
+app.get('/api/debug/serial-mismatch', async (req, res) => {
+    try {
+        console.log('🔍 DEBUG: Sprawdzanie błędnego dopasowania seriali...');
+        
+        // 1. Sprawdź co jest w ulubionych
+        const favorites = await dbAll(`
+            SELECT f.*, m.name as media_name, m.tmdb_id, p.name as playlist_name
+            FROM favorites f
+            LEFT JOIN media m ON f.stream_id = m.stream_id AND f.stream_type = m.stream_type AND f.playlist_id = m.playlist_id
+            LEFT JOIN playlists p ON f.playlist_id = p.id
+            WHERE f.stream_type = 'series'
+        `);
+        
+        console.log('🎯 Ulubione seriale:');
+        favorites.forEach(fav => {
+            console.log(`  - Stream ID: ${fav.stream_id}, Nazwa: "${fav.media_name}", TMDB: ${fav.tmdb_id}, Playlista: ${fav.playlist_name}`);
+        });
+        
+        // 2. Sprawdź co było pobierane (ostatnie 20 pobrań seriali)
+        const recentDownloads = await dbAll(`
+            SELECT d.*, m.name as media_name, m.tmdb_id
+            FROM downloads d
+            LEFT JOIN media m ON d.stream_id = m.stream_id AND d.stream_type = m.stream_type AND d.playlist_id = m.playlist_id
+            WHERE d.stream_type = 'series'
+            ORDER BY d.added_at DESC
+            LIMIT 20
+        `);
+        
+        console.log('📥 Ostatnie pobierania seriali:');
+        recentDownloads.forEach(dl => {
+            console.log(`  - Stream ID: ${dl.stream_id}, Episode ID: ${dl.episode_id}, Nazwa media: "${dl.media_name}", Filename: "${dl.filename}"`);
+        });
+        
+        // 3. Sprawdź duplikaty stream_id w różnych playlistach
+        const duplicateStreamIds = await dbAll(`
+            SELECT 
+                m.stream_id, 
+                m.stream_type,
+                COUNT(*) as count,
+                GROUP_CONCAT(m.name || ' (PL:' || m.playlist_id || ')') as names
+            FROM media m
+            WHERE m.stream_type = 'series'
+            GROUP BY m.stream_id, m.stream_type
+            HAVING count > 1
+        `);
+        
+        console.log('🔄 Seriale z duplikowanymi Stream ID:');
+        duplicateStreamIds.forEach(dup => {
+            console.log(`  - Stream ID: ${dup.stream_id}, Wystąpienia: ${dup.count}, Nazwy: ${dup.names}`);
+        });
+        
+        // 4. Sprawdź konkretnie "Scheda" vs "The Heritage"
+        const schedaSearch = await dbAll(`
+            SELECT m.*, p.name as playlist_name
+            FROM media m
+            LEFT JOIN playlists p ON m.playlist_id = p.id
+            WHERE m.name LIKE '%Scheda%' OR m.name LIKE '%Heritage%'
+        `);
+        
+        console.log('🎬 Seriale z "Scheda" lub "Heritage":');
+        schedaSearch.forEach(item => {
+            console.log(`  - Stream ID: ${item.stream_id}, Nazwa: "${item.name}", TMDB: ${item.tmdb_id}, Playlista: ${item.playlist_name}`);
+        });
+        
+        // 5. Sprawdź favorites dla konkretnego stream_id
+        const schedaFavorites = await dbAll(`
+            SELECT f.*, m.name as media_name
+            FROM favorites f
+            LEFT JOIN media m ON f.stream_id = m.stream_id AND f.stream_type = m.stream_type AND f.playlist_id = m.playlist_id
+            WHERE m.name LIKE '%Scheda%' OR m.name LIKE '%Heritage%'
+        `);
+        
+        console.log('❤️ Ulubione dla Scheda/Heritage:');
+        schedaFavorites.forEach(fav => {
+            console.log(`  - Stream ID: ${fav.stream_id}, Nazwa: "${fav.media_name}", Playlist ID: ${fav.playlist_id}`);
+        });
+        
+        // 6. Sprawdź download logs dla błędnych pobrań
+        const suspiciousDownloads = await dbAll(`
+            SELECT 
+                d.*,
+                m.name as media_name,
+                dl.message as log_message,
+                dl.timestamp as log_time
+            FROM downloads d
+            LEFT JOIN media m ON d.stream_id = m.stream_id AND d.stream_type = m.stream_type
+            LEFT JOIN download_logs dl ON d.id = dl.download_id
+            WHERE (d.filename LIKE '%Heritage%' OR m.name LIKE '%Heritage%' OR m.name LIKE '%Scheda%')
+            ORDER BY d.added_at DESC, dl.timestamp DESC
+        `);
+        
+        console.log('🚨 Podejrzane pobierania (Heritage/Scheda):');
+        suspiciousDownloads.forEach(dl => {
+            console.log(`  - Download ID: ${dl.id}, Stream ID: ${dl.stream_id}, Media: "${dl.media_name}", Filename: "${dl.filename}"`);
+            if (dl.log_message) {
+                console.log(`    Log: ${dl.log_time} - ${dl.log_message}`);
+            }
+        });
+        
+        const summary = {
+            favorites_count: favorites.length,
+            recent_downloads_count: recentDownloads.length,
+            duplicate_stream_ids: duplicateStreamIds.length,
+            scheda_heritage_items: schedaSearch.length,
+            suspicious_downloads: suspiciousDownloads.length
+        };
+        
+        res.json({
+            summary,
+            favorites,
+            recent_downloads: recentDownloads,
+            duplicate_stream_ids: duplicateStreamIds,
+            scheda_heritage_search: schedaSearch,
+            suspicious_downloads: suspiciousDownloads
+        });
+        
+    } catch (error) {
+        console.error('Błąd debugowania:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+
 // Wyszukaj w TMDB (do dodawania do wishlisty)
 app.get('/api/tmdb/search', async (req, res) => {
     try {
