@@ -1393,8 +1393,296 @@ const SettingsView = () => {
     );
 };
 
-// === GŁÓWNY KOMPONENT WISHLISTY ===
-// Dodaj do App.js
+const WishlistCard = ({ item, onUpdate, onDelete, onDownload, onViewMatches }) => {
+    const [isExpanded, setIsExpanded] = useState(false);
+    const [isEditing, setIsEditing] = useState(false);
+    const [editData, setEditData] = useState({
+        priority: item.priority,
+        auto_download: item.auto_download,
+        search_keywords: item.search_keywords || '',
+        notes: item.notes || ''
+    });
+
+    const handleSaveEdit = async () => {
+        try {
+            await onUpdate(item.id, editData);
+            setIsEditing(false);
+        } catch (error) {
+            console.error('Błąd aktualizacji:', error);
+        }
+    };
+
+    const getStatusIcon = (status) => {
+        switch (status) {
+            case 'wanted': return '🔍';
+            case 'found': return '🎯';
+            case 'downloading': return '⏬';
+            case 'completed': return '✅';
+            default: return '❓';
+        }
+    };
+
+    const getStatusColor = (status) => {
+        switch (status) {
+            case 'wanted': return 'bg-blue-900/50 text-blue-300';
+            case 'found': return 'bg-green-900/50 text-green-300';
+            case 'downloading': return 'bg-yellow-900/50 text-yellow-300';
+            case 'completed': return 'bg-gray-900/50 text-gray-300';
+            default: return 'bg-gray-900/50 text-gray-300';
+        }
+    };
+
+    const getPriorityColor = (priority) => {
+        switch (priority) {
+            case 1: return 'bg-red-600';
+            case 2: return 'bg-orange-500';
+            case 3: return 'bg-yellow-500';
+            case 4: return 'bg-blue-500';
+            case 5: return 'bg-gray-500';
+            default: return 'bg-gray-500';
+        }
+    };
+
+    return (
+        <div className="bg-gray-800 rounded-lg overflow-hidden border border-gray-700">
+            <div className="flex p-4">
+                <div className="w-20 h-28 flex-shrink-0 mr-4">
+                    <img
+                        src={item.poster_path ? 
+                            `https://image.tmdb.org/t/p/w200${item.poster_path}` : 
+                            'https://placehold.co/200x300/1f2937/ffffff?text=No+Image'
+                        }
+                        alt={item.title}
+                        className="w-full h-full object-cover rounded"
+                    />
+                </div>
+
+                <div className="flex-1 min-w-0">
+                    <div className="flex items-start justify-between mb-2">
+                        <div className="flex-1 min-w-0">
+                            <h3 className="text-lg font-semibold text-white truncate">
+                                {item.title}
+                            </h3>
+                            {item.original_title && item.original_title !== item.title && (
+                                <p className="text-sm text-gray-400 truncate">
+                                    {item.original_title}
+                                </p>
+                            )}
+                        </div>
+                        
+                        <div className="flex items-center gap-2 ml-4">
+                            <div className={`px-2 py-1 rounded text-xs font-medium ${getStatusColor(item.status)}`}>
+                                {getStatusIcon(item.status)} {item.status}
+                            </div>
+                            <div className={`w-3 h-3 rounded-full ${getPriorityColor(item.priority)}`} title={`Priorytet: ${item.priority}`}></div>
+                        </div>
+                    </div>
+
+                    <div className="text-sm text-gray-400 space-y-1">
+                        <div className="flex items-center gap-4">
+                            <span className="capitalize">
+                                {item.media_type === 'tv' ? 'Serial' : 'Film'}
+                            </span>
+                            {item.release_date && (
+                                <span>{new Date(item.release_date).getFullYear()}</span>
+                            )}
+                            {item.vote_average > 0 && (
+                                <span className="flex items-center gap-1">
+                                    ⭐ {item.vote_average.toFixed(1)}
+                                </span>
+                            )}
+                        </div>
+                        
+                        <div className="flex items-center gap-4 text-xs">
+                            <span>Auto-DL: {item.auto_download ? '✅' : '❌'}</span>
+                            {item.match_count > 0 && (
+                                <span className="text-green-400">
+                                    {item.match_count} match{item.match_count !== 1 ? 'y' : ''}
+                                </span>
+                            )}
+                        </div>
+                    </div>
+
+                    {item.genres && item.genres.length > 0 && (
+                        <div className="mt-2 flex flex-wrap gap-1">
+                            {item.genres.slice(0, 3).map((genre) => (
+                                <span key={genre.id} className="px-2 py-0.5 bg-gray-700 text-xs text-gray-300 rounded">
+                                    {genre.name}
+                                </span>
+                            ))}
+                        </div>
+                    )}
+                </div>
+            </div>
+
+            <div className="px-4 py-3 bg-gray-900/30 border-t border-gray-700">
+                <div className="flex justify-between items-center">
+                    <div className="flex gap-2">
+                        {item.match_count > 0 && (
+                            <button
+                                onClick={() => onViewMatches(item)}
+                                className="text-green-400 hover:text-green-300 text-sm"
+                            >
+                                🎯 Zobacz matche ({item.match_count})
+                            </button>
+                        )}
+                    </div>
+                    
+                    <div className="flex gap-2">
+                        {item.status === 'found' && (
+                            <button
+                                onClick={() => onDownload(item)}
+                                className="px-3 py-1 bg-green-600 hover:bg-green-700 text-white rounded text-sm"
+                            >
+                                ⏬ Pobierz
+                            </button>
+                        )}
+                        
+                        <button
+                            onClick={() => onDelete(item.id)}
+                            className="px-3 py-1 bg-red-600 hover:bg-red-700 text-white rounded text-sm"
+                        >
+                            🗑️
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+const TMDBSearchResult = ({ item, onAdd, inWishlist = false }) => {
+    const [isAdding, setIsAdding] = useState(false);
+
+    const handleAdd = async () => {
+        setIsAdding(true);
+        try {
+            await onAdd(item);
+        } catch (error) {
+            console.error('Błąd dodawania:', error);
+        } finally {
+            setIsAdding(false);
+        }
+    };
+
+    return (
+        <div className="bg-gray-800 rounded-lg p-4 border border-gray-700">
+            <div className="flex gap-3">
+                <div className="w-16 h-24 flex-shrink-0">
+                    <img
+                        src={item.poster_path ? 
+                            `https://image.tmdb.org/t/p/w200${item.poster_path}` : 
+                            'https://placehold.co/200x300/1f2937/ffffff?text=No+Image'
+                        }
+                        alt={item.title || item.name}
+                        className="w-full h-full object-cover rounded"
+                    />
+                </div>
+                
+                <div className="flex-1 min-w-0">
+                    <h4 className="font-semibold text-white truncate">
+                        {item.title || item.name}
+                    </h4>
+                    
+                    <div className="text-sm text-gray-400 mb-2">
+                        <span className="capitalize">
+                            {item.media_type === 'tv' ? 'Serial' : 'Film'}
+                        </span>
+                        {(item.release_date || item.first_air_date) && (
+                            <span className="ml-2">
+                                {new Date(item.release_date || item.first_air_date).getFullYear()}
+                            </span>
+                        )}
+                    </div>
+                    
+                    {item.overview && (
+                        <p className="text-gray-300 text-sm leading-tight line-clamp-2">
+                            {item.overview.length > 100 ? 
+                                `${item.overview.substring(0, 100)}...` : 
+                                item.overview
+                            }
+                        </p>
+                    )}
+                </div>
+                
+                <div className="flex flex-col justify-between">
+                    {inWishlist ? (
+                        <div className="px-3 py-1 bg-gray-600 text-gray-300 rounded text-sm text-center">
+                            📋 W wishliście
+                        </div>
+                    ) : (
+                        <button
+                            onClick={handleAdd}
+                            disabled={isAdding}
+                            className="px-3 py-1 bg-red-600 hover:bg-red-700 disabled:bg-red-800 text-white rounded text-sm"
+                        >
+                            {isAdding ? '...' : '+ Dodaj'}
+                        </button>
+                    )}
+                </div>
+            </div>
+        </div>
+    );
+};
+
+const WishlistMatchesModal = ({ item, matches, onClose, onDownload }) => {
+    if (!item || !matches) return null;
+
+    return (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+            <div className="bg-gray-800 rounded-lg p-6 max-w-4xl w-full mx-4 max-h-[80vh] overflow-y-auto">
+                <div className="flex justify-between items-center mb-4">
+                    <h3 className="text-xl font-bold text-white">
+                        Znalezione matche dla: {item.title}
+                    </h3>
+                    <button
+                        onClick={onClose}
+                        className="text-gray-400 hover:text-white text-2xl"
+                    >
+                        ×
+                    </button>
+                </div>
+
+                <div className="space-y-3">
+                    {matches.map((match) => (
+                        <div key={match.id} className="bg-gray-700 p-4 rounded-lg">
+                            <div className="flex justify-between items-start">
+                                <div className="flex-1">
+                                    <h4 className="font-semibold text-white">
+                                        {match.media_name}
+                                    </h4>
+                                    <div className="text-sm text-gray-400 mt-1">
+                                        <span>Playlista: {match.playlist_name}</span>
+                                        <span className="ml-4">
+                                            Score: {(match.match_score * 100).toFixed(0)}%
+                                        </span>
+                                    </div>
+                                </div>
+                                <div className="ml-4">
+                                    <button
+                                        onClick={() => onDownload(item.id, match.id)}
+                                        className="px-3 py-1 bg-green-600 hover:bg-green-700 text-white rounded text-sm"
+                                    >
+                                        ⏬ Pobierz
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    ))}
+                </div>
+
+                <div className="mt-6 text-center">
+                    <button
+                        onClick={onClose}
+                        className="px-4 py-2 bg-gray-600 hover:bg-gray-700 text-white rounded"
+                    >
+                        Zamknij
+                    </button>
+                </div>
+            </div>
+        </div>
+    );
+};
 
 const WishlistView = () => {
     const [wishlist, setWishlist] = useState([]);
@@ -1402,33 +1690,18 @@ const WishlistView = () => {
     const [loading, setLoading] = useState(true);
     const [message, setMessage] = useState('');
     const [activeTab, setActiveTab] = useState('wishlist');
-    const [filters, setFilters] = useState({
-        status: '',
-        media_type: '',
-        priority: '',
-        sort_by: 'priority ASC, added_at DESC'
-    });
-
-    // Search/Add states
     const [searchQuery, setSearchQuery] = useState('');
     const [searchResults, setSearchResults] = useState([]);
     const [searching, setSearching] = useState(false);
-
-    // Modal states
     const [selectedItem, setSelectedItem] = useState(null);
     const [selectedMatches, setSelectedMatches] = useState(null);
     const [showMatchesModal, setShowMatchesModal] = useState(false);
 
-    // Wczytaj dane
-    useEffect(() => {
-        fetchData();
-    }, [filters]);
-
-    const fetchData = async () => {
+    const fetchData = React.useCallback(async () => {
         try {
             setLoading(true);
             const [wishlistRes, statsRes] = await Promise.all([
-                axios.get('/api/wishlist', { params: filters }),
+                axios.get('/api/wishlist'),
                 axios.get('/api/wishlist/stats')
             ]);
             
@@ -1440,10 +1713,13 @@ const WishlistView = () => {
         } finally {
             setLoading(false);
         }
-    };
+    }, []);
 
-    // Wyszukiwanie w TMDB
-    const searchTMDB = async () => {
+    useEffect(() => {
+        fetchData();
+    }, [fetchData]);
+
+    const searchTMDB = React.useCallback(async () => {
         if (!searchQuery.trim() || searchQuery.length < 2) {
             setSearchResults([]);
             return;
@@ -1461,9 +1737,8 @@ const WishlistView = () => {
         } finally {
             setSearching(false);
         }
-    };
+    }, [searchQuery]);
 
-    // Debounced search
     useEffect(() => {
         const timer = setTimeout(() => {
             if (activeTab === 'add') {
@@ -1471,9 +1746,8 @@ const WishlistView = () => {
             }
         }, 500);
         return () => clearTimeout(timer);
-    }, [searchQuery, activeTab]);
+    }, [searchQuery, activeTab, searchTMDB]);
 
-    // Dodaj do wishlisty
     const handleAddToWishlist = async (tmdbItem) => {
         try {
             await axios.post('/api/wishlist', {
@@ -1485,11 +1759,8 @@ const WishlistView = () => {
             
             setMessage(`Dodano "${tmdbItem.title || tmdbItem.name}" do wishlisty!`);
             setTimeout(() => setMessage(''), 3000);
-            
-            // Odśwież wishlistę
             fetchData();
             
-            // Oznacz w wynikach wyszukiwania
             setSearchResults(prev => prev.map(item => 
                 item.id === tmdbItem.id && item.media_type === tmdbItem.media_type
                     ? { ...item, in_wishlist: true, wishlist_status: 'wanted' }
@@ -1501,7 +1772,6 @@ const WishlistView = () => {
         }
     };
 
-    // Aktualizuj pozycję wishlisty
     const handleUpdateWishlist = async (id, updates) => {
         try {
             await axios.put(`/api/wishlist/${id}`, updates);
@@ -1514,7 +1784,6 @@ const WishlistView = () => {
         }
     };
 
-    // Usuń z wishlisty
     const handleDeleteFromWishlist = async (id) => {
         if (!window.confirm('Czy na pewno chcesz usunąć tę pozycję z wishlisty?')) {
             return;
@@ -1531,7 +1800,6 @@ const WishlistView = () => {
         }
     };
 
-    // Ręczne sprawdzenie wishlisty
     const handleCheckWishlist = async () => {
         try {
             setMessage('Sprawdzanie wishlisty...');
@@ -1545,7 +1813,6 @@ const WishlistView = () => {
         }
     };
 
-    // Zobacz matche
     const handleViewMatches = async (item) => {
         try {
             const response = await axios.get(`/api/wishlist/${item.id}/matches`);
@@ -1558,7 +1825,6 @@ const WishlistView = () => {
         }
     };
 
-    // Pobierz konkretny match
     const handleDownloadMatch = async (wishlistId, matchId) => {
         try {
             await axios.post(`/api/wishlist/${wishlistId}/download/${matchId}`);
@@ -1572,7 +1838,6 @@ const WishlistView = () => {
         }
     };
 
-    // Auto-download najlepszego matcha
     const handleAutoDownload = async (item) => {
         if (item.match_count === 0) {
             setMessage('Brak matchy do pobrania.');
@@ -1581,7 +1846,7 @@ const WishlistView = () => {
 
         try {
             const matchesResponse = await axios.get(`/api/wishlist/${item.id}/matches`);
-            const bestMatch = matchesResponse.data[0]; // Najlepszy match
+            const bestMatch = matchesResponse.data[0];
             
             if (bestMatch) {
                 await handleDownloadMatch(item.id, bestMatch.id);
@@ -1590,10 +1855,6 @@ const WishlistView = () => {
             console.error('Błąd auto-download:', error);
             setMessage('Błąd auto-download.');
         }
-    };
-
-    const handleFilterChange = (key, value) => {
-        setFilters(prev => ({ ...prev, [key]: value }));
     };
 
     if (loading) {
@@ -1606,7 +1867,6 @@ const WishlistView = () => {
 
     return (
         <div className="space-y-6">
-            {/* Header z statystykami */}
             {stats && (
                 <div className="bg-gray-800 rounded-lg p-6">
                     <h3 className="text-lg font-semibold text-white mb-4">Statystyki Wishlisty</h3>
@@ -1639,7 +1899,6 @@ const WishlistView = () => {
                 </div>
             )}
 
-            {/* Komunikaty */}
             {message && (
                 <div className={`p-4 rounded-lg ${
                     message.includes('Błąd') || message.includes('błąd') ? 
@@ -1650,7 +1909,6 @@ const WishlistView = () => {
                 </div>
             )}
 
-            {/* Zakładki */}
             <div className="flex justify-between items-center">
                 <nav className="flex space-x-8">
                     <button
@@ -1685,106 +1943,35 @@ const WishlistView = () => {
                 )}
             </div>
 
-            {/* Zawartość zakładek */}
             {activeTab === 'wishlist' && (
-                <div>
-                    {/* Filtry */}
-                    <div className="bg-gray-800 rounded-lg p-4 mb-6">
-                        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-                            <div>
-                                <label className="block text-sm font-medium text-gray-300 mb-1">Status</label>
-                                <select
-                                    value={filters.status}
-                                    onChange={(e) => handleFilterChange('status', e.target.value)}
-                                    className="w-full bg-gray-700 border border-gray-600 rounded-md p-2 text-white text-sm"
-                                >
-                                    <option value="">Wszystkie</option>
-                                    <option value="wanted">Poszukiwane</option>
-                                    <option value="found">Znalezione</option>
-                                    <option value="downloading">Pobierane</option>
-                                    <option value="completed">Ukończone</option>
-                                </select>
-                            </div>
-
-                            <div>
-                                <label className="block text-sm font-medium text-gray-300 mb-1">Typ</label>
-                                <select
-                                    value={filters.media_type}
-                                    onChange={(e) => handleFilterChange('media_type', e.target.value)}
-                                    className="w-full bg-gray-700 border border-gray-600 rounded-md p-2 text-white text-sm"
-                                >
-                                    <option value="">Wszystkie</option>
-                                    <option value="movie">Filmy</option>
-                                    <option value="tv">Seriale</option>
-                                </select>
-                            </div>
-
-                            <div>
-                                <label className="block text-sm font-medium text-gray-300 mb-1">Priorytet</label>
-                                <select
-                                    value={filters.priority}
-                                    onChange={(e) => handleFilterChange('priority', e.target.value)}
-                                    className="w-full bg-gray-700 border border-gray-600 rounded-md p-2 text-white text-sm"
-                                >
-                                    <option value="">Wszystkie</option>
-                                    <option value="1">1 - Najwyższy</option>
-                                    <option value="2">2 - Wysoki</option>
-                                    <option value="3">3 - Średni</option>
-                                    <option value="4">4 - Niski</option>
-                                    <option value="5">5 - Najniższy</option>
-                                </select>
-                            </div>
-
-                            <div>
-                                <label className="block text-sm font-medium text-gray-300 mb-1">Sortowanie</label>
-                                <select
-                                    value={filters.sort_by}
-                                    onChange={(e) => handleFilterChange('sort_by', e.target.value)}
-                                    className="w-full bg-gray-700 border border-gray-600 rounded-md p-2 text-white text-sm"
-                                >
-                                    <option value="priority ASC, added_at DESC">Priorytet rosnąco</option>
-                                    <option value="priority DESC, added_at DESC">Priorytet malejąco</option>
-                                    <option value="added_at DESC">Najnowsze</option>
-                                    <option value="added_at ASC">Najstarsze</option>
-                                    <option value="title ASC">Nazwa A-Z</option>
-                                    <option value="title DESC">Nazwa Z-A</option>
-                                </select>
-                            </div>
+                <div className="space-y-4">
+                    {wishlist.length === 0 ? (
+                        <div className="bg-gray-800 rounded-lg p-8 text-center">
+                            <div className="text-gray-400 mb-4">Twoja wishlist jest pusta</div>
+                            <button
+                                onClick={() => setActiveTab('add')}
+                                className="bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-4 rounded-lg transition duration-300"
+                            >
+                                Dodaj Pierwszą Pozycję
+                            </button>
                         </div>
-                    </div>
-
-                    {/* Lista wishlisty */}
-                    <div className="space-y-4">
-                        {wishlist.length === 0 ? (
-                            <div className="bg-gray-800 rounded-lg p-8 text-center">
-                                <div className="text-gray-400 mb-4">Twoja wishlist jest pusta</div>
-                                <button
-                                    onClick={() => setActiveTab('add')}
-                                    className="bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-4 rounded-lg transition duration-300"
-                                >
-                                    Dodaj Pierwszą Pozycję
-                                </button>
-                            </div>
-                        ) : (
-                            wishlist.map(item => (
-                                <WishlistCard
-                                    key={item.id}
-                                    item={item}
-                                    onUpdate={handleUpdateWishlist}
-                                    onDelete={handleDeleteFromWishlist}
-                                    onDownload={handleAutoDownload}
-                                    onViewMatches={handleViewMatches}
-                                />
-                            ))
-                        )}
-                    </div>
+                    ) : (
+                        wishlist.map(item => (
+                            <WishlistCard
+                                key={item.id}
+                                item={item}
+                                onUpdate={handleUpdateWishlist}
+                                onDelete={handleDeleteFromWishlist}
+                                onDownload={handleAutoDownload}
+                                onViewMatches={handleViewMatches}
+                            />
+                        ))
+                    )}
                 </div>
             )}
 
-            {/* Zakładka dodawania */}
             {activeTab === 'add' && (
                 <div>
-                    {/* Wyszukiwanie */}
                     <div className="bg-gray-800 rounded-lg p-6 mb-6">
                         <h3 className="text-lg font-semibold text-white mb-4">Wyszukaj w TMDB</h3>
                         <div className="flex gap-3">
@@ -1805,7 +1992,6 @@ const WishlistView = () => {
                         </div>
                     </div>
 
-                    {/* Wyniki wyszukiwania */}
                     <div className="space-y-3">
                         {searchResults.length === 0 && searchQuery.length >= 2 && !searching && (
                             <div className="bg-gray-800 rounded-lg p-6 text-center text-gray-400">
@@ -1825,7 +2011,6 @@ const WishlistView = () => {
                 </div>
             )}
 
-            {/* Modal z matchami */}
             {showMatchesModal && (
                 <WishlistMatchesModal
                     item={selectedItem}

@@ -25,8 +25,6 @@ const db = new sqlite3.Database(dbPath, (err) => {
     }
 });
 
-// Import Wishlist Manager
-const WishlistManager = require('./wishlist_manager');
 
 function initializeDb() {
     db.serialize(() => {
