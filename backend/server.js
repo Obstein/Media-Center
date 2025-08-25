@@ -660,6 +660,7 @@ app.post('/api/playlists/sync-all', async (req, res) => {
 });
 
 // Funkcja pomocnicza do synchronizacji pojedynczej playlisty
+// Funkcja pomocnicza do synchronizacji pojedynczej playlisty
 async function syncSinglePlaylist(playlist) {
     const { id: playlistId, server_url, username, password, name } = playlist;
     
@@ -697,8 +698,11 @@ async function syncSinglePlaylist(playlist) {
             return { added: 0, removed: 0, message: 'Brak danych z serwera' };
         }
         
-        // Pobierz istniejące media dla tej playlisty
-        const existingMedia = await dbAll('SELECT stream_id, stream_type FROM media WHERE playlist_id = ?', [playlistId]);
+        // ✅ POPRAWKA: Pobierz istniejące media TYLKO dla tej konkretnej playlisty
+        const existingMedia = await dbAll(
+            'SELECT stream_id, stream_type FROM media WHERE playlist_id = ?', 
+            [playlistId]
+        );
         
         const incomingMediaSet = new Set(incomingList.map(item => `${item.stream_id}_${item.stream_type}`));
         const existingMediaSet = new Set(existingMedia.map(m => `${m.stream_id}_${m.stream_type}`));
@@ -715,16 +719,34 @@ async function syncSinglePlaylist(playlist) {
             await dbRun('BEGIN TRANSACTION');
             transactionActive = true;
             
-            // Usuń stare pozycje
+            // ✅ POPRAWKA: Usuń stare pozycje tylko z tej playlisty
             if (itemsToDelete.length > 0) {
                 const deleteMediaStmt = db.prepare('DELETE FROM media WHERE stream_id = ? AND stream_type = ? AND playlist_id = ?');
-                const deleteGenresStmt = db.prepare('DELETE FROM media_genres WHERE media_stream_id = ? AND media_stream_type = ?');
+                // ✅ POPRAWKA: Usuń gatunki tylko jeśli nie są używane przez inne playlisty
+                const deleteGenresStmt = db.prepare(`
+                    DELETE FROM media_genres 
+                    WHERE media_stream_id = ? AND media_stream_type = ? 
+                    AND NOT EXISTS (
+                        SELECT 1 FROM media m2 
+                        WHERE m2.stream_id = ? AND m2.stream_type = ? 
+                        AND m2.playlist_id != ?
+                    )
+                `);
                 const deleteFavoritesStmt = db.prepare('DELETE FROM favorites WHERE stream_id = ? AND stream_type = ? AND playlist_id = ?');
                 
                 try {
                     for (const item of itemsToDelete) {
+                        // Usuń z media dla tej playlisty
                         await stmtRun(deleteMediaStmt, [item.stream_id, item.stream_type, playlistId]);
-                        await stmtRun(deleteGenresStmt, [item.stream_id, item.stream_type]);
+                        
+                        // ✅ POPRAWKA: Usuń gatunki tylko jeśli ta pozycja nie istnieje w innych playlistach
+                        await stmtRun(deleteGenresStmt, [
+                            item.stream_id, item.stream_type, 
+                            item.stream_id, item.stream_type, 
+                            playlistId
+                        ]);
+                        
+                        // Usuń z ulubionych dla tej playlisty
                         await stmtRun(deleteFavoritesStmt, [item.stream_id, item.stream_type, playlistId]);
                     }
                 } finally {
@@ -762,11 +784,18 @@ async function syncSinglePlaylist(playlist) {
                             tmdbId,
                             item.stream_type,
                             item.container_extension,
-                            playlistId // WAŻNE: przypisz do konkretnej playlisty
+                            playlistId // ✅ WAŻNE: przypisz do konkretnej playlisty
                         ]);
                         
-                        // Pobierz gatunki z TMDB jeśli mamy ID i klucz API
-                        if (tmdbId && tmdbApi) {
+                        // ✅ POPRAWKA: Sprawdź czy gatunki już istnieją dla tego media (z dowolnej playlisty)
+                        const existingGenres = await dbAll(`
+                            SELECT COUNT(*) as count 
+                            FROM media_genres 
+                            WHERE media_stream_id = ? AND media_stream_type = ?
+                        `, [item.stream_id, item.stream_type]);
+                        
+                        // Pobierz gatunki z TMDB tylko jeśli jeszcze ich nie ma
+                        if (existingGenres[0].count === 0 && tmdbId && tmdbApi) {
                             try {
                                 const tmdbType = item.stream_type === 'series' ? 'tv' : 'movie';
                                 const tmdbUrl = `https://api.themoviedb.org/3/${tmdbType}/${tmdbId}?api_key=${tmdbApi}&language=pl-PL`;
@@ -778,6 +807,9 @@ async function syncSinglePlaylist(playlist) {
                                         await stmtRun(genreStmt, [genre.id, genre.name]);
                                         await stmtRun(mediaGenreStmt, [item.stream_id, item.stream_type, genre.id]);
                                     }
+                                } else {
+                                    // Dodaj domyślny gatunek
+                                    await stmtRun(mediaGenreStmt, [item.stream_id, item.stream_type, -1]);
                                 }
                                 
                                 // Krótkie opóźnienie dla TMDB API
@@ -786,10 +818,11 @@ async function syncSinglePlaylist(playlist) {
                                 // Dodaj domyślny gatunek przy błędzie TMDB
                                 await stmtRun(mediaGenreStmt, [item.stream_id, item.stream_type, -1]);
                             }
-                        } else {
+                        } else if (existingGenres[0].count === 0) {
                             // Brak TMDB ID lub API - dodaj domyślny gatunek
                             await stmtRun(mediaGenreStmt, [item.stream_id, item.stream_type, -1]);
                         }
+                        // ✅ Jeśli gatunki już istnieją, nie rób nic - są współdzielone między playlistami
                         
                         processedCount++;
                         if (processedCount % 100 === 0) {
@@ -814,6 +847,8 @@ async function syncSinglePlaylist(playlist) {
             // Zatwierdź transakcję
             await dbRun('COMMIT');
             transactionActive = false;
+            
+            console.log(`  ✅ Synchronizacja ${name} zakończona: +${itemsToAdd.length} -${itemsToDelete.length} (łącznie: ${newMediaCount[0].count})`);
             
             return {
                 added: itemsToAdd.length,
