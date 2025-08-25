@@ -2877,6 +2877,151 @@ async function backfillTmdbGenres(limit = 50) {
     }
 }
 
+app.get('/api/debug/serial-details/:id', async (req, res) => {
+    const { id } = req.params;
+    
+    try {
+        console.log(`🔍 DEBUG: Sprawdzam serial ID: ${id}`);
+        
+        // 1. Sprawdź co jest w bazie
+        const mediaInDB = await dbAll(`
+            SELECT m.*, p.server_url, p.username, p.password, p.name as playlist_name
+            FROM media m
+            LEFT JOIN playlists p ON m.playlist_id = p.id
+            WHERE m.stream_id = ? AND m.stream_type = 'series'
+        `, [id]);
+        
+        console.log(`📺 Znaleziono ${mediaInDB.length} seriali z tym ID`);
+        
+        if (mediaInDB.length === 0) {
+            return res.json({ 
+                error: 'Serial nie znaleziony w bazie',
+                media_found: 0
+            });
+        }
+        
+        const results = [];
+        
+        for (const media of mediaInDB) {
+            console.log(`📡 Sprawdzam playlistę: ${media.playlist_name}`);
+            
+            try {
+                const xtreamBaseUrl = `${media.server_url}/player_api.php?username=${media.username}&password=${media.password}`;
+                const apiUrl = `${xtreamBaseUrl}&action=get_series_info&series_id=${id}`;
+                
+                console.log(`🌐 API URL: ${apiUrl}`);
+                
+                const startTime = Date.now();
+                const response = await axios.get(apiUrl, { 
+                    timeout: 10000,
+                    validateStatus: (status) => status < 500
+                });
+                const responseTime = Date.now() - startTime;
+                
+                console.log(`✅ Odpowiedź: ${response.status} (${responseTime}ms)`);
+                console.log(`📦 Keys:`, Object.keys(response.data || {}));
+                
+                results.push({
+                    playlist_name: media.playlist_name,
+                    playlist_id: media.playlist_id,
+                    server_url: media.server_url,
+                    api_url: apiUrl,
+                    response_time: responseTime,
+                    status_code: response.status,
+                    success: response.status === 200,
+                    data_keys: Object.keys(response.data || {}),
+                    has_info: !!(response.data?.info),
+                    has_episodes: !!(response.data?.episodes),
+                    episode_count: response.data?.episodes ? 
+                        Object.values(response.data.episodes).flat().length : 0,
+                    sample_data: {
+                        info_name: response.data?.info?.name,
+                        info_plot: response.data?.info?.plot?.substring(0, 100),
+                        first_season: response.data?.episodes ? Object.keys(response.data.episodes)[0] : null
+                    }
+                });
+                
+            } catch (apiError) {
+                console.error(`❌ Błąd API dla ${media.playlist_name}:`, apiError.message);
+                results.push({
+                    playlist_name: media.playlist_name,
+                    playlist_id: media.playlist_id,
+                    server_url: media.server_url,
+                    success: false,
+                    error: apiError.message,
+                    error_code: apiError.code,
+                    status_code: apiError.response?.status
+                });
+            }
+        }
+        
+        res.json({
+            serial_id: id,
+            media_found: mediaInDB.length,
+            api_results: results,
+            debug_info: {
+                timestamp: new Date().toISOString(),
+                total_playlists_checked: results.length,
+                successful_calls: results.filter(r => r.success).length,
+                failed_calls: results.filter(r => !r.success).length
+            }
+        });
+        
+    } catch (error) {
+        console.error('❌ Debug error:', error);
+        res.status(500).json({ 
+            error: error.message,
+            stack: error.stack 
+        });
+    }
+});
+
+// DODAJ RÓWNIEŻ ULEPSZONĄ WERSJĘ ORYGINALNEGO ENDPOINTA
+// Znajdź endpoint '/api/media/details/:type/:id' i dodaj na początku więcej logowania:
+
+app.get('/api/media/details/:type/:id', async (req, res) => {
+    const { type, id } = req.params;
+    
+    console.log(`🔍 DETAILS REQUEST: ${type}/${id}`);
+    
+    try {
+        const settingsRows = await dbAll(`SELECT key, value FROM settings`);
+        const settings = settingsRows.reduce((acc, row) => ({...acc, [row.key]: row.value }), {});
+        const { serverUrl, username, password, tmdbApi } = settings;
+        
+        console.log(`⚙️ Settings check: serverUrl=${!!serverUrl}, username=${!!username}, password=${!!password}, tmdbApi=${!!tmdbApi}`);
+        
+        if (!tmdbApi || !serverUrl || !username || !password) {
+            console.log('❌ MISSING CONFIGURATION');
+            return res.status(400).json({ error: 'API nie jest w pełni skonfigurowane.' });
+        }
+        
+        const mediaItemResult = await dbAll('SELECT * FROM media WHERE stream_id = ? AND stream_type = ?', [id, type]);
+        console.log(`📊 Media query result: ${mediaItemResult.length} items found`);
+        
+        if (!mediaItemResult || mediaItemResult.length === 0) {
+            console.log('❌ MEDIA NOT FOUND IN DB');
+            return res.status(404).json({ error: 'Nie znaleziono pozycji w bazie danych.' });
+        }
+        
+        let finalDetails = { ...mediaItemResult[0] };
+        let tmdbIdToUse = finalDetails.tmdb_id;
+        const xtreamBaseUrl = `${serverUrl}/player_api.php?username=${username}&password=${password}`;
+        
+        console.log(`📡 Using Xtream URL base: ${xtreamBaseUrl}`);
+        
+        // Reszta kodu pozostaje bez zmian...
+        // [KONTYNUUJ Z ORYGINALNYM KODEM]
+        
+    } catch (error) {
+        console.error(`❌ DETAILS ERROR for ${type}/${id}:`, error);
+        res.status(500).json({ 
+            error: 'Nie udało się pobrać szczegółów.',
+            details: error.message 
+        });
+    }
+});
+
 app.listen(PORT, () => {
     console.log(`Serwer backendu działa na porcie ${PORT}`);
     
