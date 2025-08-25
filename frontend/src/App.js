@@ -2162,6 +2162,7 @@ function App() {
             <div className="flex items-center space-x-4">
               <button onClick={() => setIsWidgetOpen(!isWidgetOpen)} className="text-gray-300 hover:text-white">Pobierane</button>
               <a href="#/home" className="text-gray-300 hover:text-white px-3 py-2 rounded-md text-sm font-medium no-underline">Strona Główna</a>
+              <a href="#/wishlist" className="text-gray-300 hover:text-white px-3 py-2 rounded-md text-sm font-medium no-underline">Wishlist</a>
               <a href="#/settings" className="text-gray-300 hover:text-white px-3 py-2 rounded-md text-sm font-medium no-underline">Ustawienia</a>
             </div>
           </div>
