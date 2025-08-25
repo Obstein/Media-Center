@@ -923,7 +923,7 @@ app.post('/api/tmdb/sync', async (req, res) => {
         }
 
         // Sprawdź ile pozycji potrzebuje aktualizacji
-        cconst itemsToUpdate = await dbAll(`
+        const itemsToUpdate = await dbAll(`
     SELECT m.stream_id, m.tmdb_id, m.stream_type, m.name
     FROM media m
     LEFT JOIN media_genres mg ON m.stream_id = mg.media_stream_id AND m.stream_type = mg.media_stream_type AND mg.genre_id != -1
