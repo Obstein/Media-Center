@@ -1321,87 +1321,7 @@ app.get('/api/media', (req, res) => {
 });
 
 // --- API: SZCZEGÓŁY MEDIA ---
-app.get('/api/media/details/:type/:id', async (req, res) => {
-    const { type, id } = req.params;
-    try {
-        const settingsRows = await dbAll(`SELECT key, value FROM settings`);
-        const settings = settingsRows.reduce((acc, row) => ({...acc, [row.key]: row.value }), {});
-        const { serverUrl, username, password, tmdbApi } = settings;
-        
-        if (!tmdbApi || !serverUrl || !username || !password) {
-            return res.status(400).json({ error: 'API nie jest w pełni skonfigurowane.' });
-        }
-        
-        const mediaItemResult = await dbAll('SELECT * FROM media WHERE stream_id = ? AND stream_type = ?', [id, type]);
-        if (!mediaItemResult || mediaItemResult.length === 0) {
-            return res.status(404).json({ error: 'Nie znaleziono pozycji w bazie danych.' });
-        }
-        
-        let finalDetails = { ...mediaItemResult[0] };
-        let tmdbIdToUse = finalDetails.tmdb_id;
-        const xtreamBaseUrl = `${serverUrl}/player_api.php?username=${username}&password=${password}`;
-        
-        // Użyj retry mechanism dla Xtream API calls
-        try {
-            if (finalDetails.stream_type === 'series') {
-                const xtreamUrl = `${xtreamBaseUrl}&action=get_series_info&series_id=${id}`;
-                console.log(`Fetching series info for ID: ${id}`);
-                const seriesInfoRes = await makeRetryRequest(xtreamUrl);
-                finalDetails.xtream_details = seriesInfoRes.data;
-                if (seriesInfoRes.data?.info?.tmdb) {
-                    tmdbIdToUse = seriesInfoRes.data.info.tmdb;
-                }
-            } else if (finalDetails.stream_type === 'movie') {
-                const xtreamUrl = `${xtreamBaseUrl}&action=get_vod_info&vod_id=${id}`;
-                console.log(`Fetching movie info for ID: ${id}`);
-                const movieInfoRes = await makeRetryRequest(xtreamUrl);
-                finalDetails.xtream_details = { info: movieInfoRes.data?.movie_data, ...movieInfoRes.data };
-                if (movieInfoRes.data?.movie_data?.tmdb_id) {
-                    tmdbIdToUse = movieInfoRes.data.movie_data.tmdb_id;
-                }
-            }
-        } catch (xtreamError) {
-            console.error(`Failed to fetch Xtream details after retries: ${xtreamError.message}`);
-            // Kontynuuj bez szczegółów Xtream jeśli nie można ich pobrać
-            finalDetails.xtream_details = null;
-            finalDetails.xtream_error = `Nie udało się pobrać szczegółów z serwera: ${xtreamError.message}`;
-        }
-        
-        // TMDB API call z retry
-        if (tmdbIdToUse) {
-            const tmdbType = finalDetails.stream_type === 'series' ? 'tv' : 'movie';
-            const tmdbUrl = `https://api.themoviedb.org/3/${tmdbType}/${tmdbIdToUse}?api_key=${tmdbApi}&language=pl-PL&append_to_response=videos,credits,translations`;
-            try {
-                console.log(`Fetching TMDB details for ID: ${tmdbIdToUse}`);
-                const tmdbRes = await makeRetryRequest(tmdbUrl);
-                let tmdbData = tmdbRes.data;
-                const polishTranslation = tmdbData.translations?.translations?.find(t => t.iso_639_1 === 'pl');
-if (polishTranslation?.data) {
-    // TYLKO opis po polsku, NIE tytuł
-    tmdbData.overview = polishTranslation.data.overview || tmdbData.overview;
-    console.log(`📝 Używam polskiego opisu dla: ${finalDetails.name}`);
-    
-    // NIE NADPISUJ TYTUŁÓW:
-    // tmdbData.title = polishTranslation.data.title || tmdbData.title; // ❌ USUŃ
-    // tmdbData.name = polishTranslation.data.name || tmdbData.name;   // ❌ USUŃ
-}
-                finalDetails.tmdb_details = tmdbData;
-            } catch(tmdbError) {
-                console.error(`Failed to fetch TMDB details after retries: ${tmdbError.message}`);
-                finalDetails.tmdb_details = null;
-                finalDetails.tmdb_error = `Nie udało się pobrać szczegółów z TMDB: ${tmdbError.message}`;
-            }
-        }
-        
-        res.json(finalDetails);
-    } catch (error) {
-        console.error(`Błąd podczas pobierania szczegółów dla ${type}/${id}:`, error.message);
-        res.status(500).json({ 
-            error: 'Nie udało się pobrać szczegółów.',
-            details: error.message 
-        });
-    }
-});
+
 
 // --- ZOPTYMALIZOWANE ODŚWIEŻANIE MEDIÓW ---
 app.post('/api/media/refresh', async (req, res) => {
@@ -2976,27 +2896,20 @@ app.get('/api/debug/serial-details/:id', async (req, res) => {
     }
 });
 
-// DODAJ RÓWNIEŻ ULEPSZONĄ WERSJĘ ORYGINALNEGO ENDPOINTA
-// Znajdź endpoint '/api/media/details/:type/:id' i dodaj na początku więcej logowania:
-
 app.get('/api/media/details/:type/:id', async (req, res) => {
     const { type, id } = req.params;
-    
     console.log(`🔍 DETAILS REQUEST: ${type}/${id}`);
     
     try {
-        const settingsRows = await dbAll(`SELECT key, value FROM settings`);
-        const settings = settingsRows.reduce((acc, row) => ({...acc, [row.key]: row.value }), {});
-        const { serverUrl, username, password, tmdbApi } = settings;
+        // POPRAWKA: Pobierz ustawienia z nowego systemu playlist
+        const mediaItemResult = await dbAll(`
+            SELECT m.*, p.server_url, p.username, p.password, p.name as playlist_name
+            FROM media m
+            LEFT JOIN playlists p ON m.playlist_id = p.id
+            WHERE m.stream_id = ? AND m.stream_type = ?
+            LIMIT 1
+        `, [id, type]);
         
-        console.log(`⚙️ Settings check: serverUrl=${!!serverUrl}, username=${!!username}, password=${!!password}, tmdbApi=${!!tmdbApi}`);
-        
-        if (!tmdbApi || !serverUrl || !username || !password) {
-            console.log('❌ MISSING CONFIGURATION');
-            return res.status(400).json({ error: 'API nie jest w pełni skonfigurowane.' });
-        }
-        
-        const mediaItemResult = await dbAll('SELECT * FROM media WHERE stream_id = ? AND stream_type = ?', [id, type]);
         console.log(`📊 Media query result: ${mediaItemResult.length} items found`);
         
         if (!mediaItemResult || mediaItemResult.length === 0) {
@@ -3004,20 +2917,101 @@ app.get('/api/media/details/:type/:id', async (req, res) => {
             return res.status(404).json({ error: 'Nie znaleziono pozycji w bazie danych.' });
         }
         
-        let finalDetails = { ...mediaItemResult[0] };
+        const mediaItem = mediaItemResult[0];
+        
+        // Sprawdź czy mamy dane playlisty
+        if (!mediaItem.server_url || !mediaItem.username || !mediaItem.password) {
+            console.log('❌ MISSING PLAYLIST CONFIGURATION');
+            return res.status(400).json({ error: 'Brak konfiguracji playlisty dla tego media.' });
+        }
+        
+        // Pobierz klucz TMDB API
+        const tmdbApiRows = await dbAll(`SELECT value FROM settings WHERE key = 'tmdbApi'`);
+        const tmdbApi = tmdbApiRows[0]?.value;
+        
+        if (!tmdbApi) {
+            console.log('⚠️ MISSING TMDB API KEY');
+        }
+        
+        let finalDetails = { ...mediaItem };
         let tmdbIdToUse = finalDetails.tmdb_id;
-        const xtreamBaseUrl = `${serverUrl}/player_api.php?username=${username}&password=${password}`;
+        const xtreamBaseUrl = `${mediaItem.server_url}/player_api.php?username=${mediaItem.username}&password=${mediaItem.password}`;
         
         console.log(`📡 Using Xtream URL base: ${xtreamBaseUrl}`);
         
-        // Reszta kodu pozostaje bez zmian...
-        // [KONTYNUUJ Z ORYGINALNYM KODEM]
+        // Użyj retry mechanism dla Xtream API calls
+        try {
+            if (finalDetails.stream_type === 'series') {
+                const xtreamUrl = `${xtreamBaseUrl}&action=get_series_info&series_id=${id}`;
+                console.log(`📺 Fetching series info: ${xtreamUrl}`);
+                
+                const seriesInfoRes = await makeRetryRequest(xtreamUrl);
+                console.log(`✅ Series data received, keys: ${Object.keys(seriesInfoRes.data || {})}`);
+                
+                finalDetails.xtream_details = seriesInfoRes.data;
+                if (seriesInfoRes.data?.info?.tmdb) {
+                    tmdbIdToUse = seriesInfoRes.data.info.tmdb;
+                    console.log(`🔄 Updated TMDB ID from series info: ${tmdbIdToUse}`);
+                }
+            } else if (finalDetails.stream_type === 'movie') {
+                const xtreamUrl = `${xtreamBaseUrl}&action=get_vod_info&vod_id=${id}`;
+                console.log(`🎬 Fetching movie info: ${xtreamUrl}`);
+                
+                const movieInfoRes = await makeRetryRequest(xtreamUrl);
+                console.log(`✅ Movie data received, keys: ${Object.keys(movieInfoRes.data || {})}`);
+                
+                finalDetails.xtream_details = { 
+                    info: movieInfoRes.data?.movie_data, 
+                    ...movieInfoRes.data 
+                };
+                if (movieInfoRes.data?.movie_data?.tmdb_id) {
+                    tmdbIdToUse = movieInfoRes.data.movie_data.tmdb_id;
+                    console.log(`🔄 Updated TMDB ID from movie info: ${tmdbIdToUse}`);
+                }
+            }
+        } catch (xtreamError) {
+            console.error(`❌ Failed to fetch Xtream details: ${xtreamError.message}`);
+            finalDetails.xtream_details = null;
+            finalDetails.xtream_error = `Nie udało się pobrać szczegółów z serwera: ${xtreamError.message}`;
+        }
+        
+        // TMDB API call z retry (tylko jeśli mamy klucz)
+        if (tmdbIdToUse && tmdbApi) {
+            const tmdbType = finalDetails.stream_type === 'series' ? 'tv' : 'movie';
+            const tmdbUrl = `https://api.themoviedb.org/3/${tmdbType}/${tmdbIdToUse}?api_key=${tmdbApi}&language=pl-PL&append_to_response=videos,credits,translations`;
+            
+            try {
+                console.log(`🎭 Fetching TMDB details for ID: ${tmdbIdToUse}`);
+                const tmdbRes = await makeRetryRequest(tmdbUrl);
+                let tmdbData = tmdbRes.data;
+                
+                // Polski opis jeśli dostępny
+                const polishTranslation = tmdbData.translations?.translations?.find(t => t.iso_639_1 === 'pl');
+                if (polishTranslation?.data) {
+                    tmdbData.overview = polishTranslation.data.overview || tmdbData.overview;
+                    console.log(`🇵🇱 Using Polish description`);
+                }
+                
+                finalDetails.tmdb_details = tmdbData;
+                console.log(`✅ TMDB data received`);
+            } catch(tmdbError) {
+                console.error(`❌ Failed to fetch TMDB details: ${tmdbError.message}`);
+                finalDetails.tmdb_details = null;
+                finalDetails.tmdb_error = `Nie udało się pobrać szczegółów z TMDB: ${tmdbError.message}`;
+            }
+        } else {
+            console.log(`ℹ️ Skipping TMDB: tmdbId=${!!tmdbIdToUse}, apiKey=${!!tmdbApi}`);
+        }
+        
+        console.log(`✅ DETAILS SUCCESS for ${type}/${id}`);
+        res.json(finalDetails);
         
     } catch (error) {
         console.error(`❌ DETAILS ERROR for ${type}/${id}:`, error);
         res.status(500).json({ 
             error: 'Nie udało się pobrać szczegółów.',
-            details: error.message 
+            details: error.message,
+            stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
         });
     }
 });
