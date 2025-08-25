@@ -1801,7 +1801,7 @@ app.get('/api/downloads/daemon-status', (req, res) => {
 
 // Inicjalizacja Wishlist Manager
 const WishlistManager = require('./wishlist_manager');
-const WishlistManager = new WishlistManager(db, dbAll, dbRun, stmtRun);
+const wishlistManager = new WishlistManager(db, dbAll, dbRun, stmtRun);
 
 // === WISHLIST API ===
 
