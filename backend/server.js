@@ -923,14 +923,14 @@ app.post('/api/tmdb/sync', async (req, res) => {
         }
 
         // Sprawdź ile pozycji potrzebuje aktualizacji
-        const itemsToUpdate = await dbAll(`
-            SELECT m.stream_id, m.tmdb_id, m.stream_type, m.name
-            FROM media m
-            LEFT JOIN media_genres mg ON m.stream_id = mg.media_stream_id AND m.stream_type = mg.media_stream_type
-            WHERE m.tmdb_id IS NOT NULL AND m.tmdb_id != '' AND mg.genre_id IS NULL
-            GROUP BY m.stream_id, m.stream_type
-            LIMIT ?
-        `, [limit]);
+        cconst itemsToUpdate = await dbAll(`
+    SELECT m.stream_id, m.tmdb_id, m.stream_type, m.name
+    FROM media m
+    LEFT JOIN media_genres mg ON m.stream_id = mg.media_stream_id AND m.stream_type = mg.media_stream_type AND mg.genre_id != -1
+    WHERE m.tmdb_id IS NOT NULL AND m.tmdb_id != '' AND mg.genre_id IS NULL
+    GROUP BY m.stream_id, m.stream_type
+    LIMIT ?
+`, [limit]);
 
         if (itemsToUpdate.length === 0) {
             return res.json({ 
@@ -1017,11 +1017,11 @@ app.get('/api/tmdb/status', async (req, res) => {
     try {
         // Sprawdź ile pozycji bez gatunków
         const withoutGenres = await dbAll(`
-            SELECT COUNT(*) as count
-            FROM media m
-            LEFT JOIN media_genres mg ON m.stream_id = mg.media_stream_id AND m.stream_type = mg.media_stream_type
-            WHERE m.tmdb_id IS NOT NULL AND m.tmdb_id != '' AND mg.genre_id IS NULL
-        `);
+    SELECT COUNT(*) as count
+    FROM media m
+    LEFT JOIN media_genres mg ON m.stream_id = mg.media_stream_id AND m.stream_type = mg.media_stream_type AND mg.genre_id != -1
+    WHERE m.tmdb_id IS NOT NULL AND m.tmdb_id != '' AND mg.genre_id IS NULL
+`);
 
         // Sprawdź ile pozycji z gatunkami - POPRAWIONA WERSJA dla SQLite
         const withGenres = await dbAll(`
@@ -2817,13 +2817,13 @@ async function backfillTmdbGenres(limit = 50) {
 
     try {
         const itemsToUpdate = await dbAll(`
-            SELECT m.stream_id, m.tmdb_id, m.stream_type
-            FROM media m
-            LEFT JOIN media_genres mg ON m.stream_id = mg.media_stream_id AND m.stream_type = mg.media_stream_type
-            WHERE m.tmdb_id IS NOT NULL AND m.tmdb_id != '' AND mg.genre_id IS NULL
-            GROUP BY m.stream_id, m.stream_type
-            LIMIT ?
-        `, [limit]);
+    SELECT m.stream_id, m.tmdb_id, m.stream_type
+    FROM media m
+    LEFT JOIN media_genres mg ON m.stream_id = mg.media_stream_id AND m.stream_type = mg.media_stream_type AND mg.genre_id != -1
+    WHERE m.tmdb_id IS NOT NULL AND m.tmdb_id != '' AND mg.genre_id IS NULL
+    GROUP BY m.stream_id, m.stream_type
+    LIMIT ?
+`, [limit]);
 
         if (itemsToUpdate.length === 0) {
             console.log('Zadanie uzupełniania zakończone: brak pozycji do zaktualizowania.');
