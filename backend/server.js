@@ -908,7 +908,7 @@ async function syncSinglePlaylist(playlist) {
 }
 // --- API: Ręczna synchronizacja TMDB ---
 app.post('/api/tmdb/sync', async (req, res) => {
-    const { limit = 100 } = req.body;
+    const { limit = 10000 } = req.body;
     
     try {
         let settings;
