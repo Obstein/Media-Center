@@ -1584,27 +1584,74 @@ app.get('/api/downloads/statistics', async (req, res) => {
 });
 
 app.post('/api/downloads/start', async (req, res) => {
-    const { stream_id, stream_type, episodes } = req.body;
+    const { stream_id, stream_type, episodes, playlist_id } = req.body; // DODAJ playlist_id
+    
     if (!stream_id || !stream_type || !episodes || episodes.length === 0) {
         return res.status(400).json({ error: 'Brakujące dane do rozpoczęcia pobierania.' });
     }
+    
     try {
-        await dbRun('BEGIN TRANSACTION');
-        const stmt = db.prepare('INSERT OR IGNORE INTO downloads (stream_id, stream_type, episode_id, filename, status, worker_status) VALUES (?, ?, ?, ?, ?, ?)');
-        for (const episode of episodes) {
-            await stmtRun(stmt, [stream_id, stream_type, episode.id, episode.filename, 'queued', 'queued']);
+        // POBIERZ DANE PLAYLISTY dla prawidłowego URL
+        let playlistData = null;
+        if (playlist_id) {
+            const playlistRows = await dbAll('SELECT * FROM playlists WHERE id = ?', [playlist_id]);
+            playlistData = playlistRows[0];
+        } else {
+            // Fallback - znajdź playlistę dla tego media
+            const mediaRows = await dbAll('SELECT m.*, p.* FROM media m LEFT JOIN playlists p ON m.playlist_id = p.id WHERE m.stream_id = ? AND m.stream_type = ? LIMIT 1', [stream_id, stream_type]);
+            playlistData = mediaRows[0];
         }
+        
+        if (!playlistData) {
+            return res.status(400).json({ error: 'Nie znaleziono playlisty dla tego media.' });
+        }
+        
+        await dbRun('BEGIN TRANSACTION');
+        const stmt = db.prepare(`
+            INSERT OR IGNORE INTO downloads 
+            (stream_id, stream_type, playlist_id, episode_id, filename, status, worker_status, download_url) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `);
+        
+        for (const episode of episodes) {
+            // Wygeneruj prawidłowy URL już tutaj
+            let downloadUrl;
+            if (stream_type === 'movie') {
+                downloadUrl = `${playlistData.server_url}/movie/${playlistData.username}/${playlistData.password}/${stream_id}.mp4`;
+            } else {
+                downloadUrl = `${playlistData.server_url}/series/${playlistData.username}/${playlistData.password}/${episode.id}.mkv`;
+            }
+            
+            await stmtRun(stmt, [
+                stream_id, 
+                stream_type, 
+                playlistData.id || playlist_id,
+                episode.id, 
+                episode.filename, 
+                'queued', 
+                'queued',
+                downloadUrl
+            ]);
+        }
+        
         stmt.finalize();
         await dbRun('COMMIT');
         
         const jobIds = episodes.map(ep => ep.id);
-        const newJobs = await dbAll(`SELECT * FROM downloads WHERE episode_id IN (${jobIds.map(() => '?').join(',')})`, jobIds);
+        const newJobs = await dbAll(`
+            SELECT * FROM downloads 
+            WHERE episode_id IN (${jobIds.map(() => '?').join(',')}) 
+            AND stream_id = ?
+        `, [...jobIds, stream_id]);
+        
         downloadQueue.push(...newJobs);
 
         res.status(202).json({ message: `Dodano ${episodes.length} zadań do kolejki pobierania.` });
+        
         if (!isProcessing) {
             processDownloadQueue();
         }
+        
     } catch (error) {
         console.error("Błąd dodawania do kolejki:", error);
         await dbRun('ROLLBACK');
