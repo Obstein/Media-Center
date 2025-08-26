@@ -1199,7 +1199,7 @@ const SettingsView = () => {
         setMessage('');
         setIsSyncingTmdb(true);
         try {
-            const response = await axios.post('/api/tmdb/sync', { limit: 200 });
+            const response = await axios.post('/api/tmdb/sync', { limit: 20000 });
             setMessage(response.data.message || 'Synchronizacja TMDB zakończona.');
             
             // Odśwież status TMDB
