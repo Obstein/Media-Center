@@ -303,7 +303,6 @@ const PlaylistForm = ({ playlist, onSave, onCancel, isEditing = false }) => {
     );
 };
 
-// W App.js, zaktualizuj komponent PlaylistManager:
 
 const PlaylistManager = () => {
     const [playlists, setPlaylists] = useState([]);
@@ -2247,7 +2246,11 @@ function App() {
   const [route, setRoute] = useState({ path: 'home', params: {} });
   const [favorites, setFavorites] = useState(new Set());
   const [downloads, setDownloads] = useState([]);
-  const [isWidgetOpen, setIsWidgetOpen] = useState(true);
+  const [isWidgetOpen, setIsWidgetOpen] = useState(false);
+  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+  useEffect(() => {
+  setIsMobileMenuOpen(false);
+}, [route.path]);
 
   // Pobieranie ulubionych
   useEffect(() => {
@@ -2375,18 +2378,102 @@ function App() {
   return (
     <div className="min-h-screen flex flex-col font-sans">
       <header className="bg-gray-900/80 backdrop-blur-sm shadow-lg sticky top-0 z-50">
-        <nav className="container mx-auto px-4 sm:px-6 lg:px-8">
-          <div className="flex items-center justify-between h-16">
-            <a href="#/home" className="text-2xl font-bold text-white no-underline"><span className="text-red-500">M</span>ediaCenter</a>
-            <div className="flex items-center space-x-4">
-              <button onClick={() => setIsWidgetOpen(!isWidgetOpen)} className="text-gray-300 hover:text-white">Pobierane</button>
-              <a href="#/home" className="text-gray-300 hover:text-white px-3 py-2 rounded-md text-sm font-medium no-underline">Strona Główna</a>
-              <a href="#/wishlist" className="text-gray-300 hover:text-white px-3 py-2 rounded-md text-sm font-medium no-underline">Wishlist</a>
-              <a href="#/settings" className="text-gray-300 hover:text-white px-3 py-2 rounded-md text-sm font-medium no-underline">Ustawienia</a>
-            </div>
-          </div>
-        </nav>
-      </header>
+  <nav className="container mx-auto px-4 sm:px-6 lg:px-8">
+    <div className="flex items-center justify-between h-16">
+      {/* Logo */}
+      <a href="#/home" className="text-2xl font-bold text-white no-underline">
+        <span className="text-red-500">M</span>ediaCenter
+      </a>
+      
+      {/* Desktop Menu */}
+      <div className="hidden md:flex items-center space-x-4">
+        <button 
+          onClick={() => setIsWidgetOpen(!isWidgetOpen)} 
+          className="text-gray-300 hover:text-white px-3 py-2 rounded-md text-sm font-medium transition-colors duration-200 relative"
+        >
+          Pobierane
+          {downloads.length > 0 && (
+            <span className="absolute -top-1 -right-1 bg-red-500 text-white text-xs rounded-full h-5 w-5 flex items-center justify-center">
+              {downloads.length}
+            </span>
+          )}
+        </button>
+        <a href="#/home" className="text-gray-300 hover:text-white px-3 py-2 rounded-md text-sm font-medium no-underline transition-colors duration-200">
+          Strona Główna
+        </a>
+        <a href="#/wishlist" className="text-gray-300 hover:text-white px-3 py-2 rounded-md text-sm font-medium no-underline transition-colors duration-200">
+          Wishlist
+        </a>
+        <a href="#/settings" className="text-gray-300 hover:text-white px-3 py-2 rounded-md text-sm font-medium no-underline transition-colors duration-200">
+          Ustawienia
+        </a>
+      </div>
+
+      {/* Mobile menu button */}
+      <div className="md:hidden">
+        <button
+          onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
+          className="text-gray-300 hover:text-white focus:outline-none focus:text-white transition-colors duration-200"
+          aria-label="Toggle menu"
+        >
+          <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            {isMobileMenuOpen ? (
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+            ) : (
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
+            )}
+          </svg>
+        </button>
+      </div>
+    </div>
+
+    {/* Mobile Menu */}
+    <div className={`md:hidden transition-all duration-300 ease-in-out ${
+      isMobileMenuOpen ? 'max-h-64 opacity-100' : 'max-h-0 opacity-0 overflow-hidden'
+    }`}>
+      <div className="px-2 pt-2 pb-3 space-y-1 bg-gray-800/90 rounded-lg mt-2">
+        <button 
+          onClick={() => {
+            setIsWidgetOpen(!isWidgetOpen);
+            setIsMobileMenuOpen(false);
+          }} 
+          className="text-gray-300 hover:text-white block px-3 py-2 rounded-md text-base font-medium w-full text-left transition-colors duration-200 relative"
+        >
+          Pobierane
+          {downloads.length > 0 && (
+            <span className="absolute top-2 right-3 bg-red-500 text-white text-xs rounded-full h-5 w-5 flex items-center justify-center">
+              {downloads.length}
+            </span>
+          )}
+        </button>
+        
+        <a 
+          href="#/home" 
+          onClick={() => setIsMobileMenuOpen(false)}
+          className="text-gray-300 hover:text-white block px-3 py-2 rounded-md text-base font-medium no-underline transition-colors duration-200"
+        >
+          🏠 Strona Główna
+        </a>
+        
+        <a 
+          href="#/wishlist" 
+          onClick={() => setIsMobileMenuOpen(false)}
+          className="text-gray-300 hover:text-white block px-3 py-2 rounded-md text-base font-medium no-underline transition-colors duration-200"
+        >
+          ⭐ Wishlist
+        </a>
+        
+        <a 
+          href="#/settings" 
+          onClick={() => setIsMobileMenuOpen(false)}
+          className="text-gray-300 hover:text-white block px-3 py-2 rounded-md text-base font-medium no-underline transition-colors duration-200"
+        >
+          ⚙️ Ustawienia
+        </a>
+      </div>
+    </div>
+  </nav>
+</header>
       <main className="flex-grow container mx-auto p-4 sm:p-6 lg:p-8">
         {renderContent()}
       </main>
