@@ -2043,6 +2043,111 @@ app.get('/api/wishlist/:id/logs', async (req, res) => {
     }
 });
 
+// Endpoint do migracji tabeli wishlist (admin)
+app.post('/api/wishlist/migrate-database', async (req, res) => {
+    try {
+        if (!wishlistManager) {
+            return res.status(500).json({ error: 'Wishlist Manager nie jest zainicjalizowany.' });
+        }
+
+        await wishlistManager.migrateWishlistTable();
+        res.json({ message: 'Migracja tabeli wishlist zakończona pomyślnie.' });
+        
+    } catch (error) {
+        console.error('Błąd migracji wishlist:', error);
+        res.status(500).json({ error: `Błąd migracji: ${error.message}` });
+    }
+});
+
+// Resetuj status pozycji wishlisty (przywróć do 'wanted' aby ponownie sprawdzić)
+app.post('/api/wishlist/:id/reset', async (req, res) => {
+    const { id } = req.params;
+    
+    try {
+        // Sprawdź czy pozycja istnieje
+        const item = await dbAll('SELECT * FROM wishlist WHERE id = ?', [id]);
+        if (item.length === 0) {
+            return res.status(404).json({ error: 'Pozycja wishlisty nie znaleziona.' });
+        }
+
+        // Usuń stare matche
+        await dbRun('DELETE FROM wishlist_matches WHERE wishlist_id = ?', [id]);
+        
+        // Resetuj status na 'wanted'
+        await dbRun(`
+            UPDATE wishlist 
+            SET status = 'wanted', found_at = NULL 
+            WHERE id = ?
+        `, [id]);
+
+        // Dodaj log
+        await dbRun(`
+            INSERT INTO wishlist_logs (wishlist_id, level, message)
+            VALUES (?, ?, ?)
+        `, [id, 'INFO', 'Status zresetowany - pozycja będzie ponownie sprawdzona']);
+
+        res.json({ message: 'Status pozycji został zresetowany.' });
+        
+    } catch (error) {
+        console.error('Błąd resetowania statusu wishlisty:', error);
+        res.status(500).json({ error: 'Nie udało się zresetować statusu.' });
+    }
+});
+
+// Oznacz pozycję jako ukończoną ręcznie
+app.post('/api/wishlist/:id/mark-completed', async (req, res) => {
+    const { id } = req.params;
+    
+    try {
+        const item = await dbAll('SELECT * FROM wishlist WHERE id = ?', [id]);
+        if (item.length === 0) {
+            return res.status(404).json({ error: 'Pozycja wishlisty nie znaleziona.' });
+        }
+
+        await dbRun(`
+            UPDATE wishlist 
+            SET status = 'completed' 
+            WHERE id = ?
+        `, [id]);
+
+        await dbRun(`
+            INSERT INTO wishlist_logs (wishlist_id, level, message)
+            VALUES (?, ?, ?)
+        `, [id, 'INFO', 'Oznaczono jako ukończone ręcznie']);
+
+        res.json({ message: 'Pozycja została oznaczona jako ukończona.' });
+        
+    } catch (error) {
+        console.error('Błąd oznaczania jako ukończone:', error);
+        res.status(500).json({ error: 'Nie udało się oznaczyć jako ukończone.' });
+    }
+});
+
+// Pobierz szczegółowe logi dla pozycji wishlisty
+app.get('/api/wishlist/:id/logs', async (req, res) => {
+    const { id } = req.params;
+    
+    try {
+        const logs = await dbAll(`
+            SELECT 
+                timestamp,
+                level,
+                message,
+                data
+            FROM wishlist_logs 
+            WHERE wishlist_id = ? 
+            ORDER BY timestamp DESC 
+            LIMIT 50
+        `, [id]);
+
+        res.json(logs);
+        
+    } catch (error) {
+        console.error('Błąd pobierania logów wishlisty:', error);
+        res.status(500).json({ error: 'Nie udało się pobrać logów.' });
+    }
+});
+
 app.get('/api/debug/serial-mismatch', async (req, res) => {
     try {
         console.log('🔍 DEBUG: Sprawdzanie błędnego dopasowania seriali...');

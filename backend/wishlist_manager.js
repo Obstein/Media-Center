@@ -12,31 +12,60 @@ class WishlistManager {
 
     async initializeDatabase() {
         try {
-            // Tabela wishlisty
-            await this.dbRun(`
-                CREATE TABLE IF NOT EXISTS wishlist (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    tmdb_id INTEGER NOT NULL,
-                    media_type TEXT NOT NULL CHECK (media_type IN ('movie', 'tv')),
-                    title TEXT NOT NULL,
-                    original_title TEXT,
-                    release_date TEXT,
-                    poster_path TEXT,
-                    overview TEXT,
-                    genres TEXT, -- JSON string z gatunkami
-                    vote_average REAL,
-                    vote_count INTEGER,
-                    status TEXT DEFAULT 'wanted' CHECK (status IN ('wanted', 'found', 'downloading', 'completed', 'requires_selection')),
-                    priority INTEGER DEFAULT 1 CHECK (priority IN (1, 2, 3, 4, 5)), -- 1=najwyższy, 5=najniższy
-                    auto_download BOOLEAN DEFAULT 1,
-                    search_keywords TEXT, -- dodatkowe słowa kluczowe do wyszukiwania
-                    notes TEXT,
-                    added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    found_at DATETIME,
-                    last_check DATETIME,
-                    UNIQUE(tmdb_id, media_type)
-                )
+            // Sprawdź czy tabela wishlist już istnieje
+            const tableExists = await this.dbAll(`
+                SELECT name FROM sqlite_master 
+                WHERE type='table' AND name='wishlist'
             `);
+
+            if (tableExists.length === 0) {
+                // Utwórz nową tabelę z poprawnym constraint
+                await this.dbRun(`
+                    CREATE TABLE wishlist (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        tmdb_id INTEGER NOT NULL,
+                        media_type TEXT NOT NULL CHECK (media_type IN ('movie', 'tv')),
+                        title TEXT NOT NULL,
+                        original_title TEXT,
+                        release_date TEXT,
+                        poster_path TEXT,
+                        overview TEXT,
+                        genres TEXT, -- JSON string z gatunkami
+                        vote_average REAL,
+                        vote_count INTEGER,
+                        status TEXT DEFAULT 'wanted' CHECK (status IN ('wanted', 'found', 'downloading', 'completed', 'requires_selection')),
+                        priority INTEGER DEFAULT 1 CHECK (priority IN (1, 2, 3, 4, 5)), -- 1=najwyższy, 5=najniższy
+                        auto_download BOOLEAN DEFAULT 1,
+                        search_keywords TEXT, -- dodatkowe słowa kluczowe do wyszukiwania
+                        notes TEXT,
+                        added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        found_at DATETIME,
+                        last_check DATETIME,
+                        UNIQUE(tmdb_id, media_type)
+                    )
+                `);
+                console.log('✅ Utworzono nową tabelę wishlist z poprawnym constraint');
+            } else {
+                // Tabela istnieje - sprawdź czy musimy ją zmigrować
+                console.log('🔄 Tabela wishlist już istnieje, sprawdzanie constraint...');
+                
+                // Test czy constraint pozwala na 'requires_selection'
+                try {
+                    await this.dbRun(`
+                        INSERT OR REPLACE INTO wishlist 
+                        (tmdb_id, media_type, title, status, added_at)
+                        VALUES (-1, 'movie', 'TEST_CONSTRAINT', 'requires_selection', ?)
+                    `, [new Date().toISOString()]);
+                    
+                    // Jeśli się udało, usuń test
+                    await this.dbRun('DELETE FROM wishlist WHERE tmdb_id = -1 AND title = ?', ['TEST_CONSTRAINT']);
+                    console.log('✅ Constraint wspiera requires_selection');
+                    
+                } catch (constraintError) {
+                    console.log('⚠️ Constraint nie wspiera requires_selection - wykonywanie migracji...');
+                    await this.migrateWishlistTable();
+                }
+            }
 
             // Tabela logów wishlisty
             await this.dbRun(`
@@ -87,6 +116,56 @@ class WishlistManager {
             console.log('✅ Wishlist Manager: baza danych zainicjalizowana');
         } catch (error) {
             console.error('❌ Wishlist Manager: błąd inicjalizacji bazy:', error);
+        }
+    }
+
+    async migrateWishlistTable() {
+        try {
+            console.log('🔄 Rozpoczynanie migracji tabeli wishlist...');
+            
+            // 1. Utwórz tabelę tymczasową z nowym constraint
+            await this.dbRun(`
+                CREATE TABLE wishlist_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tmdb_id INTEGER NOT NULL,
+                    media_type TEXT NOT NULL CHECK (media_type IN ('movie', 'tv')),
+                    title TEXT NOT NULL,
+                    original_title TEXT,
+                    release_date TEXT,
+                    poster_path TEXT,
+                    overview TEXT,
+                    genres TEXT,
+                    vote_average REAL,
+                    vote_count INTEGER,
+                    status TEXT DEFAULT 'wanted' CHECK (status IN ('wanted', 'found', 'downloading', 'completed', 'requires_selection')),
+                    priority INTEGER DEFAULT 1 CHECK (priority IN (1, 2, 3, 4, 5)),
+                    auto_download BOOLEAN DEFAULT 1,
+                    search_keywords TEXT,
+                    notes TEXT,
+                    added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    found_at DATETIME,
+                    last_check DATETIME,
+                    UNIQUE(tmdb_id, media_type)
+                )
+            `);
+            
+            // 2. Skopiuj dane ze starej tabeli
+            await this.dbRun(`
+                INSERT INTO wishlist_new 
+                SELECT * FROM wishlist
+            `);
+            
+            // 3. Usuń starą tabelę
+            await this.dbRun('DROP TABLE wishlist');
+            
+            // 4. Zmień nazwę nowej tabeli
+            await this.dbRun('ALTER TABLE wishlist_new RENAME TO wishlist');
+            
+            console.log('✅ Migracja tabeli wishlist zakończona pomyślnie');
+            
+        } catch (migrationError) {
+            console.error('❌ Błąd migracji tabeli wishlist:', migrationError);
+            throw migrationError;
         }
     }
 
