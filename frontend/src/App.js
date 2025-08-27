@@ -1392,7 +1392,7 @@ const SettingsView = () => {
     );
 };
 
-const WishlistCard = ({ item, onUpdate, onDelete, onDownload, onViewMatches }) => {
+const WishlistCard = ({ item, onUpdate, onDelete, onDownload, onViewMatches, onMarkCompleted, onReset  }) => {
     const [isExpanded, setIsExpanded] = useState(false);
     const [isEditing, setIsEditing] = useState(false);
     const [editData, setEditData] = useState({
@@ -1548,77 +1548,79 @@ const WishlistCard = ({ item, onUpdate, onDelete, onDownload, onViewMatches }) =
             </div>
 
             <div className="px-4 py-3 bg-gray-900/30 border-t border-gray-700">
-    <div className="flex justify-between items-center">
-        <div className="flex gap-2">
-            {item.match_count > 0 && (
-                <button
-                    onClick={() => onViewMatches(item)}
-                    className={`text-sm hover:underline ${
-                        item.status === 'requires_selection' 
-                            ? 'text-orange-400 hover:text-orange-300 font-medium' 
-                            : 'text-green-400 hover:text-green-300'
-                    }`}
-                >
-                    {item.status === 'requires_selection' 
-                        ? `🤔 Wybierz wersję (${item.match_count})` 
-                        : `🎯 Zobacz matche (${item.match_count})`
-                    }
-                </button>
-            )}
-        </div>
-        
-        <div className="flex gap-2">
-            {/* Przycisk pobierania - różne zachowanie w zależności od statusu */}
-            {item.status === 'found' && item.auto_downloadable_count === 1 && (
-                <button
-                    onClick={() => onDownload(item)}
-                    className="px-3 py-1 bg-green-600 hover:bg-green-700 text-white rounded text-sm"
-                >
-                    ⏬ Auto-pobierz
-                </button>
-            )}
-            
-            {item.status === 'requires_selection' && (
-                <button
-                    onClick={() => onViewMatches(item)}
-                    className="px-3 py-1 bg-orange-600 hover:bg-orange-700 text-white rounded text-sm font-medium"
-                >
-                    🤔 Wybierz wersję
-                </button>
-            )}
+                <div className="flex justify-between items-center">
+                    <div className="flex gap-2">
+                        {item.match_count > 0 && (
+                            <button
+                                onClick={() => onViewMatches(item)}
+                                className={`text-sm hover:underline ${
+                                    item.status === 'requires_selection' 
+                                        ? 'text-orange-400 hover:text-orange-300 font-medium' 
+                                        : 'text-green-400 hover:text-green-300'
+                                }`}
+                            >
+                                {item.status === 'requires_selection' 
+                                    ? `🤔 Wybierz wersję (${item.match_count})` 
+                                    : `🎯 Zobacz matche (${item.match_count})`
+                                }
+                            </button>
+                        )}
+                    </div>
+                    
+                    <div className="flex gap-2">
+                        {/* Przycisk pobierania - różne zachowanie w zależności od statusu */}
+                        {item.status === 'found' && item.auto_downloadable_count === 1 && (
+                            <button
+                                onClick={() => onDownload(item)}
+                                className="px-3 py-1 bg-green-600 hover:bg-green-700 text-white rounded text-sm"
+                            >
+                                ⏬ Auto-pobierz
+                            </button>
+                        )}
+                        
+                        {item.status === 'requires_selection' && (
+                            <button
+                                onClick={() => onViewMatches(item)}
+                                className="px-3 py-1 bg-orange-600 hover:bg-orange-700 text-white rounded text-sm font-medium"
+                            >
+                                🤔 Wybierz wersję
+                            </button>
+                        )}
 
-            {/* Przycisk oznacz jako ukończone */}
-            {(item.status === 'found' || item.status === 'requires_selection') && (
-                <button
-                    onClick={() => onMarkCompleted(item.id)}
-                    className="px-3 py-1 bg-purple-600 hover:bg-purple-700 text-white rounded text-sm"
-                    title="Oznacz jako ukończone (jeśli już masz)"
-                >
-                    ✅ Gotowe
-                </button>
-            )}
+                        {/* Przycisk oznacz jako ukończone */}
+                        {(item.status === 'found' || item.status === 'requires_selection') && (
+                            <button
+                                onClick={() => onMarkCompleted(item.id)}
+                                className="px-3 py-1 bg-purple-600 hover:bg-purple-700 text-white rounded text-sm"
+                                title="Oznacz jako ukończone (jeśli już masz)"
+                            >
+                                ✅ Gotowe
+                            </button>
+                        )}
 
-            {/* Przycisk reset - dla pozycji które wymagają ponownego sprawdzenia */}
-            {(item.status === 'found' || item.status === 'requires_selection' || item.status === 'completed') && (
-                <button
-                    onClick={() => onReset(item.id)}
-                    className="px-3 py-1 bg-gray-600 hover:bg-gray-700 text-white rounded text-sm"
-                    title="Resetuj i sprawdź ponownie"
-                >
-                    🔄 Reset
-                </button>
-            )}
-            
-            <button
-                onClick={() => onDelete(item.id)}
-                className="px-3 py-1 bg-red-600 hover:bg-red-700 text-white rounded text-sm"
-            >
-                🗑️
-            </button>
+                        {/* Przycisk reset - dla pozycji które wymagają ponownego sprawdzenia */}
+                        {(item.status === 'found' || item.status === 'requires_selection' || item.status === 'completed') && (
+                            <button
+                                onClick={() => onReset(item.id)}
+                                className="px-3 py-1 bg-gray-600 hover:bg-gray-700 text-white rounded text-sm"
+                                title="Resetuj i sprawdź ponownie"
+                            >
+                                🔄 Reset
+                            </button>
+                        )}
+                        
+                        <button
+                            onClick={() => onDelete(item.id)}
+                            className="px-3 py-1 bg-red-600 hover:bg-red-700 text-white rounded text-sm"
+                        >
+                            🗑️
+                        </button>
+                    </div>
+                </div>
+            </div>
         </div>
-    </div>
-</div>
-        </div>
+    
+       
     );
 };
 
