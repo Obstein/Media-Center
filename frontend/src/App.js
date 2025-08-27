@@ -2248,9 +2248,7 @@ function App() {
   const [downloads, setDownloads] = useState([]);
   const [isWidgetOpen, setIsWidgetOpen] = useState(false);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
-  useEffect(() => {
-  setIsMobileMenuOpen(false);
-}, [route.path]);
+
 
   // Pobieranie ulubionych
   useEffect(() => {
