@@ -26,7 +26,7 @@ class WishlistManager {
                     genres TEXT, -- JSON string z gatunkami
                     vote_average REAL,
                     vote_count INTEGER,
-                    status TEXT DEFAULT 'wanted' CHECK (status IN ('wanted', 'found', 'downloading', 'completed')),
+                    status TEXT DEFAULT 'wanted' CHECK (status IN ('wanted', 'found', 'downloading', 'completed', 'requires_selection')),
                     priority INTEGER DEFAULT 1 CHECK (priority IN (1, 2, 3, 4, 5)), -- 1=najwyższy, 5=najniższy
                     auto_download BOOLEAN DEFAULT 1,
                     search_keywords TEXT, -- dodatkowe słowa kluczowe do wyszukiwania
@@ -51,7 +51,7 @@ class WishlistManager {
                 )
             `);
 
-            // Tabela znalezionych pozycji
+            // Zaktualizowana tabela znalezionych pozycji z dodatkowymi polami
             await this.dbRun(`
                 CREATE TABLE IF NOT EXISTS wishlist_matches (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,11 +62,27 @@ class WishlistManager {
                     playlist_name TEXT,
                     match_score REAL, -- 0.0 - 1.0, jak dobrze pasuje
                     match_reason TEXT, -- opis dlaczego uznano za match
+                    match_type TEXT DEFAULT 'name' CHECK (match_type IN ('tmdb_id', 'name', 'mixed')), -- typ dopasowania
+                    tmdb_match BOOLEAN DEFAULT 0, -- czy to dokładne dopasowanie TMDB ID
+                    auto_downloadable BOOLEAN DEFAULT 0, -- czy można automatycznie pobrać
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (wishlist_id) REFERENCES wishlist(id),
                     FOREIGN KEY (playlist_id) REFERENCES playlists(id)
                 )
             `);
+
+            // Dodaj nowe kolumny do istniejącej tabeli jeśli nie istnieją
+            try {
+                await this.dbRun('ALTER TABLE wishlist_matches ADD COLUMN match_type TEXT DEFAULT "name"');
+            } catch (e) { /* kolumna już istnieje */ }
+
+            try {
+                await this.dbRun('ALTER TABLE wishlist_matches ADD COLUMN tmdb_match BOOLEAN DEFAULT 0');
+            } catch (e) { /* kolumna już istnieje */ }
+
+            try {
+                await this.dbRun('ALTER TABLE wishlist_matches ADD COLUMN auto_downloadable BOOLEAN DEFAULT 0');
+            } catch (e) { /* kolumna już istnieje */ }
 
             console.log('✅ Wishlist Manager: baza danych zainicjalizowana');
         } catch (error) {
@@ -209,7 +225,8 @@ class WishlistManager {
                 SELECT 
                     w.*,
                     COUNT(wm.id) as match_count,
-                    MAX(wm.created_at) as last_match_date
+                    MAX(wm.created_at) as last_match_date,
+                    SUM(CASE WHEN wm.auto_downloadable = 1 THEN 1 ELSE 0 END) as auto_downloadable_count
                 FROM wishlist w
                 LEFT JOIN wishlist_matches wm ON w.id = wm.wishlist_id
                 ${whereClause}
@@ -229,15 +246,15 @@ class WishlistManager {
         }
     }
 
-    // === WYSZUKIWANIE I DOPASOWYWANIE ===
+    // === NOWA LOGIKA WYSZUKIWANIA I DOPASOWYWANIA ===
 
     async checkWishlistMatches() {
         try {
-            console.log('🔍 Sprawdzanie wishlisty...');
+            console.log('🔍 Sprawdzanie wishlisty z nową logiką...');
             
             const wantedItems = await this.dbAll(`
                 SELECT * FROM wishlist 
-                WHERE status = 'wanted' 
+                WHERE status IN ('wanted', 'requires_selection')
                 ORDER BY priority ASC, added_at ASC
             `);
 
@@ -252,10 +269,10 @@ class WishlistManager {
             
             for (const item of wantedItems) {
                 try {
-                    const matches = await this.findMatches(item);
+                    const matches = await this.findMatchesWithNewLogic(item);
                     
                     if (matches.length > 0) {
-                        await this.handleFoundMatches(item, matches);
+                        await this.handleFoundMatchesWithNewLogic(item, matches);
                         foundCount++;
                     }
 
@@ -287,13 +304,82 @@ class WishlistManager {
         }
     }
 
-    async findMatches(wishlistItem) {
+    async findMatchesWithNewLogic(wishlistItem) {
+        try {
+            const matches = [];
+
+            // 1. PRIORYTET: Wyszukaj po dokładnym TMDB ID
+            const tmdbMatches = await this.findTmdbMatches(wishlistItem);
+            
+            // 2. DODATKOWO: Wyszukaj po nazwie (tylko jeśli nie ma dokładnych TMDB matches)
+            const nameMatches = tmdbMatches.length === 0 ? 
+                await this.findNameMatches(wishlistItem) : [];
+
+            // Połącz wyniki i oznacz typ dopasowania
+            matches.push(...tmdbMatches.map(match => ({ 
+                ...match, 
+                match_type: 'tmdb_id', 
+                tmdb_match: true,
+                auto_downloadable: tmdbMatches.length === 1 // Auto tylko jeśli dokładnie 1 TMDB match
+            })));
+
+            matches.push(...nameMatches.map(match => ({ 
+                ...match, 
+                match_type: 'name', 
+                tmdb_match: false,
+                auto_downloadable: false // Nazwy nigdy nie są auto-downloadable
+            })));
+
+            console.log(`🎯 Znaleziono ${matches.length} matchy dla "${wishlistItem.title}": TMDB=${tmdbMatches.length}, Name=${nameMatches.length}`);
+
+            return matches;
+
+        } catch (error) {
+            console.error('Błąd wyszukiwania matchy:', error);
+            return [];
+        }
+    }
+
+    async findTmdbMatches(wishlistItem) {
+        try {
+            if (!wishlistItem.tmdb_id) {
+                return [];
+            }
+
+            const streamType = wishlistItem.media_type === 'tv' ? 'series' : 'movie';
+            
+            // Wyszukaj w bazie mediów po dokładnym TMDB ID
+            const matches = await this.dbAll(`
+                SELECT 
+                    m.*,
+                    p.name as playlist_name
+                FROM media m
+                LEFT JOIN playlists p ON m.playlist_id = p.id
+                WHERE m.tmdb_id = ? AND m.stream_type = ?
+            `, [wishlistItem.tmdb_id, streamType]);
+
+            console.log(`🔍 TMDB ID ${wishlistItem.tmdb_id}: znaleziono ${matches.length} dokładnych matchy`);
+
+            return matches.map(media => ({
+                ...media,
+                match_score: 1.0, // Maksymalny score dla dokładnego TMDB match
+                match_reason: `Dokładne dopasowanie TMDB ID: ${wishlistItem.tmdb_id}`
+            }));
+
+        } catch (error) {
+            console.error('Błąd wyszukiwania TMDB matchy:', error);
+            return [];
+        }
+    }
+
+    async findNameMatches(wishlistItem) {
         try {
             const searchTerms = this.generateSearchTerms(wishlistItem);
             const matches = [];
+            const streamType = wishlistItem.media_type === 'tv' ? 'series' : 'movie';
 
             for (const term of searchTerms) {
-                // Wyszukaj w bazie mediów
+                // Wyszukaj w bazie mediów po nazwie
                 const mediaMatches = await this.dbAll(`
                     SELECT 
                         m.*,
@@ -306,28 +392,31 @@ class WishlistManager {
                         OR LOWER(m.name) LIKE LOWER(?)
                     )
                     AND m.stream_type = ?
+                    AND (m.tmdb_id IS NULL OR m.tmdb_id != ?)  -- Wyklucz pozycje które już znamy po TMDB
                 `, [
                     `%${term}%`,
                     `%${term.replace(/[^\w\s]/g, '')}%`, // bez znaków specjalnych
                     `%${term.split(' ')[0]}%`, // pierwsze słowo
-                    wishlistItem.media_type === 'tv' ? 'series' : 'movie'
+                    streamType,
+                    wishlistItem.tmdb_id
                 ]);
 
                 for (const media of mediaMatches) {
                     const score = this.calculateMatchScore(wishlistItem, media, term);
                     
-                    if (score > 0.6) { // próg dopasowania
+                    if (score > 0.6) { // próg dopasowania dla nazw
                         // Sprawdź czy już nie mamy tego matcha
-                        const existingMatch = await this.dbAll(`
-                            SELECT id FROM wishlist_matches 
-                            WHERE wishlist_id = ? AND media_stream_id = ? AND media_stream_type = ?
-                        `, [wishlistItem.id, media.stream_id, media.stream_type]);
+                        const existingMatch = matches.find(m => 
+                            m.stream_id === media.stream_id && 
+                            m.stream_type === media.stream_type &&
+                            m.playlist_id === media.playlist_id
+                        );
 
-                        if (existingMatch.length === 0) {
+                        if (!existingMatch) {
                             matches.push({
                                 ...media,
                                 match_score: score,
-                                match_reason: `Dopasowanie nazwy: "${term}" -> "${media.name}"`,
+                                match_reason: `Dopasowanie nazwy: "${term}" -> "${media.name}" (score: ${score.toFixed(2)})`,
                                 search_term: term
                             });
                         }
@@ -336,18 +425,16 @@ class WishlistManager {
             }
 
             // Sortuj według score i usuń duplikaty
-            return matches
+            const uniqueMatches = matches
                 .sort((a, b) => b.match_score - a.match_score)
-                .filter((match, index, self) => 
-                    index === self.findIndex(m => 
-                        m.stream_id === match.stream_id && 
-                        m.stream_type === match.stream_type
-                    )
-                )
-                .slice(0, 5); // max 5 najlepszych matchy
+                .slice(0, 10); // max 10 najlepszych matchy
+
+            console.log(`🔍 NAME SEARCH dla "${wishlistItem.title}": znaleziono ${uniqueMatches.length} matchy po nazwie`);
+
+            return uniqueMatches;
 
         } catch (error) {
-            console.error('Błąd wyszukiwania matchy:', error);
+            console.error('Błąd wyszukiwania matchy po nazwie:', error);
             return [];
         }
     }
@@ -411,11 +498,6 @@ class WishlistManager {
             score += (matchingWords.length / searchWords.length) * 0.6;
         }
 
-        // Bonus za TMDB ID match (jeśli dostępne)
-        if (media.tmdb_id && media.tmdb_id == wishlistItem.tmdb_id) {
-            score += 0.5;
-        }
-
         // Bonus za poprawny rok (jeśli dostępny)
         if (wishlistItem.release_date && media.name.includes(wishlistItem.release_date.substring(0, 4))) {
             score += 0.2;
@@ -424,17 +506,20 @@ class WishlistManager {
         return Math.min(score, 1.0);
     }
 
-    async handleFoundMatches(wishlistItem, matches) {
+    async handleFoundMatchesWithNewLogic(wishlistItem, matches) {
         try {
-            console.log(`🎯 Znaleziono ${matches.length} dopasowań dla: ${wishlistItem.title}`);
+            console.log(`🎯 Obsługa ${matches.length} matchy dla: ${wishlistItem.title}`);
 
-            // Zapisz wszystkie matche
+            // Usuń stare matche dla tej pozycji wishlisty
+            await this.dbRun('DELETE FROM wishlist_matches WHERE wishlist_id = ?', [wishlistItem.id]);
+
+            // Zapisz wszystkie nowe matche
             for (const match of matches) {
                 await this.dbRun(`
                     INSERT INTO wishlist_matches 
                     (wishlist_id, media_stream_id, media_stream_type, playlist_id, 
-                     playlist_name, match_score, match_reason)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                     playlist_name, match_score, match_reason, match_type, tmdb_match, auto_downloadable)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 `, [
                     wishlistItem.id,
                     match.stream_id,
@@ -442,29 +527,63 @@ class WishlistManager {
                     match.playlist_id,
                     match.playlist_name,
                     match.match_score,
-                    match.match_reason
+                    match.match_reason,
+                    match.match_type,
+                    match.tmdb_match ? 1 : 0,
+                    match.auto_downloadable ? 1 : 0
                 ]);
             }
 
-            // Oznacz jako znaleziony
+            // NOWA LOGIKA STATUSU:
+            const autoDownloadableCount = matches.filter(m => m.auto_downloadable).length;
+            const totalMatches = matches.length;
+
+            let newStatus = 'found';
+            let shouldAutoDownload = false;
+
+            if (totalMatches === 0) {
+                // Nie znaleziono nic
+                newStatus = 'wanted';
+            } else if (autoDownloadableCount === 1) {
+                // Dokładnie 1 auto-downloadable match (tylko TMDB exact match)
+                newStatus = 'found';
+                shouldAutoDownload = wishlistItem.auto_download;
+            } else if (totalMatches > 0) {
+                // Znaleziono matche, ale wymagają selekcji
+                newStatus = 'requires_selection';
+                shouldAutoDownload = false;
+            }
+
+            // Aktualizuj status
             await this.dbRun(`
                 UPDATE wishlist 
-                SET status = 'found', found_at = ? 
+                SET status = ?, found_at = ? 
                 WHERE id = ?
-            `, [new Date().toISOString(), wishlistItem.id]);
+            `, [newStatus, new Date().toISOString(), wishlistItem.id]);
 
             // Log
             const bestMatch = matches[0];
             await this.logWishlistAction(
                 wishlistItem.id, 
                 'SUCCESS', 
-                `Znaleziono match: ${bestMatch.name} (score: ${bestMatch.match_score.toFixed(2)})`,
-                JSON.stringify({ matches: matches.length, best_score: bestMatch.match_score })
+                `Status: ${newStatus}, Matche: ${totalMatches} (auto: ${autoDownloadableCount}), Najlepszy: ${bestMatch?.name} (${bestMatch?.match_score?.toFixed(2)})`,
+                JSON.stringify({ 
+                    matches: totalMatches, 
+                    auto_downloadable: autoDownloadableCount,
+                    new_status: newStatus,
+                    will_auto_download: shouldAutoDownload
+                })
             );
 
-            // Auto-download jeśli włączony
-            if (wishlistItem.auto_download) {
-                await this.initiateAutoDownload(wishlistItem, bestMatch);
+            // Auto-download TYLKO jeśli dokładnie 1 auto-downloadable match
+            if (shouldAutoDownload && autoDownloadableCount === 1) {
+                const autoMatch = matches.find(m => m.auto_downloadable);
+                await this.initiateAutoDownload(wishlistItem, autoMatch);
+            } else if (newStatus === 'requires_selection') {
+                console.log(`⚠️ "${wishlistItem.title}" wymaga ręcznej selekcji (${totalMatches} matchy, ${autoDownloadableCount} auto)`);
+                
+                // Wyślij powiadomienie o wymaganiu wyboru
+                await this.sendSelectionRequiredNotification(wishlistItem, matches);
             }
 
         } catch (error) {
@@ -473,9 +592,62 @@ class WishlistManager {
         }
     }
 
+    async sendSelectionRequiredNotification(wishlistItem, matches) {
+        try {
+            const settings = await this.dbAll('SELECT value FROM settings WHERE key = ?', ['discordWebhook']);
+            const webhookUrl = settings[0]?.value;
+            
+            if (webhookUrl) {
+                const topMatches = matches.slice(0, 3);
+                let message = `🤔 **Wybór wymagany dla:** ${wishlistItem.title}\n`;
+                message += `Znaleziono ${matches.length} matchy, wybierz który pobrać:\n\n`;
+                
+                topMatches.forEach((match, idx) => {
+                    const scorePercent = (match.match_score * 100).toFixed(0);
+                    const type = match.match_type === 'tmdb_id' ? '🎯 TMDB' : '📝 Nazwa';
+                    message += `${idx + 1}. **${match.name}** (${match.playlist_name})\n`;
+                    message += `   ${type} | Score: ${scorePercent}%\n\n`;
+                });
+
+                message += `💡 Sprawdź wishlistę w aplikacji aby wybrać właściwą wersję.`;
+
+                await axios.post(webhookUrl, {
+                    content: message,
+                    username: "Media Center Wishlist - Selection Required"
+                });
+            }
+        } catch (error) {
+            console.error('Błąd wysyłania powiadomienia o wyborze:', error);
+        }
+    }
+
+    async sendWishlistNotification(wishlistItem, match) {
+        try {
+            const settings = await this.dbAll('SELECT value FROM settings WHERE key = ?', ['discordWebhook']);
+            const webhookUrl = settings[0]?.value;
+            
+            if (webhookUrl) {
+                const message = `🎯 **Wishlist Auto-Download!**\n` +
+                    `**${wishlistItem.title}** (${wishlistItem.media_type})\n` +
+                    `Znaleziono jako: **${match.name}**\n` +
+                    `Playlista: ${match.playlist_name}\n` +
+                    `Typ: ${match.match_type === 'tmdb_id' ? '🎯 TMDB ID Match' : '📝 Name Match'}\n` +
+                    `Score: ${(match.match_score * 100).toFixed(0)}%\n` +
+                    `✅ Pobieranie rozpoczęte automatycznie`;
+
+                await axios.post(webhookUrl, {
+                    content: message,
+                    username: "Media Center Wishlist - Auto Download"
+                });
+            }
+        } catch (error) {
+            console.error('Błąd wysyłania powiadomienia wishlist:', error);
+        }
+    }
+
     async initiateAutoDownload(wishlistItem, match) {
         try {
-            console.log(`⏬ Rozpoczynanie auto-download dla: ${wishlistItem.title}`);
+            console.log(`⏬ Auto-download: ${wishlistItem.title} -> ${match.name}`);
 
             // Oznacz jako downloading
             await this.dbRun(`
@@ -498,7 +670,7 @@ class WishlistManager {
                 await this.logWishlistAction(
                     wishlistItem.id,
                     'INFO',
-                    `Rozpoczęto pobieranie filmu: ${filename}`
+                    `Auto-download filmu: ${filename} z ${match.playlist_name}`
                 );
 
             } else if (match.stream_type === 'series') {
@@ -522,12 +694,12 @@ class WishlistManager {
                     await this.logWishlistAction(
                         wishlistItem.id,
                         'INFO',
-                        `Rozpoczęto pobieranie serialu: ${episodesToDownload.length} odcinków`
+                        `Auto-download serialu: ${episodesToDownload.length} odcinków z ${match.playlist_name}`
                     );
                 }
             }
 
-            // Wyślij powiadomienie Discord jeśli skonfigurowane
+            // Wyślij powiadomienie Discord o auto-download
             await this.sendWishlistNotification(wishlistItem, match);
 
         } catch (error) {
@@ -545,29 +717,6 @@ class WishlistManager {
                 'ERROR',
                 `Błąd auto-download: ${error.message}`
             );
-        }
-    }
-
-    async sendWishlistNotification(wishlistItem, match) {
-        try {
-            const settings = await this.dbAll('SELECT value FROM settings WHERE key = ?', ['discordWebhook']);
-            const webhookUrl = settings[0]?.value;
-            
-            if (webhookUrl) {
-                const message = `🎯 **Wishlist Match Found!**\n` +
-                    `**${wishlistItem.title}** (${wishlistItem.media_type})\n` +
-                    `Znaleziono jako: **${match.name}**\n` +
-                    `Playlista: ${match.playlist_name}\n` +
-                    `Score: ${(match.match_score * 100).toFixed(0)}%\n` +
-                    `Auto-download: ${wishlistItem.auto_download ? '✅ Tak' : '❌ Nie'}`;
-
-                await axios.post(webhookUrl, {
-                    content: message,
-                    username: "Media Center Wishlist"
-                });
-            }
-        } catch (error) {
-            console.error('Błąd wysyłania powiadomienia wishlist:', error);
         }
     }
 
@@ -610,6 +759,7 @@ class WishlistManager {
                     COUNT(*) as total,
                     SUM(CASE WHEN status = 'wanted' THEN 1 ELSE 0 END) as wanted,
                     SUM(CASE WHEN status = 'found' THEN 1 ELSE 0 END) as found,
+                    SUM(CASE WHEN status = 'requires_selection' THEN 1 ELSE 0 END) as requires_selection,
                     SUM(CASE WHEN status = 'downloading' THEN 1 ELSE 0 END) as downloading,
                     SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
                     SUM(CASE WHEN auto_download = 1 THEN 1 ELSE 0 END) as auto_download_enabled

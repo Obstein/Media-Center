@@ -1416,6 +1416,7 @@ const WishlistCard = ({ item, onUpdate, onDelete, onDownload, onViewMatches }) =
         switch (status) {
             case 'wanted': return '🔍';
             case 'found': return '🎯';
+            case 'requires_selection': return '🤔';
             case 'downloading': return '⏬';
             case 'completed': return '✅';
             default: return '❓';
@@ -1426,9 +1427,21 @@ const WishlistCard = ({ item, onUpdate, onDelete, onDownload, onViewMatches }) =
         switch (status) {
             case 'wanted': return 'bg-blue-900/50 text-blue-300';
             case 'found': return 'bg-green-900/50 text-green-300';
+            case 'requires_selection': return 'bg-orange-900/50 text-orange-300';
             case 'downloading': return 'bg-yellow-900/50 text-yellow-300';
             case 'completed': return 'bg-gray-900/50 text-gray-300';
             default: return 'bg-gray-900/50 text-gray-300';
+        }
+    };
+
+    const getStatusText = (status) => {
+        switch (status) {
+            case 'wanted': return 'Poszukiwane';
+            case 'found': return 'Znalezione';
+            case 'requires_selection': return 'Wymaga wyboru';
+            case 'downloading': return 'Pobieranie';
+            case 'completed': return 'Ukończone';
+            default: return status;
         }
     };
 
@@ -1444,6 +1457,7 @@ const WishlistCard = ({ item, onUpdate, onDelete, onDownload, onViewMatches }) =
     };
 
     return (
+        
         <div className="bg-gray-800 rounded-lg overflow-hidden border border-gray-700">
             <div className="flex p-4">
                 <div className="w-20 h-28 flex-shrink-0 mr-4">
@@ -1472,7 +1486,7 @@ const WishlistCard = ({ item, onUpdate, onDelete, onDownload, onViewMatches }) =
                         
                         <div className="flex items-center gap-2 ml-4">
                             <div className={`px-2 py-1 rounded text-xs font-medium ${getStatusColor(item.status)}`}>
-                                {getStatusIcon(item.status)} {item.status}
+                                {getStatusIcon(item.status)} {getStatusText(item.status)}
                             </div>
                             <div className={`w-3 h-3 rounded-full ${getPriorityColor(item.priority)}`} title={`Priorytet: ${item.priority}`}></div>
                         </div>
@@ -1496,11 +1510,30 @@ const WishlistCard = ({ item, onUpdate, onDelete, onDownload, onViewMatches }) =
                         <div className="flex items-center gap-4 text-xs">
                             <span>Auto-DL: {item.auto_download ? '✅' : '❌'}</span>
                             {item.match_count > 0 && (
-                                <span className="text-green-400">
+                                <span className={`${
+                                    item.status === 'requires_selection' ? 'text-orange-400' : 'text-green-400'
+                                }`}>
                                     {item.match_count} match{item.match_count !== 1 ? 'y' : ''}
+                                    {item.auto_downloadable_count > 0 && (
+                                        <span className="ml-1 text-green-500">
+                                            ({item.auto_downloadable_count} auto)
+                                        </span>
+                                    )}
                                 </span>
                             )}
                         </div>
+
+                        {/* Dodatkowe info dla requires_selection */}
+                        {item.status === 'requires_selection' && (
+                            <div className="mt-2 p-2 bg-orange-900/30 rounded text-xs">
+                                <div className="text-orange-300 font-medium mb-1">
+                                    🤔 Znaleziono wiele wersji - wybierz właściwą:
+                                </div>
+                                <div className="text-orange-200">
+                                    Sprawdź dostępne opcje i wybierz którą wersję chcesz pobrać
+                                </div>
+                            </div>
+                        )}
                     </div>
 
                     {item.genres && item.genres.length > 0 && (
@@ -1516,35 +1549,219 @@ const WishlistCard = ({ item, onUpdate, onDelete, onDownload, onViewMatches }) =
             </div>
 
             <div className="px-4 py-3 bg-gray-900/30 border-t border-gray-700">
-                <div className="flex justify-between items-center">
-                    <div className="flex gap-2">
-                        {item.match_count > 0 && (
-                            <button
-                                onClick={() => onViewMatches(item)}
-                                className="text-green-400 hover:text-green-300 text-sm"
-                            >
-                                🎯 Zobacz matche ({item.match_count})
-                            </button>
-                        )}
+    <div className="flex justify-between items-center">
+        <div className="flex gap-2">
+            {item.match_count > 0 && (
+                <button
+                    onClick={() => onViewMatches(item)}
+                    className={`text-sm hover:underline ${
+                        item.status === 'requires_selection' 
+                            ? 'text-orange-400 hover:text-orange-300 font-medium' 
+                            : 'text-green-400 hover:text-green-300'
+                    }`}
+                >
+                    {item.status === 'requires_selection' 
+                        ? `🤔 Wybierz wersję (${item.match_count})` 
+                        : `🎯 Zobacz matche (${item.match_count})`
+                    }
+                </button>
+            )}
+        </div>
+        
+        <div className="flex gap-2">
+            {/* Przycisk pobierania - różne zachowanie w zależności od statusu */}
+            {item.status === 'found' && item.auto_downloadable_count === 1 && (
+                <button
+                    onClick={() => onDownload(item)}
+                    className="px-3 py-1 bg-green-600 hover:bg-green-700 text-white rounded text-sm"
+                >
+                    ⏬ Auto-pobierz
+                </button>
+            )}
+            
+            {item.status === 'requires_selection' && (
+                <button
+                    onClick={() => onViewMatches(item)}
+                    className="px-3 py-1 bg-orange-600 hover:bg-orange-700 text-white rounded text-sm font-medium"
+                >
+                    🤔 Wybierz wersję
+                </button>
+            )}
+
+            {/* Przycisk oznacz jako ukończone */}
+            {(item.status === 'found' || item.status === 'requires_selection') && (
+                <button
+                    onClick={() => onMarkCompleted(item.id)}
+                    className="px-3 py-1 bg-purple-600 hover:bg-purple-700 text-white rounded text-sm"
+                    title="Oznacz jako ukończone (jeśli już masz)"
+                >
+                    ✅ Gotowe
+                </button>
+            )}
+
+            {/* Przycisk reset - dla pozycji które wymagają ponownego sprawdzenia */}
+            {(item.status === 'found' || item.status === 'requires_selection' || item.status === 'completed') && (
+                <button
+                    onClick={() => onReset(item.id)}
+                    className="px-3 py-1 bg-gray-600 hover:bg-gray-700 text-white rounded text-sm"
+                    title="Resetuj i sprawdź ponownie"
+                >
+                    🔄 Reset
+                </button>
+            )}
+            
+            <button
+                onClick={() => onDelete(item.id)}
+                className="px-3 py-1 bg-red-600 hover:bg-red-700 text-white rounded text-sm"
+            >
+                🗑️
+            </button>
+        </div>
+    </div>
+</div>
+        </div>
+    );
+};
+
+// Zaktualizowany WishlistMatchesModal z lepszą wizualizacją typów matchy
+
+const WishlistMatchesModal = ({ item, matches, onClose, onDownload }) => {
+    if (!item || !matches) return null;
+
+    const groupedMatches = matches.reduce((groups, match) => {
+        const type = match.match_type || 'name';
+        if (!groups[type]) groups[type] = [];
+        groups[type].push(match);
+        return groups;
+    }, {});
+
+    const getMatchTypeInfo = (type) => {
+        switch (type) {
+            case 'tmdb_id':
+                return {
+                    icon: '🎯',
+                    label: 'Dokładne dopasowanie TMDB ID',
+                    color: 'bg-green-900/50 border-green-700',
+                    description: 'To samo TMDB ID - najwyższa pewność dopasowania'
+                };
+            case 'name':
+                return {
+                    icon: '📝',
+                    label: 'Dopasowanie po nazwie',
+                    color: 'bg-blue-900/50 border-blue-700',
+                    description: 'Dopasowanie na podstawie podobieństwa nazw'
+                };
+            default:
+                return {
+                    icon: '❓',
+                    label: 'Inne',
+                    color: 'bg-gray-900/50 border-gray-700',
+                    description: 'Inne kryteria dopasowania'
+                };
+        }
+    };
+
+    return (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+            <div className="bg-gray-800 rounded-lg p-6 max-w-4xl w-full mx-4 max-h-[80vh] overflow-y-auto">
+                <div className="flex justify-between items-center mb-4">
+                    <h3 className="text-xl font-bold text-white">
+                        Dostępne wersje dla: {item.title}
+                    </h3>
+                    <button
+                        onClick={onClose}
+                        className="text-gray-400 hover:text-white text-2xl"
+                    >
+                        ×
+                    </button>
+                </div>
+
+                {/* Info o statusie */}
+                {item.status === 'requires_selection' && (
+                    <div className="mb-4 p-3 bg-orange-900/30 border border-orange-700 rounded">
+                        <div className="text-orange-300 font-medium mb-1">
+                            🤔 Wybór wymagany
+                        </div>
+                        <div className="text-orange-200 text-sm">
+                            Znaleziono wiele wersji. Wybierz którą chcesz pobrać klikając przycisk "Pobierz".
+                        </div>
                     </div>
-                    
-                    <div className="flex gap-2">
-                        {item.status === 'found' && (
-                            <button
-                                onClick={() => onDownload(item)}
-                                className="px-3 py-1 bg-green-600 hover:bg-green-700 text-white rounded text-sm"
-                            >
-                                ⏬ Pobierz
-                            </button>
-                        )}
+                )}
+
+                {/* Wyświetl grupy matchy według typu */}
+                <div className="space-y-4">
+                    {Object.entries(groupedMatches).map(([type, typeMatches]) => {
+                        const typeInfo = getMatchTypeInfo(type);
                         
-                        <button
-                            onClick={() => onDelete(item.id)}
-                            className="px-3 py-1 bg-red-600 hover:bg-red-700 text-white rounded text-sm"
-                        >
-                            🗑️
-                        </button>
-                    </div>
+                        return (
+                            <div key={type} className={`border rounded-lg p-4 ${typeInfo.color}`}>
+                                <div className="flex items-center justify-between mb-3">
+                                    <h4 className="font-semibold text-white flex items-center gap-2">
+                                        {typeInfo.icon} {typeInfo.label}
+                                        <span className="text-sm font-normal text-gray-400">
+                                            ({typeMatches.length} {typeMatches.length === 1 ? 'wynik' : 'wyniki'})
+                                        </span>
+                                    </h4>
+                                    {type === 'tmdb_id' && (
+                                        <span className="text-xs bg-green-800 text-green-200 px-2 py-1 rounded">
+                                            Najwyższa pewność
+                                        </span>
+                                    )}
+                                </div>
+                                
+                                <p className="text-sm text-gray-300 mb-3">{typeInfo.description}</p>
+                                
+                                <div className="space-y-2">
+                                    {typeMatches.map((match) => (
+                                        <div key={match.id} className="bg-gray-700/50 p-3 rounded">
+                                            <div className="flex justify-between items-start">
+                                                <div className="flex-1">
+                                                    <h5 className="font-medium text-white">
+                                                        {match.media_name}
+                                                    </h5>
+                                                    <div className="text-sm text-gray-400 mt-1 space-y-1">
+                                                        <div>
+                                                            <span className="font-medium">Playlista:</span> {match.playlist_name}
+                                                        </div>
+                                                        <div>
+                                                            <span className="font-medium">Dopasowanie:</span> {(match.match_score * 100).toFixed(0)}%
+                                                        </div>
+                                                        {match.auto_downloadable && (
+                                                            <div className="text-green-400 text-xs">
+                                                                ✅ Może być automatycznie pobrane
+                                                            </div>
+                                                        )}
+                                                        {match.match_reason && (
+                                                            <div className="text-gray-500 text-xs">
+                                                                {match.match_reason}
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                </div>
+                                                <div className="ml-4">
+                                                    <button
+                                                        onClick={() => onDownload(item.id, match.id)}
+                                                        className="px-3 py-1 bg-green-600 hover:bg-green-700 text-white rounded text-sm"
+                                                    >
+                                                        ⏬ Pobierz
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        );
+                    })}
+                </div>
+
+                <div className="mt-6 text-center">
+                    <button
+                        onClick={onClose}
+                        className="px-4 py-2 bg-gray-600 hover:bg-gray-700 text-white rounded"
+                    >
+                        Zamknij
+                    </button>
                 </div>
             </div>
         </div>
@@ -1625,64 +1842,6 @@ const TMDBSearchResult = ({ item, onAdd, inWishlist = false }) => {
     );
 };
 
-const WishlistMatchesModal = ({ item, matches, onClose, onDownload }) => {
-    if (!item || !matches) return null;
-
-    return (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-            <div className="bg-gray-800 rounded-lg p-6 max-w-4xl w-full mx-4 max-h-[80vh] overflow-y-auto">
-                <div className="flex justify-between items-center mb-4">
-                    <h3 className="text-xl font-bold text-white">
-                        Znalezione matche dla: {item.title}
-                    </h3>
-                    <button
-                        onClick={onClose}
-                        className="text-gray-400 hover:text-white text-2xl"
-                    >
-                        ×
-                    </button>
-                </div>
-
-                <div className="space-y-3">
-                    {matches.map((match) => (
-                        <div key={match.id} className="bg-gray-700 p-4 rounded-lg">
-                            <div className="flex justify-between items-start">
-                                <div className="flex-1">
-                                    <h4 className="font-semibold text-white">
-                                        {match.media_name}
-                                    </h4>
-                                    <div className="text-sm text-gray-400 mt-1">
-                                        <span>Playlista: {match.playlist_name}</span>
-                                        <span className="ml-4">
-                                            Score: {(match.match_score * 100).toFixed(0)}%
-                                        </span>
-                                    </div>
-                                </div>
-                                <div className="ml-4">
-                                    <button
-                                        onClick={() => onDownload(item.id, match.id)}
-                                        className="px-3 py-1 bg-green-600 hover:bg-green-700 text-white rounded text-sm"
-                                    >
-                                        ⏬ Pobierz
-                                    </button>
-                                </div>
-                            </div>
-                        </div>
-                    ))}
-                </div>
-
-                <div className="mt-6 text-center">
-                    <button
-                        onClick={onClose}
-                        className="px-4 py-2 bg-gray-600 hover:bg-gray-700 text-white rounded"
-                    >
-                        Zamknij
-                    </button>
-                </div>
-            </div>
-        </div>
-    );
-};
 
 const WishlistView = () => {
     const [wishlist, setWishlist] = useState([]);
@@ -1769,6 +1928,38 @@ const WishlistView = () => {
         } catch (error) {
             console.error('Błąd dodawania do wishlisty:', error);
             setMessage(error.response?.data?.error || 'Błąd dodawania do wishlisty.');
+        }
+    };
+
+    const handleResetWishlistItem = async (id) => {
+        if (!window.confirm('Czy na pewno chcesz zresetować status tej pozycji? Będzie ponownie sprawdzona.')) {
+            return;
+        }
+
+        try {
+            await axios.post(`/api/wishlist/${id}/reset`);
+            setMessage('Pozycja została zresetowana i będzie ponownie sprawdzona.');
+            setTimeout(() => setMessage(''), 3000);
+            fetchData();
+        } catch (error) {
+            console.error('Błąd resetowania pozycji:', error);
+            setMessage('Błąd resetowania pozycji.');
+        }
+    };
+
+    const handleMarkCompleted = async (id) => {
+        if (!window.confirm('Czy na pewno chcesz oznaczyć tę pozycję jako ukończoną?')) {
+            return;
+        }
+
+        try {
+            await axios.post(`/api/wishlist/${id}/mark-completed`);
+            setMessage('Pozycja została oznaczona jako ukończona.');
+            setTimeout(() => setMessage(''), 3000);
+            fetchData();
+        } catch (error) {
+            console.error('Błąd oznaczania jako ukończone:', error);
+            setMessage('Błąd oznaczania jako ukończone.');
         }
     };
 
@@ -1868,36 +2059,64 @@ const WishlistView = () => {
     return (
         <div className="space-y-6">
             {stats && (
-                <div className="bg-gray-800 rounded-lg p-6">
-                    <h3 className="text-lg font-semibold text-white mb-4">Statystyki Wishlisty</h3>
-                    <div className="grid grid-cols-2 md:grid-cols-6 gap-4 text-center">
-                        <div className="bg-blue-900/50 p-4 rounded">
-                            <div className="text-2xl font-bold text-blue-300">{stats.statistics.total || 0}</div>
-                            <div className="text-gray-400">Łącznie</div>
+    <div className="bg-gray-800 rounded-lg p-6">
+        <h3 className="text-lg font-semibold text-white mb-4">Statystyki Wishlisty</h3>
+        <div className="grid grid-cols-2 md:grid-cols-7 gap-4 text-center">
+            <div className="bg-blue-900/50 p-4 rounded">
+                <div className="text-2xl font-bold text-blue-300">{stats.statistics.total || 0}</div>
+                <div className="text-gray-400">Łącznie</div>
+            </div>
+            <div className="bg-yellow-900/50 p-4 rounded">
+                <div className="text-2xl font-bold text-yellow-300">{stats.statistics.wanted || 0}</div>
+                <div className="text-gray-400">Poszukiwane</div>
+            </div>
+            <div className="bg-green-900/50 p-4 rounded">
+                <div className="text-2xl font-bold text-green-300">{stats.statistics.found || 0}</div>
+                <div className="text-gray-400">Znalezione</div>
+            </div>
+            <div className="bg-orange-900/50 p-4 rounded">
+                <div className="text-2xl font-bold text-orange-300">{stats.statistics.requires_selection || 0}</div>
+                <div className="text-gray-400 text-xs">Wymaga wyboru</div>
+            </div>
+            <div className="bg-purple-900/50 p-4 rounded">
+                <div className="text-2xl font-bold text-purple-300">{stats.statistics.downloading || 0}</div>
+                <div className="text-gray-400">Pobierane</div>
+            </div>
+            <div className="bg-gray-900/50 p-4 rounded">
+                <div className="text-2xl font-bold text-gray-300">{stats.statistics.completed || 0}</div>
+                <div className="text-gray-400">Ukończone</div>
+            </div>
+            <div className="bg-red-900/50 p-4 rounded">
+                <div className="text-2xl font-bold text-red-300">{stats.statistics.auto_download_enabled || 0}</div>
+                <div className="text-gray-400">Auto-DL</div>
+            </div>
+        </div>
+
+        {/* Dodatkowe informacje o statusach */}
+        {(stats.statistics.requires_selection > 0 || stats.statistics.found > 0) && (
+            <div className="mt-4 p-3 bg-gray-900/50 rounded">
+                <div className="text-sm text-gray-300 space-y-1">
+                    {stats.statistics.requires_selection > 0 && (
+                        <div className="flex items-center gap-2">
+                            <span className="text-orange-400">🤔</span>
+                            <span>
+                                <strong>{stats.statistics.requires_selection}</strong> pozycji wymaga ręcznego wyboru wersji
+                            </span>
                         </div>
-                        <div className="bg-yellow-900/50 p-4 rounded">
-                            <div className="text-2xl font-bold text-yellow-300">{stats.statistics.wanted || 0}</div>
-                            <div className="text-gray-400">Poszukiwane</div>
+                    )}
+                    {stats.statistics.found > 0 && (
+                        <div className="flex items-center gap-2">
+                            <span className="text-green-400">🎯</span>
+                            <span>
+                                <strong>{stats.statistics.found}</strong> pozycji gotowych do automatycznego pobierania
+                            </span>
                         </div>
-                        <div className="bg-green-900/50 p-4 rounded">
-                            <div className="text-2xl font-bold text-green-300">{stats.statistics.found || 0}</div>
-                            <div className="text-gray-400">Znalezione</div>
-                        </div>
-                        <div className="bg-purple-900/50 p-4 rounded">
-                            <div className="text-2xl font-bold text-purple-300">{stats.statistics.downloading || 0}</div>
-                            <div className="text-gray-400">Pobierane</div>
-                        </div>
-                        <div className="bg-gray-900/50 p-4 rounded">
-                            <div className="text-2xl font-bold text-gray-300">{stats.statistics.completed || 0}</div>
-                            <div className="text-gray-400">Ukończone</div>
-                        </div>
-                        <div className="bg-red-900/50 p-4 rounded">
-                            <div className="text-2xl font-bold text-red-300">{stats.statistics.auto_download_enabled || 0}</div>
-                            <div className="text-gray-400">Auto-DL</div>
-                        </div>
-                    </div>
+                    )}
                 </div>
-            )}
+            </div>
+        )}
+    </div>
+)}
 
             {message && (
                 <div className={`p-4 rounded-lg ${
