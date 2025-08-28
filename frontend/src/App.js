@@ -661,11 +661,14 @@ const MediaCard = ({ item, isFavorite, onToggleFavorite }) => (
     );
 };
 */
-// Zaktualizowany komponent DownloadWidget w App.js
-
+// Zaktualizowany komponent DownloadWidget
 const DownloadWidget = ({ downloads, onRemove, onClose, isOpen }) => {
     const [statistics, setStatistics] = useState(null);
     const [daemonStatus, setDaemonStatus] = useState(null);
+    const [activeTab, setActiveTab] = useState('active'); // 'active' lub 'archive'
+    const [archive, setArchive] = useState([]);
+    const [archiveLoading, setArchiveLoading] = useState(false);
+    const [archivePagination, setArchivePagination] = useState({ currentPage: 1, totalPages: 1 });
 
     // Pobierz statystyki i status daemon
     useEffect(() => {
@@ -689,10 +692,48 @@ const DownloadWidget = ({ downloads, onRemove, onClose, isOpen }) => {
         }
     }, [isOpen]);
 
+    // Pobierz archiwum gdy przełączamy na zakładkę archiwum
+    useEffect(() => {
+        if (isOpen && activeTab === 'archive') {
+            fetchArchive(1);
+        }
+    }, [isOpen, activeTab]);
+
+    const fetchArchive = async (page = 1) => {
+        setArchiveLoading(true);
+        try {
+            const response = await axios.get('/api/downloads/archive', {
+                params: { page, limit: 20 }
+            });
+            setArchive(response.data.downloads);
+            setArchivePagination(response.data.pagination);
+        } catch (error) {
+            console.error('Błąd pobierania archiwum:', error);
+        } finally {
+            setArchiveLoading(false);
+        }
+    };
+
+    const handleDeleteFromArchive = async (id, filename) => {
+        if (!window.confirm(`Czy na pewno chcesz trwale usunąć "${filename}" z archiwum?\n\nTo pozwoli systemowi pobrać ten plik ponownie w przyszłości.`)) {
+            return;
+        }
+
+        try {
+            await axios.delete(`/api/downloads/archive/${id}`);
+            // Odśwież archiwum
+            fetchArchive(archivePagination.currentPage);
+            // Odśwież statystyki
+            const statsResponse = await axios.get('/api/downloads/statistics');
+            setStatistics(statsResponse.data);
+        } catch (error) {
+            console.error('Błąd usuwania z archiwum:', error);
+        }
+    };
+
     const handleStartDaemon = async () => {
         try {
             await axios.post('/api/downloads/start-daemon');
-            // Odśwież status po chwili
             setTimeout(async () => {
                 const response = await axios.get('/api/downloads/daemon-status');
                 setDaemonStatus(response.data);
@@ -705,7 +746,6 @@ const DownloadWidget = ({ downloads, onRemove, onClose, isOpen }) => {
     const handleStopDaemon = async () => {
         try {
             await axios.post('/api/downloads/stop-daemon');
-            // Odśwież status po chwili
             setTimeout(async () => {
                 const response = await axios.get('/api/downloads/daemon-status');
                 setDaemonStatus(response.data);
@@ -732,16 +772,56 @@ const DownloadWidget = ({ downloads, onRemove, onClose, isOpen }) => {
         return status;
     };
 
+    const getRemoveButtonInfo = (workerStatus) => {
+        if (workerStatus === 'completed') {
+            return {
+                text: '📦',
+                title: 'Archiwizuj (ukryj z widoku)',
+                className: 'text-blue-400 hover:text-blue-300'
+            };
+        } else {
+            return {
+                text: '×',
+                title: 'Usuń z listy',
+                className: 'text-gray-500 hover:text-white'
+            };
+        }
+    };
+
     return (
-        <div className="fixed bottom-4 right-4 w-96 bg-gray-800 rounded-lg shadow-2xl border border-gray-700 z-50 max-h-96 overflow-hidden">
-            <div className="p-4">
+        <div className="fixed bottom-4 right-4 w-96 bg-gray-800 rounded-lg shadow-2xl border border-gray-700 z-50 max-h-[80vh] overflow-hidden flex flex-col">
+            <div className="p-4 flex-shrink-0">
                 <div className="flex justify-between items-center mb-3">
                     <h4 className="font-bold text-lg text-white">Download Manager</h4>
                     <button onClick={onClose} className="text-gray-400 hover:text-white text-xl">&times;</button>
                 </div>
 
-                {/* Status Daemon */}
-                {daemonStatus && (
+                {/* Zakładki */}
+                <div className="flex bg-gray-900 rounded-lg p-1 mb-3">
+                    <button
+                        onClick={() => setActiveTab('active')}
+                        className={`flex-1 py-2 px-3 rounded-md text-sm font-medium transition-colors ${
+                            activeTab === 'active'
+                                ? 'bg-gray-700 text-white'
+                                : 'text-gray-400 hover:text-gray-300'
+                        }`}
+                    >
+                        Aktywne ({downloads.length})
+                    </button>
+                    <button
+                        onClick={() => setActiveTab('archive')}
+                        className={`flex-1 py-2 px-3 rounded-md text-sm font-medium transition-colors ${
+                            activeTab === 'archive'
+                                ? 'bg-gray-700 text-white'
+                                : 'text-gray-400 hover:text-gray-300'
+                        }`}
+                    >
+                        Archiwum ({statistics?.statistics?.archived || 0})
+                    </button>
+                </div>
+
+                {/* Status Daemon - tylko dla aktywnych */}
+                {activeTab === 'active' && daemonStatus && (
                     <div className="mb-3 p-2 bg-gray-700 rounded">
                         <div className="flex justify-between items-center">
                             <span className="text-sm text-gray-300">
@@ -771,103 +851,176 @@ const DownloadWidget = ({ downloads, onRemove, onClose, isOpen }) => {
                     </div>
                 )}
 
-                {/* Statystyki */}
-                {statistics && (
-                    <div className="mb-3 grid grid-cols-4 gap-2 text-xs">
-                        <div className="bg-blue-900/50 p-2 rounded text-center">
-                            <div className="text-blue-300 font-semibold">{statistics.statistics.queued}</div>
-                            <div className="text-gray-400">Kolejka</div>
-                        </div>
-                        <div className="bg-yellow-900/50 p-2 rounded text-center">
-                            <div className="text-yellow-300 font-semibold">{statistics.statistics.downloading}</div>
-                            <div className="text-gray-400">Pobiera</div>
-                        </div>
-                        <div className="bg-green-900/50 p-2 rounded text-center">
-                            <div className="text-green-300 font-semibold">{statistics.statistics.completed}</div>
-                            <div className="text-gray-400">Gotowe</div>
-                        </div>
-                        <div className="bg-red-900/50 p-2 rounded text-center">
-                            <div className="text-red-300 font-semibold">{statistics.statistics.failed}</div>
-                            <div className="text-gray-400">Błędy</div>
+                {/* Statystyki - tylko dla aktywnych */}
+                {activeTab === 'active' && statistics && (
+                    <div className="mb-3">
+                        <div className="grid grid-cols-4 gap-2 text-xs mb-2">
+                            <div className="bg-blue-900/50 p-2 rounded text-center">
+                                <div className="text-blue-300 font-semibold">{statistics.statistics.queued}</div>
+                                <div className="text-gray-400">Kolejka</div>
+                            </div>
+                            <div className="bg-yellow-900/50 p-2 rounded text-center">
+                                <div className="text-yellow-300 font-semibold">{statistics.statistics.downloading}</div>
+                                <div className="text-gray-400">Pobiera</div>
+                            </div>
+                            <div className="bg-green-900/50 p-2 rounded text-center">
+                                <div className="text-green-300 font-semibold">{statistics.statistics.completed}</div>
+                                <div className="text-gray-400">Gotowe</div>
+                            </div>
+                            <div className="bg-red-900/50 p-2 rounded text-center">
+                                <div className="text-red-300 font-semibold">{statistics.statistics.failed}</div>
+                                <div className="text-gray-400">Błędy</div>
+                            </div>
                         </div>
                     </div>
                 )}
+            </div>
 
-                {/* Lista aktywnych pobierań */}
-                <div className="max-h-64 overflow-y-auto">
-                    {downloads.length === 0 ? (
-                        <p className="text-gray-400 text-sm text-center py-4">Brak aktywnych pobierań</p>
-                    ) : (
-                        <ul className="space-y-2 text-sm">
-                            {downloads.slice(0, 10).map(d => (
-                                <li key={d.id} className="bg-gray-700 p-2 rounded">
-                                    <div className="flex justify-between items-center mb-1">
-                                        <span className="truncate text-gray-300 flex-1">
-                                            {getStatusIcon(d.status, d.worker_status)} {d.filename}
-                                        </span>
-                                        <div className="flex items-center gap-2 ml-2">
-                                            <span className={`text-xs font-semibold ${
-                                                d.worker_status === 'failed' ? 'text-red-400' : 
-                                                d.worker_status === 'completed' ? 'text-green-400' :
-                                                d.worker_status === 'downloading' ? 'text-blue-400' :
-                                                'text-gray-400'
-                                            }`}>
-                                                {getStatusText(d.status, d.worker_status)}
-                                            </span>
-                                            <button 
-                                                onClick={() => onRemove(d.id)} 
-                                                className="text-gray-500 hover:text-white text-lg"
-                                                title="Usuń z listy"
-                                            >
-                                                &times;
-                                            </button>
-                                        </div>
-                                    </div>
+            {/* Zawartość - scrollowalna */}
+            <div className="flex-1 overflow-hidden">
+                {activeTab === 'active' ? (
+                    /* Lista aktywnych pobierań */
+                    <div className="px-4 pb-4 h-full overflow-y-auto">
+                        {downloads.length === 0 ? (
+                            <p className="text-gray-400 text-sm text-center py-4">Brak aktywnych pobierań</p>
+                        ) : (
+                            <ul className="space-y-2 text-sm">
+                                {downloads.slice(0, 10).map(d => {
+                                    const removeButtonInfo = getRemoveButtonInfo(d.worker_status);
                                     
-                                    {/* Progress bar dla pobierania */}
-                                    {d.worker_status === 'downloading' && (
-                                        <div className="w-full bg-gray-600 rounded-full h-1.5 animate-pulse">
-                                            <div className="bg-blue-500 h-1.5 rounded-full" style={{width: `${d.progress || 30}%`}}></div>
-                                        </div>
-                                    )}
-                                    
-                                    {/* Błąd */}
-                                    {d.error_message && (
-                                        <div className="text-red-400 text-xs mt-1 truncate" title={d.error_message}>
-                                            {d.error_message}
-                                        </div>
-                                    )}
-                                    
-                                    {/* URL (do debugowania) */}
-                                    {d.download_url && (
-                                        <div className="text-gray-500 text-xs mt-1 truncate" title={d.download_url}>
-                                            {new URL(d.download_url).hostname}
-                                        </div>
-                                    )}
-                                </li>
-                            ))}
-                        </ul>
-                    )}
-                </div>
+                                    return (
+                                        <li key={d.id} className="bg-gray-700/50 p-2 rounded">
+                                            <div className="flex justify-between items-center mb-1">
+                                                <span className="truncate text-gray-300 flex-1">
+                                                    {getStatusIcon(d.status, d.worker_status)} {d.filename}
+                                                </span>
+                                                <div className="flex items-center gap-2 ml-2">
+                                                    <span className={`text-xs font-semibold ${
+                                                        d.worker_status === 'failed' ? 'text-red-400' : 
+                                                        d.worker_status === 'completed' ? 'text-green-400' :
+                                                        d.worker_status === 'downloading' ? 'text-blue-400' :
+                                                        'text-gray-400'
+                                                    }`}>
+                                                        {getStatusText(d.status, d.worker_status)}
+                                                    </span>
+                                                    <button 
+                                                        onClick={() => onRemove(d.id)} 
+                                                        className={`text-lg ${removeButtonInfo.className}`}
+                                                        title={removeButtonInfo.title}
+                                                    >
+                                                        {removeButtonInfo.text}
+                                                    </button>
+                                                </div>
+                                            </div>
+                                            
+                                            {d.worker_status === 'downloading' && (
+                                                <div className="w-full bg-gray-600 rounded-full h-1.5 animate-pulse">
+                                                    <div className="bg-blue-500 h-1.5 rounded-full" style={{width: `${d.progress || 30}%`}}></div>
+                                                </div>
+                                            )}
+                                            
+                                            {d.error_message && (
+                                                <div className="text-red-400 text-xs mt-1 truncate" title={d.error_message}>
+                                                    {d.error_message}
+                                                </div>
+                                            )}
+                                            
+                                            {d.download_url && (
+                                                <div className="text-gray-500 text-xs mt-1 truncate" title={d.download_url}>
+                                                    {new URL(d.download_url).hostname}
+                                                </div>
+                                            )}
+                                        </li>
+                                    );
+                                })}
+                            </ul>
+                        )}
 
-                {/* Ostatnia aktywność */}
-                {statistics?.recent_activity && statistics.recent_activity.length > 0 && (
-                    <div className="mt-3 pt-3 border-t border-gray-600">
-                        <h5 className="text-xs font-semibold text-gray-400 mb-2">Ostatnia aktywność</h5>
-                        <div className="max-h-20 overflow-y-auto text-xs space-y-1">
-                            {statistics.recent_activity.slice(0, 5).map((log, idx) => (
-                                <div key={idx} className="text-gray-500">
-                                    <span className={`
-                                        ${log.level === 'ERROR' ? 'text-red-400' : 
-                                          log.level === 'SUCCESS' ? 'text-green-400' : 
-                                          log.level === 'WARNING' ? 'text-yellow-400' : 
-                                          'text-gray-400'}
-                                    `}>
-                                        {log.level}
-                                    </span>: {log.message.substring(0, 50)}...
+                        {/* Ostatnia aktywność */}
+                        {statistics?.recent_activity && statistics.recent_activity.length > 0 && (
+                            <div className="mt-3 pt-3 border-t border-gray-600">
+                                <h5 className="text-xs font-semibold text-gray-400 mb-2">Ostatnia aktywność</h5>
+                                <div className="max-h-20 overflow-y-auto text-xs space-y-1">
+                                    {statistics.recent_activity.slice(0, 5).map((log, idx) => (
+                                        <div key={idx} className="text-gray-500">
+                                            <span className={`
+                                                ${log.level === 'ERROR' ? 'text-red-400' : 
+                                                  log.level === 'SUCCESS' ? 'text-green-400' : 
+                                                  log.level === 'WARNING' ? 'text-yellow-400' : 
+                                                  'text-gray-400'}
+                                            `}>
+                                                {log.level}
+                                            </span>: {log.message.substring(0, 50)}...
+                                        </div>
+                                    ))}
                                 </div>
-                            ))}
+                            </div>
+                        )}
+                    </div>
+                ) : (
+                    /* Archiwum */
+                    <div className="px-4 pb-4 h-full overflow-y-auto">
+                        <div className="mb-3 text-sm text-gray-400 bg-purple-900/30 p-2 rounded">
+                            📦 Archiwum zawiera ukończone pobierania. Usunięcie pozwoli na ponowne pobranie.
                         </div>
+
+                        {archiveLoading ? (
+                            <p className="text-gray-400 text-sm text-center py-4">Ładowanie archiwum...</p>
+                        ) : archive.length === 0 ? (
+                            <p className="text-gray-400 text-sm text-center py-4">Archiwum jest puste</p>
+                        ) : (
+                            <>
+                                <ul className="space-y-2 text-sm">
+                                    {archive.map(d => (
+                                        <li key={d.id} className="bg-purple-900/20 p-2 rounded border border-purple-700/30">
+                                            <div className="flex justify-between items-center mb-1">
+                                                <span className="truncate text-gray-300 flex-1">
+                                                    📦 {d.filename}
+                                                </span>
+                                                <div className="flex items-center gap-2 ml-2">
+                                                    <span className="text-xs text-purple-400">
+                                                        Zarchiwizowane
+                                                    </span>
+                                                    <button 
+                                                        onClick={() => handleDeleteFromArchive(d.id, d.filename)} 
+                                                        className="text-red-400 hover:text-red-300 text-lg"
+                                                        title="Usuń z archiwum (pozwoli na ponowne pobranie)"
+                                                    >
+                                                        🗑️
+                                                    </button>
+                                                </div>
+                                            </div>
+                                            <div className="text-xs text-gray-500">
+                                                Pobrano: {new Date(d.added_at).toLocaleDateString()}
+                                            </div>
+                                        </li>
+                                    ))}
+                                </ul>
+
+                                {/* Paginacja archiwum */}
+                                {archivePagination.totalPages > 1 && (
+                                    <div className="mt-4 flex justify-center items-center gap-2">
+                                        <button
+                                            onClick={() => fetchArchive(archivePagination.currentPage - 1)}
+                                            disabled={archivePagination.currentPage <= 1}
+                                            className="px-2 py-1 text-xs bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:cursor-not-allowed text-white rounded"
+                                        >
+                                            ←
+                                        </button>
+                                        <span className="text-xs text-gray-400">
+                                            {archivePagination.currentPage} / {archivePagination.totalPages}
+                                        </span>
+                                        <button
+                                            onClick={() => fetchArchive(archivePagination.currentPage + 1)}
+                                            disabled={archivePagination.currentPage >= archivePagination.totalPages}
+                                            className="px-2 py-1 text-xs bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:cursor-not-allowed text-white rounded"
+                                        >
+                                            →
+                                        </button>
+                                    </div>
+                                )}
+                            </>
+                        )}
                     </div>
                 )}
             </div>

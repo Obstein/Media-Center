@@ -138,6 +138,26 @@ function initializeDb() {
             }
         });
 
+        // Dodaj kolumnę archived jeśli nie istnieje
+db.all("PRAGMA table_info(downloads)", [], (err, columns) => {
+    if (err) {
+        console.error("Błąd sprawdzania struktury tabeli downloads:", err);
+        return;
+    }
+    
+    const columnNames = columns.map(col => col.name);
+    
+    if (!columnNames.includes('archived')) {
+        db.run("ALTER TABLE downloads ADD COLUMN archived BOOLEAN DEFAULT 0", (alterErr) => {
+            if (alterErr) {
+                console.error("Błąd dodawania kolumny archived:", alterErr);
+            } else {
+                console.log("✅ Dodano kolumnę archived do tabeli downloads");
+            }
+        });
+    }
+});
+
         db.run(`
             CREATE TABLE IF NOT EXISTS media (
                 stream_id INTEGER, name TEXT, stream_icon TEXT, rating REAL,
@@ -598,8 +618,6 @@ app.get('/api/playlists/overview', async (req, res) => {
         res.status(500).json({ error: 'Nie udało się pobrać przeglądu playlist.' });
     }
 });
-
-// Dodaj te endpointy do server.js, po istniejących API playlist:
 
 // Synchronizuj pojedynczą playlistę
 app.post('/api/playlists/:id/sync', async (req, res) => {
@@ -1512,13 +1530,14 @@ app.post('/api/media/refresh', async (req, res) => {
 // --- API POBIERANIA ---
 app.get('/api/downloads/status', async (req, res) => {
     try {
-        // Pobierz z bazy danych z dodatkowymi kolumnami
+        // Pobierz z bazy danych z dodatkowymi kolumnami, POMIJAJĄC ZARCHIWIZOWANE
         const downloads = await dbAll(`
             SELECT 
                 id, stream_id, stream_type, episode_id, filename, filepath,
                 status, worker_status, progress, error_message, download_url,
-                added_at
+                added_at, archived
             FROM downloads 
+            WHERE archived = 0 OR archived IS NULL
             ORDER BY added_at DESC 
             LIMIT 50
         `);
@@ -1553,6 +1572,7 @@ app.get('/api/downloads/status', async (req, res) => {
 // Nowy endpoint do statystyk download managera
 app.get('/api/downloads/statistics', async (req, res) => {
     try {
+        // Statystyki tylko dla niezarchiwizowanych
         const stats = await dbAll(`
             SELECT 
                 COUNT(*) as total,
@@ -1561,6 +1581,14 @@ app.get('/api/downloads/statistics', async (req, res) => {
                 SUM(CASE WHEN worker_status = 'completed' THEN 1 ELSE 0 END) as completed,
                 SUM(CASE WHEN worker_status = 'failed' THEN 1 ELSE 0 END) as failed
             FROM downloads
+            WHERE archived = 0 OR archived IS NULL
+        `);
+        
+        // Statystyki archiwum (dodatkowe info)
+        const archivedStats = await dbAll(`
+            SELECT COUNT(*) as archived_count
+            FROM downloads
+            WHERE archived = 1
         `);
         
         const recentActivity = await dbAll(`
@@ -1569,12 +1597,16 @@ app.get('/api/downloads/statistics', async (req, res) => {
                 d.filename
             FROM download_logs dl
             LEFT JOIN downloads d ON dl.download_id = d.id
+            WHERE d.archived = 0 OR d.archived IS NULL
             ORDER BY dl.timestamp DESC 
             LIMIT 20
         `);
         
         res.json({
-            statistics: stats[0],
+            statistics: {
+                ...stats[0],
+                archived: archivedStats[0].archived_count
+            },
             recent_activity: recentActivity
         });
     } catch (error) {
@@ -1675,32 +1707,46 @@ app.post('/api/downloads/remove/:id', async (req, res) => {
         // Pobierz informacje o zadaniu z bazy danych
         const jobToDelete = await dbAll('SELECT * FROM downloads WHERE id = ?', [id]);
         
-        // Sprawdź, czy zadanie istnieje i czy plik nie został w pełni pobrany
-        if (jobToDelete.length > 0 && jobToDelete[0].filepath && jobToDelete[0].worker_status !== 'completed') {
-            const { filepath } = jobToDelete[0];
-            if (fs.existsSync(filepath)) {
-                console.log(`Usuwanie niekompletnego pliku: ${filepath}`);
-                fs.unlinkSync(filepath);
+        if (jobToDelete.length === 0) {
+            return res.status(404).json({ error: 'Zadanie nie znalezione.' });
+        }
+
+        const job = jobToDelete[0];
+        
+        // NOWA LOGIKA: Sprawdź status zadania
+        if (job.worker_status === 'completed') {
+            // Dla ukończonych - tylko archiwizuj
+            await dbRun('UPDATE downloads SET archived = 1 WHERE id = ?', [id]);
+            console.log(`📦 Zarchiwizowano ukończone pobieranie: ${job.filename}`);
+            res.status(200).json({ message: 'Pobieranie zostało zarchiwizowane.', action: 'archived' });
+        } else {
+            // Dla nieukończonych - usuń fizycznie (jak wcześniej)
+            // Sprawdź, czy zadanie nie zostało w pełni pobrane i usuń plik
+            if (job.filepath && fs.existsSync(job.filepath)) {
+                console.log(`Usuwanie niekompletnego pliku: ${job.filepath}`);
                 try {
-                    const dir = path.dirname(filepath);
+                    fs.unlinkSync(job.filepath);
+                    const dir = path.dirname(job.filepath);
                     if (fs.readdirSync(dir).length === 0) {
                         console.log(`Usuwanie pustego folderu: ${dir}`);
                         fs.rmdirSync(dir);
                     }
-                } catch (e) {
-                    console.warn(`Nie można usunąć folderu ${path.dirname(filepath)}, prawdopodobnie nie jest pusty.`);
+                } catch (fileError) {
+                    console.warn(`Nie można usunąć pliku/folderu: ${fileError.message}`);
                 }
             }
-        }
 
-        // Usuń wpis z bazy danych wraz z logami
-        await dbRun('DELETE FROM download_logs WHERE download_id = ?', [id]);
-        await dbRun('DELETE FROM downloads WHERE id = ?', [id]);
+            // Usuń wpis z bazy danych wraz z logami
+            await dbRun('DELETE FROM download_logs WHERE download_id = ?', [id]);
+            await dbRun('DELETE FROM downloads WHERE id = ?', [id]);
+            
+            console.log(`🗑️ Usunięto niekompletne pobieranie: ${job.filename}`);
+            res.status(200).json({ message: 'Zadanie zostało usunięte.', action: 'deleted' });
+        }
         
-        res.status(200).json({ message: 'Zadanie usunięte z listy.' });
     } catch (error) {
-        console.error(`Błąd usuwania zadania ${id}:`, error);
-        res.status(500).json({ error: 'Nie udało się usunąć zadania.' });
+        console.error(`Błąd obsługi zadania ${id}:`, error);
+        res.status(500).json({ error: 'Nie udało się obsłużyć zadania.' });
     }
 });
 
@@ -3279,6 +3325,70 @@ app.get('/api/media/details/:type/:id', async (req, res) => {
     }
 });
 
+app.get('/api/downloads/archive', async (req, res) => {
+    try {
+        const { page = 1, limit = 50 } = req.query;
+        const offset = (page - 1) * limit;
+        
+        // Pobierz zarchiwizowane pobierania
+        const archivedDownloads = await dbAll(`
+            SELECT 
+                id, stream_id, stream_type, episode_id, filename, filepath,
+                status, worker_status, progress, added_at, archived
+            FROM downloads 
+            WHERE archived = 1
+            ORDER BY added_at DESC 
+            LIMIT ? OFFSET ?
+        `, [limit, offset]);
+        
+        // Policz total
+        const totalResult = await dbAll(`
+            SELECT COUNT(*) as total 
+            FROM downloads 
+            WHERE archived = 1
+        `);
+        
+        const total = totalResult[0].total;
+        const totalPages = Math.ceil(total / limit);
+        
+        res.json({
+            downloads: archivedDownloads,
+            pagination: {
+                currentPage: parseInt(page),
+                totalPages,
+                totalItems: total,
+                itemsPerPage: parseInt(limit)
+            }
+        });
+    } catch (error) {
+        console.error("Błąd pobierania archiwum:", error);
+        res.status(500).json({ error: 'Błąd pobierania archiwum.' });
+    }
+});
+
+// Endpoint do trwałego usuwania z archiwum
+app.delete('/api/downloads/archive/:id', async (req, res) => {
+    const { id } = req.params;
+    try {
+        // Sprawdź czy wpis istnieje i jest zarchiwizowany
+        const archived = await dbAll('SELECT * FROM downloads WHERE id = ? AND archived = 1', [id]);
+        
+        if (archived.length === 0) {
+            return res.status(404).json({ error: 'Zarchiwizowane pobieranie nie znalezione.' });
+        }
+        
+        // Usuń trwale z bazy
+        await dbRun('DELETE FROM download_logs WHERE download_id = ?', [id]);
+        await dbRun('DELETE FROM downloads WHERE id = ?', [id]);
+        
+        res.json({ message: 'Pobieranie zostało trwale usunięte z archiwum.' });
+        
+    } catch (error) {
+        console.error("Błąd usuwania z archiwum:", error);
+        res.status(500).json({ error: 'Błąd usuwania z archiwum.' });
+    }
+});
+
 app.listen(PORT, () => {
     console.log(`Serwer backendu działa na porcie ${PORT}`);
     
@@ -3457,27 +3567,29 @@ async function monitorFavoritesMultiPlaylist() {
 
                     const allEpisodes = Object.values(seriesInfoRes.data.episodes).flat();
                     
-                    // Sprawdź odcinki które są completed, downloading, lub mają już 3+ nieudane próby
+                    // ZAKTUALIZOWANE ZAPYTANIE: Sprawdź odcinki uwzględniając archiwum
                     const existingDownloads = await dbAll(`
                         SELECT 
                             episode_id,
                             COUNT(*) as attempt_count,
-                            MAX(CASE WHEN worker_status = 'completed' THEN 1 ELSE 0 END) as is_completed,
+                            MAX(CASE WHEN worker_status = 'completed' AND (archived = 0 OR archived IS NULL) THEN 1 ELSE 0 END) as is_completed_active,
+                            MAX(CASE WHEN worker_status = 'completed' AND archived = 1 THEN 1 ELSE 0 END) as is_completed_archived,
                             MAX(CASE WHEN worker_status = 'downloading' THEN 1 ELSE 0 END) as is_downloading
                         FROM downloads 
                         WHERE stream_id = ? AND stream_type = ? AND playlist_id = ?
                         GROUP BY episode_id
                         HAVING 
-                            is_completed = 1 
+                            is_completed_active = 1 
+                            OR is_completed_archived = 1 
                             OR is_downloading = 1 
                             OR attempt_count >= 3
                     `, [series.stream_id, 'series', playlist.playlist_id]);
 
                     const excludedEpisodeIds = new Set(existingDownloads.map(row => row.episode_id));
 
-                    console.log(`  - ${playlist.playlist_name}/${series.stream_id}: ${allEpisodes.length} odcinków, ${excludedEpisodeIds.size} wykluczonych`);
+                    console.log(`  - ${playlist.playlist_name}/${series.stream_id}: ${allEpisodes.length} odcinków, ${excludedEpisodeIds.size} wykluczonych (w tym archiwum)`);
 
-                    // Sprawdź ile jest failed z mniej niż 3 próbami (do retry)
+                    // Sprawdź ile jest failed z mniej niż 3 próbami (do retry) - tylko niezarchiwizowane
                     const retryableDownloads = await dbAll(`
                         SELECT 
                             episode_id,
@@ -3485,11 +3597,12 @@ async function monitorFavoritesMultiPlaylist() {
                         FROM downloads 
                         WHERE stream_id = ? AND stream_type = ? AND playlist_id = ?
                         AND worker_status = 'failed'
+                        AND (archived = 0 OR archived IS NULL)
                         GROUP BY episode_id
                         HAVING attempt_count < 3
                     `, [series.stream_id, 'series', playlist.playlist_id]);
 
-                    // Sprawdź ile ma już 3+ prób (do usunięcia)
+                    // Sprawdź ile ma już 3+ prób (do usunięcia) - tylko niezarchiwizowane
                     const maxAttemptsDownloads = await dbAll(`
                         SELECT 
                             episode_id,
@@ -3497,11 +3610,12 @@ async function monitorFavoritesMultiPlaylist() {
                         FROM downloads 
                         WHERE stream_id = ? AND stream_type = ? AND playlist_id = ?
                         AND worker_status = 'failed'
+                        AND (archived = 0 OR archived IS NULL)
                         GROUP BY episode_id
                         HAVING attempt_count >= 3
                     `, [series.stream_id, 'series', playlist.playlist_id]);
 
-                    // Usuń downloads które mają już 3+ nieudane próby
+                    // Usuń downloads które mają już 3+ nieudane próby (tylko niezarchiwizowane)
                     if (maxAttemptsDownloads.length > 0) {
                         console.log(`🗑️ Usuwanie ${maxAttemptsDownloads.length} odcinków z 3+ nieudanymi próbami z ${playlist.playlist_name}...`);
                         
@@ -3510,6 +3624,7 @@ async function monitorFavoritesMultiPlaylist() {
                                 await dbRun(`
                                     DELETE FROM downloads 
                                     WHERE stream_id = ? AND stream_type = ? AND playlist_id = ? AND episode_id = ?
+                                    AND (archived = 0 OR archived IS NULL)
                                 `, [series.stream_id, 'series', playlist.playlist_id, item.episode_id]);
                             } catch (error) {
                                 console.error(`❌ Błąd usuwania downloads dla odcinka ${item.episode_id}:`, error);
@@ -3521,19 +3636,23 @@ async function monitorFavoritesMultiPlaylist() {
                             SELECT 
                                 episode_id,
                                 COUNT(*) as attempt_count,
-                                MAX(CASE WHEN worker_status = 'completed' THEN 1 ELSE 0 END) as is_completed,
+                                MAX(CASE WHEN worker_status = 'completed' AND (archived = 0 OR archived IS NULL) THEN 1 ELSE 0 END) as is_completed_active,
+                                MAX(CASE WHEN worker_status = 'completed' AND archived = 1 THEN 1 ELSE 0 END) as is_completed_archived,
                                 MAX(CASE WHEN worker_status = 'downloading' THEN 1 ELSE 0 END) as is_downloading
                             FROM downloads 
                             WHERE stream_id = ? AND stream_type = ? AND playlist_id = ?
                             GROUP BY episode_id
                             HAVING 
-                                is_completed = 1 
+                                is_completed_active = 1 
+                                OR is_completed_archived = 1 
                                 OR is_downloading = 1 
                                 OR attempt_count >= 3
                         `, [series.stream_id, 'series', playlist.playlist_id]);
                         
                         excludedEpisodeIds.clear();
                         updatedExistingDownloads.forEach(row => excludedEpisodeIds.add(row.episode_id));
+                        
+                        console.log(`  - Zaktualizowana lista wykluczonych: ${excludedEpisodeIds.size}`);
                     }
 
                     // Filtruj odcinki do dodania
