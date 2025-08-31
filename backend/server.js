@@ -2609,7 +2609,7 @@ async function processDownloadQueue() {
         await dbRun('UPDATE downloads SET status = ?, worker_status = ? WHERE id = ?', 
                     ['downloading', 'downloading', job.id]);
 
-        // POPRAWKA: Pobierz dane playlisty dla tego zadania
+        // Pobierz dane playlisty dla tego zadania
         const downloadDetails = await dbAll(`
             SELECT d.*, p.server_url, p.username, p.password, p.name as playlist_name
             FROM downloads d
@@ -2627,126 +2627,174 @@ async function processDownloadQueue() {
             throw new Error('Brak danych playlisty dla tego pobierania');
         }
         
-        console.log(`🔍 DOWNLOAD JOB ${job.id}:`);
-        console.log(`  - Playlista: ${downloadJob.playlist_name}`);
-        console.log(`  - Server: ${downloadJob.server_url}`);
-        console.log(`  - Stream ID: ${downloadJob.stream_id}`);
-        console.log(`  - Episode ID: ${downloadJob.episode_id}`);
+        console.log(`🔍 DOWNLOAD JOB ${job.id}: ${downloadJob.filename}`);
         
-        // Pobierz szczegóły media z właściwej playlisty
-        console.log(`Fetching media details for ${downloadJob.stream_type} ID: ${downloadJob.stream_id}`);
-        
-        // Buduj URL API z danych playlisty
+        // Pobierz szczegóły media z Xtream API dla prawidłowych nazw i dat
         const xtreamBaseUrl = `${downloadJob.server_url}/player_api.php?username=${downloadJob.username}&password=${downloadJob.password}`;
         
         let mediaDetailsResponse;
-        if (downloadJob.stream_type === 'series') {
-            const apiUrl = `${xtreamBaseUrl}&action=get_series_info&series_id=${downloadJob.stream_id}`;
-            console.log(`📡 Series API URL: ${apiUrl}`);
-            mediaDetailsResponse = await axios.get(apiUrl);
-        } else {
-            const apiUrl = `${xtreamBaseUrl}&action=get_vod_info&vod_id=${downloadJob.stream_id}`;
-            console.log(`📡 Movie API URL: ${apiUrl}`);
-            mediaDetailsResponse = await axios.get(apiUrl);
+        try {
+            if (downloadJob.stream_type === 'series') {
+                const apiUrl = `${xtreamBaseUrl}&action=get_series_info&series_id=${downloadJob.stream_id}`;
+                mediaDetailsResponse = await axios.get(apiUrl, { timeout: 15000 });
+            } else {
+                const apiUrl = `${xtreamBaseUrl}&action=get_vod_info&vod_id=${downloadJob.stream_id}`;
+                mediaDetailsResponse = await axios.get(apiUrl, { timeout: 15000 });
+            }
+        } catch (apiError) {
+            console.warn(`⚠️ Nie udało się pobrać szczegółów z API: ${apiError.message}`);
+            mediaDetailsResponse = { data: null };
         }
         
         const details = {
             stream_id: downloadJob.stream_id,
             stream_type: downloadJob.stream_type,
             name: downloadJob.filename,
-            xtream_details: mediaDetailsResponse.data,
-            container_extension: null // Będzie ustawione później
+            xtream_details: mediaDetailsResponse.data
         };
 
-        // Reszta logiki z oryginalnej funkcji...
-        console.log(`🔍 DEBUG: Szczegóły filmu dla ID ${downloadJob.stream_id}:`);
-        console.log(`  - job.filename: ${downloadJob.filename}`);
-        console.log(`  - details.container_extension: ${details.container_extension}`);
-        console.log(`  - xtream_details struktura:`, Object.keys(details.xtream_details || {}));
-
-        if (details.xtream_details?.info) {
-            console.log(`  - xtream_details.info keys:`, Object.keys(details.xtream_details.info));
-            console.log(`  - xtream_details.info.container_extension: ${details.xtream_details.info.container_extension}`);
-        }
-
-        // Sprawdź czy w nazwie pliku jest rozszerzenie
-        const filenameMatch = downloadJob.filename?.match(/\.(mp4|mkv|avi|mov|m4v|wmv|flv|ts|m2ts)$/i);
-        if (filenameMatch) {
-            console.log(`  - Rozszerzenie z nazwy pliku: ${filenameMatch[1]}`);
-        }
-
-        // Określ prawidłowe rozszerzenie
+        // === OKREŚL ROZSZERZENIE PLIKU ===
         let extension = 'mp4'; // domyślne
         let downloadUrl;
 
         if (downloadJob.stream_type === 'movie') {
-            // Dla filmów: sprawdź różne źródła rozszerzenia
-            let movieExtension = null;
-            
+            // Sprawdź różne źródła rozszerzenia dla filmów
             if (details.xtream_details?.info?.container_extension) {
-                movieExtension = details.xtream_details.info.container_extension;
-                console.log(`✅ Znaleziono rozszerzenie w xtream_details.info: ${movieExtension}`);
-            }
-            else if (filenameMatch) {
-                movieExtension = filenameMatch[1].toLowerCase();
-                console.log(`✅ Znaleziono rozszerzenie w nazwie pliku: ${movieExtension}`);
+                extension = details.xtream_details.info.container_extension;
+            } else {
+                const filenameMatch = downloadJob.filename?.match(/\.(mp4|mkv|avi|mov|m4v|wmv|flv|ts|m2ts)$/i);
+                if (filenameMatch) {
+                    extension = filenameMatch[1].toLowerCase();
+                }
             }
             
-            extension = movieExtension || 'mkv';
-            
-            // POPRAWKA: Używaj danych z downloadJob zamiast settings
             downloadUrl = `${downloadJob.server_url}/movie/${downloadJob.username}/${downloadJob.password}/${downloadJob.stream_id}.${extension}`;
-            
-            console.log(`🎬 MOVIE URL WITH CORRECT EXTENSION:`);
-            console.log(`  - Stream ID: ${downloadJob.stream_id}`);
-            console.log(`  - Final Extension: ${extension}`);
-            console.log(`  - Final URL: ${downloadUrl}`);
             
         } else {
             // Dla seriali: znajdź konkretny odcinek i weź jego rozszerzenie
-            const episodeData = Object.values(details.xtream_details.episodes).flat().find(ep => ep.id == downloadJob.episode_id);
+            const allEpisodes = details.xtream_details?.episodes ? Object.values(details.xtream_details.episodes).flat() : [];
+            const episodeData = allEpisodes.find(ep => ep.id == downloadJob.episode_id);
             extension = episodeData?.container_extension || 'mkv';
             
-            // POPRAWKA: Używaj danych z downloadJob zamiast settings
             downloadUrl = `${downloadJob.server_url}/series/${downloadJob.username}/${downloadJob.password}/${downloadJob.episode_id}.${extension}`;
+        }
+
+        // === PLEX-KOMPATYBILNA STRUKTURA FOLDERÓW I NAZW ===
+        let plexCompatiblePath;
+
+        if (downloadJob.stream_type === 'movie') {
+            // === FILMY: /Movies/Movie Title (Year)/Movie Title (Year).ext ===
             
-            console.log(`📺 SERIES URL:`);
-            console.log(`  - Episode ID: ${downloadJob.episode_id}`);
-            console.log(`  - Episode Extension: ${episodeData?.container_extension}`);
-            console.log(`  - Final Extension: ${extension}`);
-            console.log(`  - Final URL: ${downloadUrl}`);
-        }
-        
-        // Reszta logiki nazewnictwa plików (bez zmian)
-        const title = downloadJob.filename.replace(/\s*-\s*S\d+E\d+.*$/, '').trim();
-        const year = 'UnknownYear'; // Możesz to poprawić później
-        
-        const safeName = title.replace(/[^\w\s.-]/gi, '').trim();
-        let folderPath = downloadJob.stream_type === 'movie'
-            ? path.join('/downloads/movies', `${safeName} (${year})`)
-            : path.join('/downloads/series', `${safeName} (${year})`);
-        
-        // Dla seriali dodaj folder sezonu
-        if (downloadJob.stream_type === 'series') {
-            const episodeData = Object.values(details.xtream_details.episodes).flat().find(ep => ep.id == downloadJob.episode_id);
-            if (episodeData?.season) {
-                folderPath = path.join(folderPath, `Season ${String(episodeData.season).padStart(2, '0')}`);
+            const movieInfo = details.xtream_details?.info || {};
+            let movieTitle = movieInfo.name || details.name || downloadJob.filename;
+            let releaseYear = 'Unknown';
+            
+            // Spróbuj pobrać rok z różnych źródeł
+            if (movieInfo.releasedate) {
+                releaseYear = new Date(movieInfo.releasedate).getFullYear();
+            } else if (movieInfo.year) {
+                releaseYear = movieInfo.year;
+            } else {
+                // Spróbuj wyciągnąć rok z nazwy
+                const yearMatch = movieTitle.match(/\((\d{4})\)|(\d{4})/);
+                if (yearMatch) {
+                    releaseYear = yearMatch[1] || yearMatch[2];
+                    // Usuń rok z tytułu jeśli był w nawiasach
+                    movieTitle = movieTitle.replace(/\s*\(\d{4}\)\s*/, '').trim();
+                }
             }
+            
+            // Wyczyść tytuł dla systemu plików (zachowaj akcenty, usuń tylko problematyczne znaki)
+            const safeMovieTitle = movieTitle
+                .replace(/[<>:"/\\|?*]/g, '')  // Usuń znaki problematyczne dla Windows/Linux
+                .replace(/\s+/g, ' ')          // Znormalizuj spacje
+                .trim();
+            
+            // Struktura Plex: /Movies/Movie Title (Year)/Movie Title (Year).ext
+            const movieFolderName = `${safeMovieTitle} (${releaseYear})`;
+            const movieFileName = `${safeMovieTitle} (${releaseYear}).${extension}`;
+            
+            plexCompatiblePath = path.join('/downloads/movies', movieFolderName, movieFileName);
+            
+            console.log(`🎬 PLEX MOVIE:`);
+            console.log(`  - Original: "${movieTitle}"`);
+            console.log(`  - Year: ${releaseYear}`);
+            console.log(`  - Safe: "${safeMovieTitle}"`);
+            console.log(`  - Structure: ${movieFolderName}/${movieFileName}`);
+            
+        } else {
+            // === SERIALE: /TV Shows/Show Title (Year)/Season XX/Show Title - S01E05 - Episode Title.ext ===
+            
+            const seriesInfo = details.xtream_details?.info || {};
+            const allEpisodes = details.xtream_details?.episodes ? Object.values(details.xtream_details.episodes).flat() : [];
+            const episodeData = allEpisodes.find(ep => ep.id == downloadJob.episode_id);
+            
+            if (!episodeData) {
+                throw new Error(`Nie znaleziono odcinka o ID: ${downloadJob.episode_id}`);
+            }
+            
+            let seriesTitle = seriesInfo.name || details.name || downloadJob.filename.replace(/\s*-\s*S\d+E\d+.*$/, '').trim();
+            let releaseYear = 'Unknown';
+            
+            // Spróbuj pobrać rok serialu
+            if (seriesInfo.releasedate) {
+                releaseYear = new Date(seriesInfo.releasedate).getFullYear();
+            } else if (seriesInfo.year) {
+                releaseYear = seriesInfo.year;
+            } else {
+                // Spróbuj wyciągnąć rok z nazwy
+                const yearMatch = seriesTitle.match(/\((\d{4})\)|(\d{4})/);
+                if (yearMatch) {
+                    releaseYear = yearMatch[1] || yearMatch[2];
+                    seriesTitle = seriesTitle.replace(/\s*\(\d{4}\)\s*/, '').trim();
+                }
+            }
+            
+            // Wyczyść nazwy dla systemu plików
+            const safeSeriesTitle = seriesTitle
+                .replace(/[<>:"/\\|?*]/g, '')
+                .replace(/\s+/g, ' ')
+                .trim();
+                
+            const safeEpisodeTitle = (episodeData.title || `Episode ${episodeData.episode_num}`)
+                .replace(/[<>:"/\\|?*]/g, '')
+                .replace(/\s+/g, ' ')
+                .trim();
+            
+            // Format numerów z zerami wiodącymi
+            const seasonPadded = String(episodeData.season || 1).padStart(2, '0');
+            const episodePadded = String(episodeData.episode_num || 1).padStart(2, '0');
+            
+            // Struktura Plex dla seriali
+            const seriesFolderName = `${safeSeriesTitle} (${releaseYear})`;
+            const seasonFolderName = `Season ${seasonPadded}`;
+            
+            // Format nazwy pliku zgodny z Plex: "Show Title - S01E05 - Episode Title.ext"
+            const episodeFileName = `${safeSeriesTitle} - S${seasonPadded}E${episodePadded} - ${safeEpisodeTitle}.${extension}`;
+            
+            plexCompatiblePath = path.join('/downloads/series', seriesFolderName, seasonFolderName, episodeFileName);
+            
+            console.log(`📺 PLEX SERIES:`);
+            console.log(`  - Original: "${seriesTitle}"`);
+            console.log(`  - Year: ${releaseYear}`);
+            console.log(`  - Safe: "${safeSeriesTitle}"`);
+            console.log(`  - Season: ${episodeData.season} -> ${seasonPadded}`);
+            console.log(`  - Episode: ${episodeData.episode_num} -> ${episodePadded}`);
+            console.log(`  - Episode Title: "${episodeData.title}"`);
+            console.log(`  - Structure: ${seriesFolderName}/${seasonFolderName}/${episodeFileName}`);
         }
-        
-        const safeFilename = `${downloadJob.filename.replace(/\.(mp4|mkv|avi|mov)$/, '')}.${extension}`;
-        const filePath = path.join(folderPath, safeFilename);
 
-        // Aktualizuj szczegóły w bazie z URL pobierania
+        // Aktualizuj szczegóły w bazie z Plex-kompatybilną ścieżką
+        const finalFileName = path.basename(plexCompatiblePath);
         await dbRun('UPDATE downloads SET filename = ?, filepath = ?, download_url = ? WHERE id = ?', 
-                    [safeFilename, filePath, downloadUrl, downloadJob.id]);
+                    [finalFileName, plexCompatiblePath, downloadUrl, downloadJob.id]);
         
-        console.log(`Starting download job ${downloadJob.id}: ${safeFilename}`);
-        console.log(`Download URL: ${downloadUrl}`);
+        console.log(`📁 Final Plex Path: ${plexCompatiblePath}`);
+        console.log(`🌐 Download URL: ${downloadUrl}`);
 
-        // Użyj download_manager.py (bez zmian w tej części)
+        // Użyj download_manager.py do pobrania
         await new Promise((resolve, reject) => {
-            const pythonProcess = spawn('python3', ['download_manager.py', downloadUrl, filePath]);
+            const pythonProcess = spawn('python3', ['download_manager.py', downloadUrl, plexCompatiblePath]);
             activeDownloads.set(downloadJob.id, pythonProcess);
 
             let stdoutData = '';
@@ -2781,10 +2829,10 @@ async function processDownloadQueue() {
         // Oznacz jako ukończone
         await dbRun('UPDATE downloads SET status = ?, worker_status = ?, progress = 100 WHERE id = ?', 
                     ['completed', 'completed', downloadJob.id]);
-        console.log(`✅ Download completed for job ${downloadJob.id}`);
+        console.log(`✅ Download completed for job ${downloadJob.id}: ${finalFileName}`);
 
     } catch (error) {
-        console.error(`Błąd przetwarzania zadania ${job.id}:`, error);
+        console.error(`❌ Błąd przetwarzania zadania ${job.id}:`, error);
         await dbRun('UPDATE downloads SET status = ?, worker_status = ?, error_message = ? WHERE id = ?', 
                     ['failed', 'failed', error.message, job.id]);
     } finally {
