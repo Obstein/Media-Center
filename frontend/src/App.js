@@ -1016,8 +1016,6 @@ const DownloadWidget = ({ downloads, onRemove, onClose, isOpen }) => {
     const [archive, setArchive] = useState([]);
     const [archiveLoading, setArchiveLoading] = useState(false);
     const [archivePagination, setArchivePagination] = useState({ currentPage: 1, totalPages: 1 });
-    const [showArchiveManager, setShowArchiveManager] = useState(false);
-
     
     // NOWE: Stany dla wyszukiwania i grupowania
     const [searchTerm, setSearchTerm] = useState('');
@@ -1233,7 +1231,7 @@ const DownloadWidget = ({ downloads, onRemove, onClose, isOpen }) => {
     const processedDownloads = processDownloads(activeTab === 'active' ? downloads : archive);
 
     return (
-        <div className="fixed bottom-4 right-4 w-[480px] bg-gray-800 rounded-lg shadow-2xl border border-gray-700 z-50 max-h-[80vh] overflow-hidden flex flex-col">
+        <div className="fixed bottom-4 right-4 w-[480px] bg-gray-800 rounded-lg shadow-2xl border border-gray-700 z-50 max-h-[80vh] overflow-hidden flex flex-col download-widget">
             <div className="p-4 flex-shrink-0">
                 <div className="flex justify-between items-center mb-3">
                     <h4 className="font-bold text-lg text-white">Download Manager</h4>
@@ -1284,19 +1282,6 @@ const DownloadWidget = ({ downloads, onRemove, onClose, isOpen }) => {
                                     ×
                                 </button>
                             )}
-                            {activeTab === 'archive' && (
-    <div className="mb-3 flex justify-between items-center">
-        <button
-            onClick={() => setShowArchiveManager(true)}
-            className="px-3 py-1 bg-purple-600 hover:bg-purple-700 text-white rounded text-sm"
-        >
-            📊 Zarządzaj Archiwum
-        </button>
-        <span className="text-xs text-gray-400">
-            {statistics?.statistics?.archived || 0} pozycji w archiwum
-        </span>
-    </div>
-)}
                         </div>
 
                         {/* Grupowanie i sortowanie */}
@@ -1324,8 +1309,6 @@ const DownloadWidget = ({ downloads, onRemove, onClose, isOpen }) => {
                         </div>
                     </div>
                 )}
-
-                
 
                 {/* Status Daemon - tylko dla aktywnych */}
                 {activeTab === 'active' && daemonStatus && (
@@ -1384,10 +1367,10 @@ const DownloadWidget = ({ downloads, onRemove, onClose, isOpen }) => {
             </div>
 
             {/* Zawartość - scrollowalna */}
-            <div className="flex-1 overflow-hidden">
+            <div className="flex-1 overflow-y-auto">
                 {activeTab === 'active' ? (
                     /* Lista aktywnych pobierań */
-                    <div className="px-4 pb-4 h-full overflow-y-auto">
+                    <div className="px-4 pb-4">
                         {downloads.length === 0 ? (
                             <p className="text-gray-400 text-sm text-center py-4">Brak aktywnych pobierań</p>
                         ) : (
@@ -1438,121 +1421,139 @@ const DownloadWidget = ({ downloads, onRemove, onClose, isOpen }) => {
                         )}
                     </div>
                 ) : (
-                    /* ULEPSZONE ARCHIWUM z grupowaniem */
-                    <div className="px-4 pb-4 h-full overflow-y-auto">
-                        {archiveLoading ? (
-                            <p className="text-gray-400 text-sm text-center py-4">Ładowanie archiwum...</p>
-                        ) : processedDownloads.length === 0 ? (
-                            <p className="text-gray-400 text-sm text-center py-4">
-                                {searchTerm ? `Brak wyników dla "${searchTerm}"` : 'Archiwum jest puste'}
-                            </p>
-                        ) : (
-                            <>
-                                {/* Informacja o wynikach */}
-                                {searchTerm && (
-                                    <div className="mb-3 text-xs text-gray-400 bg-gray-700/30 p-2 rounded">
-                                        📊 Znaleziono {processedDownloads.reduce((sum, group) => sum + group.items.length, 0)} wyników dla "{searchTerm}"
-                                    </div>
-                                )}
+                    /* ULEPSZONE ARCHIWUM z grupowaniem - POPRAWIONE SCROLLOWANIE */
+                    <div className="px-4 pb-4">
+                        <div className="max-h-full overflow-y-auto">
+                            {archiveLoading ? (
+                                <p className="text-gray-400 text-sm text-center py-4">Ładowanie archiwum...</p>
+                            ) : processedDownloads.length === 0 ? (
+                                <p className="text-gray-400 text-sm text-center py-4">
+                                    {searchTerm ? `Brak wyników dla "${searchTerm}"` : 'Archiwum jest puste'}
+                                </p>
+                            ) : (
+                                <>
+                                    {/* Informacja o wynikach */}
+                                    {searchTerm && (
+                                        <div className="mb-3 text-xs text-gray-400 bg-gray-700/30 p-2 rounded">
+                                            📊 Znaleziono {processedDownloads.reduce((sum, group) => sum + group.items.length, 0)} wyników dla "{searchTerm}"
+                                        </div>
+                                    )}
 
-                                <div className="space-y-4">
-                                    {processedDownloads.map((group, groupIndex) => (
-                                        <div key={groupIndex}>
-                                            {/* Nagłówek grupy */}
-                                            {group.groupName && groupBy !== 'none' && (
-                                                <div className="flex items-center justify-between mb-2 pb-1 border-b border-gray-600">
-                                                    <h5 className="text-sm font-semibold text-white">
-                                                        {group.groupName}
-                                                    </h5>
-                                                    <span className="text-xs text-gray-400">
-                                                        {group.items.length} {group.items.length === 1 ? 'pozycja' : 'pozycji'}
-                                                    </span>
-                                                </div>
-                                            )}
+                                    {/* POPRAWIONA SEKCJA - Scrollowalna lista grup */}
+                                    <div className="space-y-4 max-h-96 overflow-y-auto pr-2 download-widget-scroll">
+                                        {processedDownloads.map((group, groupIndex) => (
+                                            <div key={groupIndex}>
+                                                {/* Nagłówek grupy - STICKY */}
+                                                {group.groupName && groupBy !== 'none' && (
+                                                    <div className="sticky top-0 z-10 archive-group-header flex items-center justify-between mb-2 pb-1 border-b border-gray-600 py-2">
+                                                        <h5 className="text-sm font-semibold text-white">
+                                                            {group.groupName}
+                                                        </h5>
+                                                        <span className="text-xs text-gray-400 bg-gray-700/80 px-2 py-1 rounded">
+                                                            {group.items.length} {group.items.length === 1 ? 'pozycja' : 'pozycji'}
+                                                        </span>
+                                                    </div>
+                                                )}
 
-                                            {/* Elementy grupy */}
-                                            <div className="space-y-2">
-                                                {group.items.map(d => (
-                                                    <div key={d.id} className="bg-purple-900/20 p-2 rounded border border-purple-700/30">
-                                                        <div className="flex justify-between items-center mb-1">
-                                                            <span className="truncate text-gray-300 flex-1 text-sm">
-                                                                📦 {d.filename}
-                                                            </span>
-                                                            <div className="flex items-center gap-2 ml-2">
-                                                                <span className="text-xs text-purple-400">
-                                                                    {new Date(d.added_at).toLocaleDateString('pl-PL')}
-                                                                </span>
-                                                                <button 
-                                                                    onClick={() => handleDeleteFromArchive(d.id, d.filename)} 
-                                                                    className="text-red-400 hover:text-red-300 text-lg"
-                                                                    title="Usuń z archiwum (pozwoli na ponowne pobranie)"
-                                                                >
-                                                                    🗑️
-                                                                </button>
+                                                {/* Elementy grupy */}
+                                                <div className="space-y-2">
+                                                    {group.items.map(d => (
+                                                        <div key={d.id} className="archive-item bg-purple-900/20 p-3 rounded border border-purple-700/30 hover:bg-purple-900/40 transition-all duration-200">
+                                                            <div className="archive-item-content flex justify-between items-start gap-2">
+                                                                <div className="flex-1 min-w-0">
+                                                                    <div className="flex items-center gap-2 mb-1">
+                                                                        <span className="text-purple-400">📦</span>
+                                                                        <span className="text-gray-300 text-sm font-medium truncate" title={d.filename}>
+                                                                            {d.filename}
+                                                                        </span>
+                                                                    </div>
+                                                                    
+                                                                    <div className="text-xs text-gray-500 space-y-1">
+                                                                        <div className="flex items-center gap-4">
+                                                                            <span>📅 {new Date(d.added_at).toLocaleDateString('pl-PL')}</span>
+                                                                            <span className="capitalize">
+                                                                                {d.stream_type === 'series' ? '📺 Serial' : '🎬 Film'}
+                                                                            </span>
+                                                                        </div>
+                                                                        
+                                                                        {/* Dodatkowe info dla seriali */}
+                                                                        {d.stream_type === 'series' && d.episode_id && (
+                                                                            <div className="text-purple-300">
+                                                                                🎭 Episode ID: {d.episode_id}
+                                                                            </div>
+                                                                        )}
+                                                                        
+                                                                        {/* Info o ścieżce pliku */}
+                                                                        {d.filepath && (
+                                                                            <div className="text-gray-500 truncate" title={d.filepath}>
+                                                                                📁 {d.filepath}
+                                                                            </div>
+                                                                        )}
+                                                                    </div>
+                                                                </div>
+                                                                
+                                                                <div className="flex-shrink-0">
+                                                                    <button 
+                                                                        onClick={() => handleDeleteFromArchive(d.id, d.filename)} 
+                                                                        className="archive-action-button text-red-400 hover:text-red-300 hover:bg-red-900/30 p-2 rounded transition-all duration-200"
+                                                                        title="Usuń z archiwum (pozwoli na ponowne pobranie)"
+                                                                    >
+                                                                        🗑️
+                                                                    </button>
+                                                                </div>
                                                             </div>
                                                         </div>
-                                                        
-                                                        {/* Dodatkowe info dla grupy seriali */}
-                                                        {groupBy === 'series' && d.stream_type === 'series' && (
-                                                            <div className="text-xs text-gray-500">
-                                                                {d.episode_id ? `Odcinek ID: ${d.episode_id}` : 'Serial'}
-                                                            </div>
-                                                        )}
-                                                    </div>
-                                                ))}
-                                            </div>
-                                        </div>
-                                    ))}
-                                </div>
+                                                    ))}
+                                                </div>
 
-                                {/* Paginacja archiwum */}
-                                {archivePagination.totalPages > 1 && (
-                                    <div className="mt-4 flex justify-center items-center gap-2">
-                                        <button
-                                            onClick={() => fetchArchive(archivePagination.currentPage - 1)}
-                                            disabled={archivePagination.currentPage <= 1}
-                                            className="px-2 py-1 text-xs bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:cursor-not-allowed text-white rounded"
-                                        >
-                                            ←
-                                        </button>
-                                        <span className="text-xs text-gray-400">
-                                            {archivePagination.currentPage} / {archivePagination.totalPages}
-                                        </span>
-                                        <button
-                                            onClick={() => fetchArchive(archivePagination.currentPage + 1)}
-                                            disabled={archivePagination.currentPage >= archivePagination.totalPages}
-                                            className="px-2 py-1 text-xs bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:cursor-not-allowed text-white rounded"
-                                        >
-                                            →
-                                        </button>
+                                                {/* Separator między grupami */}
+                                                {groupBy !== 'none' && groupIndex < processedDownloads.length - 1 && (
+                                                    <div className="mt-4 border-t border-gray-600"></div>
+                                                )}
+                                            </div>
+                                        ))}
                                     </div>
-                                )}
-                            </>
-                        )}
+
+                                    {/* Paginacja archiwum - ZAWSZE WIDOCZNA NA DOLE */}
+                                    {archivePagination.totalPages > 1 && (
+                                        <div className="mt-4 pt-3 border-t border-gray-600 bg-gray-800 flex justify-between items-center text-xs">
+                                            <button
+                                                onClick={() => fetchArchive(archivePagination.currentPage - 1)}
+                                                disabled={archivePagination.currentPage <= 1}
+                                                className="px-3 py-2 bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:cursor-not-allowed text-white rounded flex items-center gap-1"
+                                            >
+                                                ← Poprzednia
+                                            </button>
+                                            
+                                            <div className="flex items-center gap-2">
+                                                <span className="text-gray-400">
+                                                    Strona {archivePagination.currentPage} z {archivePagination.totalPages}
+                                                </span>
+                                                <span className="text-gray-500">
+                                                    ({archivePagination.totalItems} łącznie)
+                                                </span>
+                                            </div>
+                                            
+                                            <button
+                                                onClick={() => fetchArchive(archivePagination.currentPage + 1)}
+                                                disabled={archivePagination.currentPage >= archivePagination.totalPages}
+                                                className="px-3 py-2 bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:cursor-not-allowed text-white rounded flex items-center gap-1"
+                                            >
+                                                Następna →
+                                            </button>
+                                        </div>
+                                    )}
+
+                                    {/* Informacja o łącznej liczbie elementów */}
+                                    <div className="mt-2 text-center text-xs text-gray-500">
+                                        Wyświetlono {processedDownloads.reduce((sum, group) => sum + group.items.length, 0)} z {archivePagination.totalItems} pozycji
+                                    </div>
+                                </>
+                            )}
+                        </div>
                     </div>
                 )}
             </div>
-            {showArchiveManager && (
-    <ArchiveSeriesManager
-        isOpen={showArchiveManager}
-        onClose={() => setShowArchiveManager(false)}
-        onRefresh={() => {
-            if (activeTab === 'archive') {
-                fetchArchive(1);
-            }
-            // Odśwież także statystyki
-            const fetchStats = async () => {
-                try {
-                    const statsResponse = await axios.get('/api/downloads/statistics');
-                    setStatistics(statsResponse.data);
-                } catch (error) {
-                    console.error('Błąd odświeżania statystyk:', error);
-                }
-            };
-            fetchStats();
-        }}
-    />
-)}
         </div>
     );
 };
