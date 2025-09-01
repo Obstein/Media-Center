@@ -2597,7 +2597,7 @@ app.get('/api/tmdb/search', async (req, res) => {
     }
 });
 
-// Pełna funkcja processDownloadQueue z poprawkami nazewnictwa Plex
+// Pełna funkcja processDownloadQueue z poprawkami nazewnictwa Plex i TMDB
 async function processDownloadQueue() {
     if (isProcessing || downloadQueue.length === 0) {
         return;
@@ -2866,113 +2866,58 @@ async function processDownloadQueue() {
                 .replace(/\s+/g, ' ')
                 .trim();
 
-            // ✅ POPRAWKA TYTUŁU ODCINKA: Usuń duplikacje i niepotrzebne elementy
-            let cleanEpisodeTitle = episodeData.title || `Odcinek ${episodeData.episode_num}`;
+            // ✅ INTELIGENTNY TYTUŁ ODCINKA Z TMDB
+            let cleanEpisodeTitle = 'Odcinek ' + episodeData.episode_num; // domyślny fallback
+            
+            console.log(`📺 EPISODE TITLE PROCESSING:`);
+            console.log(`  - Original Xtream Title: "${episodeData.title || 'N/A'}"`);
+            console.log(`  - TMDB Episode Title: "${details.tmdb_episode_details?.name || 'N/A'}"`);
+            
+            // ✅ PRIORYTET 1: Użyj tytułu z TMDB jeśli dostępny
+            if (details.tmdb_episode_details?.name) {
+                cleanEpisodeTitle = details.tmdb_episode_details.name;
+                console.log(`  ✅ Using TMDB episode title: "${cleanEpisodeTitle}"`);
+            } 
+            // ✅ PRIORYTET 2: Spróbuj wyczyścić tytuł z Xtream
+            else if (episodeData.title) {
+                cleanEpisodeTitle = episodeData.title;
+                console.log(`  📺 Using Xtream title, will clean: "${cleanEpisodeTitle}"`);
+                
+                // Usuń prefiksy językowe (PL, EN, US, DE, FR, ES, IT, itp.)
+                cleanEpisodeTitle = cleanEpisodeTitle.replace(/^[A-Z]{2,3}\s*[-\s]*/, '').trim();
+                console.log(`  - After language prefix removal: "${cleanEpisodeTitle}"`);
 
-            console.log(`📺 EPISODE TITLE CLEANING:`);
-            console.log(`  - Original Episode Title: "${cleanEpisodeTitle}"`);
-            console.log(`  - Series Title: "${seriesTitle}"`);
-            console.log(`  - TMDB Title: "${tmdbData?.name || 'N/A'}"`);
+                // Usuń nazwę serialu z TMDB (najdokładniejsza)
+                if (tmdbData?.name) {
+                    const tmdbNameRegex = new RegExp(tmdbData.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+                    cleanEpisodeTitle = cleanEpisodeTitle.replace(tmdbNameRegex, '').trim();
+                    console.log(`  - After TMDB series name removal: "${cleanEpisodeTitle}"`);
+                }
 
-            // ✅ KROK 1: Usuń prefiksy językowe (PL -, EN -, DE -, itp.)
-            cleanEpisodeTitle = cleanEpisodeTitle.replace(/^[A-Z]{2}\s*-\s*/i, '').trim();
-            console.log(`  - After language prefix removal: "${cleanEpisodeTitle}"`);
+                // Usuń kody odcinków (S01E01, S1E1, 1x01, itp.)
+                cleanEpisodeTitle = cleanEpisodeTitle.replace(/S\d{1,2}E\d{1,2}/gi, '').trim();
+                cleanEpisodeTitle = cleanEpisodeTitle.replace(/\d{1,2}x\d{1,2}/gi, '').trim();
+                cleanEpisodeTitle = cleanEpisodeTitle.replace(/Season\s*\d+\s*Episode\s*\d+/gi, '').trim();
+                console.log(`  - After episode code removal: "${cleanEpisodeTitle}"`);
 
-            // ✅ KROK 2: Usuń nazwę serialu z TMDB (priorytet)
-            if (tmdbData?.name && cleanEpisodeTitle.toLowerCase().includes(tmdbData.name.toLowerCase())) {
-                // Usuń dokładną nazwę z TMDB
-                const tmdbNameRegex = new RegExp(tmdbData.name.replace(/[.*+?^${}()|[\]\\]/g, '\\            // ✅ POPRAWKA TYTUŁU ODCINKA: Usuń duplikacje i niepotrzebne elementy
-            let cleanEpisodeTitle = episodeData.title || `Odcinek ${episodeData.episode_num}`;
+                // Usuń pozostałe separatory i słowa językowe
+                cleanEpisodeTitle = cleanEpisodeTitle.replace(/^[\s\-–—_\|]+/, '').trim(); // wiodące
+                cleanEpisodeTitle = cleanEpisodeTitle.replace(/[\s\-–—_\|]+$/, '').trim(); // końcowe  
+                cleanEpisodeTitle = cleanEpisodeTitle.replace(/\s*-\s*-\s*/g, ' - ').trim(); // podwójne myślniki
+                cleanEpisodeTitle = cleanEpisodeTitle.replace(/^(Polski|Polish|English|Deutsch|Français|Español|Italiano)\s*[-\s]*/i, '').trim();
+                cleanEpisodeTitle = cleanEpisodeTitle.replace(/\s+/g, ' ').trim(); // wielokrotne spacje
+                console.log(`  - After full cleanup: "${cleanEpisodeTitle}"`);
 
-            console.log(`📺 EPISODE TITLE CLEANING:`);
-            console.log(`  - Original Episode Title: "${cleanEpisodeTitle}"`);
-            console.log(`  - Series Title: "${seriesTitle}"`);
-
-            // Usuń prefiks z nazwą serialu jeśli jest obecny w tytule odcinka
-            if (cleanEpisodeTitle.toLowerCase().startsWith(seriesTitle.toLowerCase())) {
-                cleanEpisodeTitle = cleanEpisodeTitle.substring(seriesTitle.length).trim();
-                console.log(`  - After series name removal: "${cleanEpisodeTitle}"`);
+                // Jeśli po czyszczeniu zostało bardzo mało, użyj domyślnego
+                if (!cleanEpisodeTitle || cleanEpisodeTitle.length < 3 || /^[-\s]*$/.test(cleanEpisodeTitle)) {
+                    cleanEpisodeTitle = `Odcinek ${episodeData.episode_num}`;
+                    console.log(`  - Using fallback: "${cleanEpisodeTitle}"`);
+                }
             }
-
-            // Usuń wzór S01E01 z tytułu odcinka jeśli jest obecny
-            const seasonEpisodePattern = new RegExp(`S${String(episodeData.season).padStart(2, '0')}E${String(episodeData.episode_num).padStart(2, '0')}`, 'gi');
-            cleanEpisodeTitle = cleanEpisodeTitle.replace(seasonEpisodePattern, '').trim();
-            console.log(`  - After S01E01 removal: "${cleanEpisodeTitle}"`);
-
-            // Usuń wiodące myślniki, spacje i inne separatory
-            cleanEpisodeTitle = cleanEpisodeTitle.replace(/^[\s\-–—_\|]+/, '').trim();
-            console.log(`  - After separator removal: "${cleanEpisodeTitle}"`);
-
-            // Jeśli po czyszczeniu został pusty tytuł lub bardzo krótki, użyj domyślnego
-            if (!cleanEpisodeTitle || cleanEpisodeTitle.length < 3) {
-                cleanEpisodeTitle = `Odcinek ${episodeData.episode_num}`;
-                console.log(`  - Using fallback title: "${cleanEpisodeTitle}"`);
-            }
-
-            const safeEpisodeTitle = cleanEpisodeTitle
-                .replace(/[<>:"/\\|?*]/g, '')
-                .replace(/\s+/g, ' ')
-                .trim();'), 'gi');
-                cleanEpisodeTitle = cleanEpisodeTitle.replace(tmdbNameRegex, '').trim();
-                console.log(`  - After TMDB series name removal: "${cleanEpisodeTitle}"`);
-            } else if (cleanEpisodeTitle.toLowerCase().includes(seriesTitle.toLowerCase())) {
-                // Fallback: usuń nazwę z Xtream
-                const seriesNameRegex = new RegExp(seriesTitle.replace(/[.*+?^${}()|[\]\\]/g, '\\            // ✅ POPRAWKA TYTUŁU ODCINKA: Usuń duplikacje i niepotrzebne elementy
-            let cleanEpisodeTitle = episodeData.title || `Odcinek ${episodeData.episode_num}`;
-
-            console.log(`📺 EPISODE TITLE CLEANING:`);
-            console.log(`  - Original Episode Title: "${cleanEpisodeTitle}"`);
-            console.log(`  - Series Title: "${seriesTitle}"`);
-
-            // Usuń prefiks z nazwą serialu jeśli jest obecny w tytule odcinka
-            if (cleanEpisodeTitle.toLowerCase().startsWith(seriesTitle.toLowerCase())) {
-                cleanEpisodeTitle = cleanEpisodeTitle.substring(seriesTitle.length).trim();
-                console.log(`  - After series name removal: "${cleanEpisodeTitle}"`);
-            }
-
-            // Usuń wzór S01E01 z tytułu odcinka jeśli jest obecny
-            const seasonEpisodePattern = new RegExp(`S${String(episodeData.season).padStart(2, '0')}E${String(episodeData.episode_num).padStart(2, '0')}`, 'gi');
-            cleanEpisodeTitle = cleanEpisodeTitle.replace(seasonEpisodePattern, '').trim();
-            console.log(`  - After S01E01 removal: "${cleanEpisodeTitle}"`);
-
-            // Usuń wiodące myślniki, spacje i inne separatory
-            cleanEpisodeTitle = cleanEpisodeTitle.replace(/^[\s\-–—_\|]+/, '').trim();
-            console.log(`  - After separator removal: "${cleanEpisodeTitle}"`);
-
-            // Jeśli po czyszczeniu został pusty tytuł lub bardzo krótki, użyj domyślnego
-            if (!cleanEpisodeTitle || cleanEpisodeTitle.length < 3) {
-                cleanEpisodeTitle = `Odcinek ${episodeData.episode_num}`;
-                console.log(`  - Using fallback title: "${cleanEpisodeTitle}"`);
-            }
-
-            const safeEpisodeTitle = cleanEpisodeTitle
-                .replace(/[<>:"/\\|?*]/g, '')
-                .replace(/\s+/g, ' ')
-                .trim();'), 'gi');
-                cleanEpisodeTitle = cleanEpisodeTitle.replace(seriesNameRegex, '').trim();
-                console.log(`  - After Xtream series name removal: "${cleanEpisodeTitle}"`);
-            }
-
-            // ✅ KROK 3: Usuń wzór S01E01 z tytułu odcinka jeśli jest obecny
-            const seasonEpisodePattern = new RegExp(`S${String(episodeData.season).padStart(2, '0')}E${String(episodeData.episode_num).padStart(2, '0')}`, 'gi');
-            cleanEpisodeTitle = cleanEpisodeTitle.replace(seasonEpisodePattern, '').trim();
-            console.log(`  - After S01E01 removal: "${cleanEpisodeTitle}"`);
-
-            // ✅ KROK 4: Usuń wiodące i podwójne separatory
-            cleanEpisodeTitle = cleanEpisodeTitle.replace(/^[\s\-–—_\|]+/, '').trim(); // wiodące
-            cleanEpisodeTitle = cleanEpisodeTitle.replace(/[\s\-–—_\|]+$/, '').trim(); // końcowe  
-            cleanEpisodeTitle = cleanEpisodeTitle.replace(/\s*-\s*-\s*/g, ' - ').trim(); // podwójne myślniki
-            cleanEpisodeTitle = cleanEpisodeTitle.replace(/\s+/g, ' ').trim(); // wielokrotne spacje
-            console.log(`  - After separator cleanup: "${cleanEpisodeTitle}"`);
-
-            // ✅ KROK 5: Jeśli tytuł zaczyna się od "Polski" lub podobnych, usuń to
-            cleanEpisodeTitle = cleanEpisodeTitle.replace(/^(Polski|Polish|PL)\s*-?\s*/i, '').trim();
-            console.log(`  - After language word removal: "${cleanEpisodeTitle}"`);
-
-            // ✅ KROK 6: Jeśli po czyszczeniu został pusty lub bardzo krótki tytuł, użyj domyślnego
-            if (!cleanEpisodeTitle || cleanEpisodeTitle.length < 3 || cleanEpisodeTitle === '-') {
-                cleanEpisodeTitle = `Odcinek ${episodeData.episode_num}`;
-                console.log(`  - Using fallback title: "${cleanEpisodeTitle}"`);
+            
+            // ✅ DODATKOWE INFO: Jeśli TMDB ma opis odcinka, pokaż go w logach
+            if (details.tmdb_episode_details?.overview) {
+                console.log(`  📖 TMDB Episode Overview: "${details.tmdb_episode_details.overview.substring(0, 100)}..."`);
             }
 
             const safeEpisodeTitle = cleanEpisodeTitle
