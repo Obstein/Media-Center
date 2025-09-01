@@ -2597,6 +2597,7 @@ app.get('/api/tmdb/search', async (req, res) => {
     }
 });
 
+// Pełna funkcja processDownloadQueue z poprawkami nazewnictwa Plex
 async function processDownloadQueue() {
     if (isProcessing || downloadQueue.length === 0) {
         return;
@@ -2629,7 +2630,7 @@ async function processDownloadQueue() {
         
         console.log(`🔍 DOWNLOAD JOB ${job.id}: ${downloadJob.filename}`);
         
-        // Pobierz szczegóły media z Xtream API dla prawidłowych nazw i dat
+        // Pobierz szczegóły media z Xtream API i TMDB
         const xtreamBaseUrl = `${downloadJob.server_url}/player_api.php?username=${downloadJob.username}&password=${downloadJob.password}`;
         
         let mediaDetailsResponse;
@@ -2645,12 +2646,43 @@ async function processDownloadQueue() {
             console.warn(`⚠️ Nie udało się pobrać szczegółów z API: ${apiError.message}`);
             mediaDetailsResponse = { data: null };
         }
+
+        // ✅ POBIERZ DANE Z TMDB dla lepszych nazw i dat
+        let tmdbDetails = null;
+        try {
+            // Pobierz TMDB ID z bazy danych
+            const mediaFromDb = await dbAll(`
+                SELECT tmdb_id FROM media 
+                WHERE stream_id = ? AND stream_type = ? 
+                LIMIT 1
+            `, [downloadJob.stream_id, downloadJob.stream_type]);
+            
+            const tmdbId = mediaFromDb[0]?.tmdb_id || mediaDetailsResponse?.data?.info?.tmdb;
+            
+            if (tmdbId) {
+                const tmdbApiRows = await dbAll('SELECT value FROM settings WHERE key = ?', ['tmdbApi']);
+                const tmdbApi = tmdbApiRows[0]?.value;
+                
+                if (tmdbApi) {
+                    const tmdbType = downloadJob.stream_type === 'series' ? 'tv' : 'movie';
+                    const tmdbUrl = `https://api.themoviedb.org/3/${tmdbType}/${tmdbId}?api_key=${tmdbApi}&language=pl-PL`;
+                    
+                    console.log(`🎭 Pobieranie danych TMDB dla ${tmdbType} ID: ${tmdbId}`);
+                    const tmdbResponse = await axios.get(tmdbUrl, { timeout: 10000 });
+                    tmdbDetails = tmdbResponse.data;
+                    console.log(`✅ TMDB: "${tmdbDetails.title || tmdbDetails.name}" (${tmdbDetails.release_date || tmdbDetails.first_air_date})`);
+                }
+            }
+        } catch (tmdbError) {
+            console.warn(`⚠️ Nie udało się pobrać danych TMDB: ${tmdbError.message}`);
+        }
         
         const details = {
             stream_id: downloadJob.stream_id,
             stream_type: downloadJob.stream_type,
             name: downloadJob.filename,
-            xtream_details: mediaDetailsResponse.data
+            xtream_details: mediaDetailsResponse.data,
+            tmdb_details: tmdbDetails
         };
 
         // === OKREŚL ROZSZERZENIE PLIKU ===
@@ -2686,28 +2718,49 @@ async function processDownloadQueue() {
             // === FILMY: /Movies/Movie Title (Year)/Movie Title (Year).ext ===
             
             const movieInfo = details.xtream_details?.info || {};
-            let movieTitle = movieInfo.name || details.name || downloadJob.filename;
+            const tmdbData = details.tmdb_details;
+            
+            // ✅ PRIORYTET: Użyj nazwy i roku z TMDB jeśli dostępne
+            let movieTitle = tmdbData?.title || movieInfo.name || details.name || downloadJob.filename;
             let releaseYear = 'Unknown';
             
-            // Spróbuj pobrać rok z różnych źródeł
-            if (movieInfo.releasedate) {
-                releaseYear = new Date(movieInfo.releasedate).getFullYear();
+            // ✅ PRIORYTETOWE ŹRÓDŁA ROKU (TMDB FIRST)
+            if (tmdbData?.release_date) {
+                const tmdbYear = new Date(tmdbData.release_date).getFullYear();
+                if (!isNaN(tmdbYear) && tmdbYear > 1900 && tmdbYear <= new Date().getFullYear() + 5) {
+                    releaseYear = tmdbYear;
+                    console.log(`🎭 Używam roku z TMDB: ${releaseYear}`);
+                }
+            } else if (movieInfo.releasedate) {
+                const xtreamYear = new Date(movieInfo.releasedate).getFullYear();
+                if (!isNaN(xtreamYear) && xtreamYear > 1900 && xtreamYear <= new Date().getFullYear() + 5) {
+                    releaseYear = xtreamYear;
+                    console.log(`📺 Używam roku z Xtream: ${releaseYear}`);
+                }
             } else if (movieInfo.year) {
-                releaseYear = movieInfo.year;
+                const year = parseInt(movieInfo.year);
+                if (!isNaN(year) && year > 1900 && year <= new Date().getFullYear() + 5) {
+                    releaseYear = year;
+                    console.log(`📺 Używam roku z Xtream (year): ${releaseYear}`);
+                }
             } else {
-                // Spróbuj wyciągnąć rok z nazwy
-                const yearMatch = movieTitle.match(/\((\d{4})\)|(\d{4})/);
-                if (yearMatch) {
-                    releaseYear = yearMatch[1] || yearMatch[2];
-                    // Usuń rok z tytułu jeśli był w nawiasach
-                    movieTitle = movieTitle.replace(/\s*\(\d{4}\)\s*/, '').trim();
+                // Fallback: wykryj rok z nazwy
+                const yearMatches = movieTitle.match(/[\(\[]?(\d{4})[\)\]]?/g);
+                if (yearMatches) {
+                    const lastYearMatch = yearMatches[yearMatches.length - 1];
+                    const year = parseInt(lastYearMatch.replace(/[\(\[\)\]]/g, ''));
+                    if (!isNaN(year) && year > 1900 && year <= new Date().getFullYear() + 5) {
+                        releaseYear = year;
+                        movieTitle = movieTitle.replace(/\s*[\(\[]?\d{4}[\)\]]?\s*$/, '').trim();
+                        console.log(`🔍 Wykryto rok z nazwy: ${releaseYear}`);
+                    }
                 }
             }
             
-            // Wyczyść tytuł dla systemu plików (zachowaj akcenty, usuń tylko problematyczne znaki)
+            // Wyczyść tytuł dla systemu plików
             const safeMovieTitle = movieTitle
-                .replace(/[<>:"/\\|?*]/g, '')  // Usuń znaki problematyczne dla Windows/Linux
-                .replace(/\s+/g, ' ')          // Znormalizuj spacje
+                .replace(/[<>:"/\\|?*]/g, '')
+                .replace(/\s+/g, ' ')
                 .trim();
             
             // Struktura Plex: /Movies/Movie Title (Year)/Movie Title (Year).ext
@@ -2717,8 +2770,10 @@ async function processDownloadQueue() {
             plexCompatiblePath = path.join('/downloads/movies', movieFolderName, movieFileName);
             
             console.log(`🎬 PLEX MOVIE:`);
-            console.log(`  - Original: "${movieTitle}"`);
-            console.log(`  - Year: ${releaseYear}`);
+            console.log(`  - TMDB Title: "${tmdbData?.title || 'N/A'}"`);
+            console.log(`  - TMDB Date: "${tmdbData?.release_date || 'N/A'}"`);
+            console.log(`  - Final Title: "${movieTitle}"`);
+            console.log(`  - Final Year: ${releaseYear}`);
             console.log(`  - Safe: "${safeMovieTitle}"`);
             console.log(`  - Structure: ${movieFolderName}/${movieFileName}`);
             
@@ -2726,6 +2781,7 @@ async function processDownloadQueue() {
             // === SERIALE: /TV Shows/Show Title (Year)/Season XX/Show Title - S01E05 - Episode Title.ext ===
             
             const seriesInfo = details.xtream_details?.info || {};
+            const tmdbData = details.tmdb_details;
             const allEpisodes = details.xtream_details?.episodes ? Object.values(details.xtream_details.episodes).flat() : [];
             const episodeData = allEpisodes.find(ep => ep.id == downloadJob.episode_id);
             
@@ -2733,21 +2789,54 @@ async function processDownloadQueue() {
                 throw new Error(`Nie znaleziono odcinka o ID: ${downloadJob.episode_id}`);
             }
             
-            let seriesTitle = seriesInfo.name || details.name || downloadJob.filename.replace(/\s*-\s*S\d+E\d+.*$/, '').trim();
+            // ✅ PRIORYTET: Użyj nazwy i roku z TMDB jeśli dostępne
+            let seriesTitle = tmdbData?.name || seriesInfo.name || details.name || downloadJob.filename.replace(/\s*-\s*S\d+E\d+.*$/, '').trim();
             let releaseYear = 'Unknown';
             
-            // Spróbuj pobrać rok serialu
-            if (seriesInfo.releasedate) {
-                releaseYear = new Date(seriesInfo.releasedate).getFullYear();
-            } else if (seriesInfo.year) {
-                releaseYear = seriesInfo.year;
-            } else {
-                // Spróbuj wyciągnąć rok z nazwy
-                const yearMatch = seriesTitle.match(/\((\d{4})\)|(\d{4})/);
-                if (yearMatch) {
-                    releaseYear = yearMatch[1] || yearMatch[2];
-                    seriesTitle = seriesTitle.replace(/\s*\(\d{4}\)\s*/, '').trim();
+            // ✅ PRIORYTETOWE ŹRÓDŁA ROKU (TMDB FIRST)
+            if (tmdbData?.first_air_date) {
+                const tmdbYear = new Date(tmdbData.first_air_date).getFullYear();
+                if (!isNaN(tmdbYear) && tmdbYear > 1900 && tmdbYear <= new Date().getFullYear() + 5) {
+                    releaseYear = tmdbYear;
+                    console.log(`🎭 Używam roku z TMDB: ${releaseYear}`);
                 }
+            } else if (seriesInfo.releasedate) {
+                const xtreamYear = new Date(seriesInfo.releasedate).getFullYear();
+                if (!isNaN(xtreamYear) && xtreamYear > 1900 && xtreamYear <= new Date().getFullYear() + 5) {
+                    releaseYear = xtreamYear;
+                    console.log(`📺 Używam roku z Xtream: ${releaseYear}`);
+                }
+            } else if (seriesInfo.year) {
+                const year = parseInt(seriesInfo.year);
+                if (!isNaN(year) && year > 1900 && year <= new Date().getFullYear() + 5) {
+                    releaseYear = year;
+                    console.log(`📺 Używam roku z Xtream (year): ${releaseYear}`);
+                }
+            } else if (seriesInfo.last_modified) {
+                const modYear = new Date(seriesInfo.last_modified).getFullYear();
+                if (!isNaN(modYear) && modYear > 1900 && modYear <= new Date().getFullYear()) {
+                    releaseYear = modYear;
+                    console.log(`📺 Używam roku z last_modified: ${releaseYear}`);
+                }
+            } else {
+                // Fallback: wykryj rok z nazwy
+                const yearMatches = seriesTitle.match(/[\(\[]?(\d{4})[\)\]]?/g);
+                if (yearMatches) {
+                    const firstYearMatch = yearMatches[0];
+                    const year = parseInt(firstYearMatch.replace(/[\(\[\)\]]/g, ''));
+                    if (!isNaN(year) && year > 1900 && year <= new Date().getFullYear() + 5) {
+                        releaseYear = year;
+                        seriesTitle = seriesTitle.replace(/\s*[\(\[]?\d{4}[\)\]]?\s*/, '').trim();
+                        console.log(`🔍 Wykryto rok z nazwy: ${releaseYear}`);
+                    }
+                }
+            }
+            
+            // ✅ LEPSZY FALLBACK: Jeśli nadal Unknown, użyj inteligentnego domyślnego
+            if (releaseYear === 'Unknown') {
+                const currentYear = new Date().getFullYear();
+                releaseYear = currentYear - 2;
+                console.log(`⚠️ Brak roku dla serialu "${seriesTitle}", używam domyślnego: ${releaseYear}`);
             }
             
             // Wyczyść nazwy dla systemu plików
@@ -2755,8 +2844,36 @@ async function processDownloadQueue() {
                 .replace(/[<>:"/\\|?*]/g, '')
                 .replace(/\s+/g, ' ')
                 .trim();
-                
-            const safeEpisodeTitle = (episodeData.title || `Episode ${episodeData.episode_num}`)
+
+            // ✅ POPRAWKA TYTUŁU ODCINKA: Usuń duplikacje i niepotrzebne elementy
+            let cleanEpisodeTitle = episodeData.title || `Odcinek ${episodeData.episode_num}`;
+
+            console.log(`📺 EPISODE TITLE CLEANING:`);
+            console.log(`  - Original Episode Title: "${cleanEpisodeTitle}"`);
+            console.log(`  - Series Title: "${seriesTitle}"`);
+
+            // Usuń prefiks z nazwą serialu jeśli jest obecny w tytule odcinka
+            if (cleanEpisodeTitle.toLowerCase().startsWith(seriesTitle.toLowerCase())) {
+                cleanEpisodeTitle = cleanEpisodeTitle.substring(seriesTitle.length).trim();
+                console.log(`  - After series name removal: "${cleanEpisodeTitle}"`);
+            }
+
+            // Usuń wzór S01E01 z tytułu odcinka jeśli jest obecny
+            const seasonEpisodePattern = new RegExp(`S${String(episodeData.season).padStart(2, '0')}E${String(episodeData.episode_num).padStart(2, '0')}`, 'gi');
+            cleanEpisodeTitle = cleanEpisodeTitle.replace(seasonEpisodePattern, '').trim();
+            console.log(`  - After S01E01 removal: "${cleanEpisodeTitle}"`);
+
+            // Usuń wiodące myślniki, spacje i inne separatory
+            cleanEpisodeTitle = cleanEpisodeTitle.replace(/^[\s\-–—_\|]+/, '').trim();
+            console.log(`  - After separator removal: "${cleanEpisodeTitle}"`);
+
+            // Jeśli po czyszczeniu został pusty tytuł lub bardzo krótki, użyj domyślnego
+            if (!cleanEpisodeTitle || cleanEpisodeTitle.length < 3) {
+                cleanEpisodeTitle = `Odcinek ${episodeData.episode_num}`;
+                console.log(`  - Using fallback title: "${cleanEpisodeTitle}"`);
+            }
+
+            const safeEpisodeTitle = cleanEpisodeTitle
                 .replace(/[<>:"/\\|?*]/g, '')
                 .replace(/\s+/g, ' ')
                 .trim();
@@ -2769,19 +2886,23 @@ async function processDownloadQueue() {
             const seriesFolderName = `${safeSeriesTitle} (${releaseYear})`;
             const seasonFolderName = `Season ${seasonPadded}`;
             
-            // Format nazwy pliku zgodny z Plex: "Show Title - S01E05 - Episode Title.ext"
+            // ✅ Format nazwy pliku zgodny z Plex: "Show Title - S01E05 - Episode Title.ext"
             const episodeFileName = `${safeSeriesTitle} - S${seasonPadded}E${episodePadded} - ${safeEpisodeTitle}.${extension}`;
             
             plexCompatiblePath = path.join('/downloads/series', seriesFolderName, seasonFolderName, episodeFileName);
             
-            console.log(`📺 PLEX SERIES:`);
-            console.log(`  - Original: "${seriesTitle}"`);
-            console.log(`  - Year: ${releaseYear}`);
-            console.log(`  - Safe: "${safeSeriesTitle}"`);
+            console.log(`📺 PLEX SERIES (TMDB ENHANCED):`);
+            console.log(`  - TMDB Title: "${tmdbData?.name || 'N/A'}"`);
+            console.log(`  - TMDB Date: "${tmdbData?.first_air_date || 'N/A'}"`);
+            console.log(`  - Xtream Title: "${seriesInfo.name || 'N/A'}"`);
+            console.log(`  - Final Title: "${seriesTitle}"`);
+            console.log(`  - Final Year: ${releaseYear}`);
+            console.log(`  - Safe Series: "${safeSeriesTitle}"`);
+            console.log(`  - Original Episode: "${episodeData.title}"`);
+            console.log(`  - Final Episode: "${safeEpisodeTitle}"`);
             console.log(`  - Season: ${episodeData.season} -> ${seasonPadded}`);
             console.log(`  - Episode: ${episodeData.episode_num} -> ${episodePadded}`);
-            console.log(`  - Episode Title: "${episodeData.title}"`);
-            console.log(`  - Structure: ${seriesFolderName}/${seasonFolderName}/${episodeFileName}`);
+            console.log(`  - Final Structure: ${seriesFolderName}/${seasonFolderName}/${episodeFileName}`);
         }
 
         // Aktualizuj szczegóły w bazie z Plex-kompatybilną ścieżką
