@@ -2649,6 +2649,7 @@ async function processDownloadQueue() {
 
         // ✅ POBIERZ DANE Z TMDB dla lepszych nazw i dat
         let tmdbDetails = null;
+        let tmdbEpisodeDetails = null;
         try {
             // Pobierz TMDB ID z bazy danych
             const mediaFromDb = await dbAll(`
@@ -2671,6 +2672,25 @@ async function processDownloadQueue() {
                     const tmdbResponse = await axios.get(tmdbUrl, { timeout: 10000 });
                     tmdbDetails = tmdbResponse.data;
                     console.log(`✅ TMDB: "${tmdbDetails.title || tmdbDetails.name}" (${tmdbDetails.release_date || tmdbDetails.first_air_date})`);
+                    
+                    // ✅ POBIERZ SZCZEGÓŁY ODCINKA Z TMDB (tylko dla seriali)
+                    if (downloadJob.stream_type === 'series' && downloadJob.episode_id) {
+                        const allEpisodes = mediaDetailsResponse?.data?.episodes ? Object.values(mediaDetailsResponse.data.episodes).flat() : [];
+                        const episodeData = allEpisodes.find(ep => ep.id == downloadJob.episode_id);
+                        
+                        if (episodeData?.season && episodeData?.episode_num) {
+                            try {
+                                const tmdbEpisodeUrl = `https://api.themoviedb.org/3/tv/${tmdbId}/season/${episodeData.season}/episode/${episodeData.episode_num}?api_key=${tmdbApi}&language=pl-PL`;
+                                console.log(`🎭 Pobieranie szczegółów odcinka S${episodeData.season}E${episodeData.episode_num} z TMDB...`);
+                                
+                                const tmdbEpisodeResponse = await axios.get(tmdbEpisodeUrl, { timeout: 10000 });
+                                tmdbEpisodeDetails = tmdbEpisodeResponse.data;
+                                console.log(`✅ TMDB Episode: "${tmdbEpisodeDetails.name}" (${tmdbEpisodeDetails.air_date})`);
+                            } catch (episodeError) {
+                                console.warn(`⚠️ Nie udało się pobrać szczegółów odcinka z TMDB: ${episodeError.message}`);
+                            }
+                        }
+                    }
                 }
             }
         } catch (tmdbError) {
@@ -2682,7 +2702,8 @@ async function processDownloadQueue() {
             stream_type: downloadJob.stream_type,
             name: downloadJob.filename,
             xtream_details: mediaDetailsResponse.data,
-            tmdb_details: tmdbDetails
+            tmdb_details: tmdbDetails,
+            tmdb_episode_details: tmdbEpisodeDetails
         };
 
         // === OKREŚL ROZSZERZENIE PLIKU ===
@@ -2851,6 +2872,21 @@ async function processDownloadQueue() {
             console.log(`📺 EPISODE TITLE CLEANING:`);
             console.log(`  - Original Episode Title: "${cleanEpisodeTitle}"`);
             console.log(`  - Series Title: "${seriesTitle}"`);
+            console.log(`  - TMDB Title: "${tmdbData?.name || 'N/A'}"`);
+
+            // ✅ KROK 1: Usuń prefiksy językowe (PL -, EN -, DE -, itp.)
+            cleanEpisodeTitle = cleanEpisodeTitle.replace(/^[A-Z]{2}\s*-\s*/i, '').trim();
+            console.log(`  - After language prefix removal: "${cleanEpisodeTitle}"`);
+
+            // ✅ KROK 2: Usuń nazwę serialu z TMDB (priorytet)
+            if (tmdbData?.name && cleanEpisodeTitle.toLowerCase().includes(tmdbData.name.toLowerCase())) {
+                // Usuń dokładną nazwę z TMDB
+                const tmdbNameRegex = new RegExp(tmdbData.name.replace(/[.*+?^${}()|[\]\\]/g, '\\            // ✅ POPRAWKA TYTUŁU ODCINKA: Usuń duplikacje i niepotrzebne elementy
+            let cleanEpisodeTitle = episodeData.title || `Odcinek ${episodeData.episode_num}`;
+
+            console.log(`📺 EPISODE TITLE CLEANING:`);
+            console.log(`  - Original Episode Title: "${cleanEpisodeTitle}"`);
+            console.log(`  - Series Title: "${seriesTitle}"`);
 
             // Usuń prefiks z nazwą serialu jeśli jest obecny w tytule odcinka
             if (cleanEpisodeTitle.toLowerCase().startsWith(seriesTitle.toLowerCase())) {
@@ -2876,6 +2912,72 @@ async function processDownloadQueue() {
             const safeEpisodeTitle = cleanEpisodeTitle
                 .replace(/[<>:"/\\|?*]/g, '')
                 .replace(/\s+/g, ' ')
+                .trim();'), 'gi');
+                cleanEpisodeTitle = cleanEpisodeTitle.replace(tmdbNameRegex, '').trim();
+                console.log(`  - After TMDB series name removal: "${cleanEpisodeTitle}"`);
+            } else if (cleanEpisodeTitle.toLowerCase().includes(seriesTitle.toLowerCase())) {
+                // Fallback: usuń nazwę z Xtream
+                const seriesNameRegex = new RegExp(seriesTitle.replace(/[.*+?^${}()|[\]\\]/g, '\\            // ✅ POPRAWKA TYTUŁU ODCINKA: Usuń duplikacje i niepotrzebne elementy
+            let cleanEpisodeTitle = episodeData.title || `Odcinek ${episodeData.episode_num}`;
+
+            console.log(`📺 EPISODE TITLE CLEANING:`);
+            console.log(`  - Original Episode Title: "${cleanEpisodeTitle}"`);
+            console.log(`  - Series Title: "${seriesTitle}"`);
+
+            // Usuń prefiks z nazwą serialu jeśli jest obecny w tytule odcinka
+            if (cleanEpisodeTitle.toLowerCase().startsWith(seriesTitle.toLowerCase())) {
+                cleanEpisodeTitle = cleanEpisodeTitle.substring(seriesTitle.length).trim();
+                console.log(`  - After series name removal: "${cleanEpisodeTitle}"`);
+            }
+
+            // Usuń wzór S01E01 z tytułu odcinka jeśli jest obecny
+            const seasonEpisodePattern = new RegExp(`S${String(episodeData.season).padStart(2, '0')}E${String(episodeData.episode_num).padStart(2, '0')}`, 'gi');
+            cleanEpisodeTitle = cleanEpisodeTitle.replace(seasonEpisodePattern, '').trim();
+            console.log(`  - After S01E01 removal: "${cleanEpisodeTitle}"`);
+
+            // Usuń wiodące myślniki, spacje i inne separatory
+            cleanEpisodeTitle = cleanEpisodeTitle.replace(/^[\s\-–—_\|]+/, '').trim();
+            console.log(`  - After separator removal: "${cleanEpisodeTitle}"`);
+
+            // Jeśli po czyszczeniu został pusty tytuł lub bardzo krótki, użyj domyślnego
+            if (!cleanEpisodeTitle || cleanEpisodeTitle.length < 3) {
+                cleanEpisodeTitle = `Odcinek ${episodeData.episode_num}`;
+                console.log(`  - Using fallback title: "${cleanEpisodeTitle}"`);
+            }
+
+            const safeEpisodeTitle = cleanEpisodeTitle
+                .replace(/[<>:"/\\|?*]/g, '')
+                .replace(/\s+/g, ' ')
+                .trim();'), 'gi');
+                cleanEpisodeTitle = cleanEpisodeTitle.replace(seriesNameRegex, '').trim();
+                console.log(`  - After Xtream series name removal: "${cleanEpisodeTitle}"`);
+            }
+
+            // ✅ KROK 3: Usuń wzór S01E01 z tytułu odcinka jeśli jest obecny
+            const seasonEpisodePattern = new RegExp(`S${String(episodeData.season).padStart(2, '0')}E${String(episodeData.episode_num).padStart(2, '0')}`, 'gi');
+            cleanEpisodeTitle = cleanEpisodeTitle.replace(seasonEpisodePattern, '').trim();
+            console.log(`  - After S01E01 removal: "${cleanEpisodeTitle}"`);
+
+            // ✅ KROK 4: Usuń wiodące i podwójne separatory
+            cleanEpisodeTitle = cleanEpisodeTitle.replace(/^[\s\-–—_\|]+/, '').trim(); // wiodące
+            cleanEpisodeTitle = cleanEpisodeTitle.replace(/[\s\-–—_\|]+$/, '').trim(); // końcowe  
+            cleanEpisodeTitle = cleanEpisodeTitle.replace(/\s*-\s*-\s*/g, ' - ').trim(); // podwójne myślniki
+            cleanEpisodeTitle = cleanEpisodeTitle.replace(/\s+/g, ' ').trim(); // wielokrotne spacje
+            console.log(`  - After separator cleanup: "${cleanEpisodeTitle}"`);
+
+            // ✅ KROK 5: Jeśli tytuł zaczyna się od "Polski" lub podobnych, usuń to
+            cleanEpisodeTitle = cleanEpisodeTitle.replace(/^(Polski|Polish|PL)\s*-?\s*/i, '').trim();
+            console.log(`  - After language word removal: "${cleanEpisodeTitle}"`);
+
+            // ✅ KROK 6: Jeśli po czyszczeniu został pusty lub bardzo krótki tytuł, użyj domyślnego
+            if (!cleanEpisodeTitle || cleanEpisodeTitle.length < 3 || cleanEpisodeTitle === '-') {
+                cleanEpisodeTitle = `Odcinek ${episodeData.episode_num}`;
+                console.log(`  - Using fallback title: "${cleanEpisodeTitle}"`);
+            }
+
+            const safeEpisodeTitle = cleanEpisodeTitle
+                .replace(/[<>:"/\\|?*]/g, '')
+                .replace(/\s+/g, ' ')
                 .trim();
             
             // Format numerów z zerami wiodącymi
@@ -2892,14 +2994,15 @@ async function processDownloadQueue() {
             plexCompatiblePath = path.join('/downloads/series', seriesFolderName, seasonFolderName, episodeFileName);
             
             console.log(`📺 PLEX SERIES (TMDB ENHANCED):`);
-            console.log(`  - TMDB Title: "${tmdbData?.name || 'N/A'}"`);
-            console.log(`  - TMDB Date: "${tmdbData?.first_air_date || 'N/A'}"`);
-            console.log(`  - Xtream Title: "${seriesInfo.name || 'N/A'}"`);
-            console.log(`  - Final Title: "${seriesTitle}"`);
-            console.log(`  - Final Year: ${releaseYear}`);
-            console.log(`  - Safe Series: "${safeSeriesTitle}"`);
-            console.log(`  - Original Episode: "${episodeData.title}"`);
+            console.log(`  - TMDB Series: "${tmdbData?.name || 'N/A'}"`);
+            console.log(`  - TMDB Air Date: "${tmdbData?.first_air_date || 'N/A'}"`);
+            console.log(`  - TMDB Episode: "${details.tmdb_episode_details?.name || 'N/A'}"`);
+            console.log(`  - TMDB Episode Air: "${details.tmdb_episode_details?.air_date || 'N/A'}"`);
+            console.log(`  - Xtream Series: "${seriesInfo.name || 'N/A'}"`);
+            console.log(`  - Xtream Episode: "${episodeData.title || 'N/A'}"`);
+            console.log(`  - Final Series: "${seriesTitle}"`);
             console.log(`  - Final Episode: "${safeEpisodeTitle}"`);
+            console.log(`  - Final Year: ${releaseYear}`);
             console.log(`  - Season: ${episodeData.season} -> ${seasonPadded}`);
             console.log(`  - Episode: ${episodeData.episode_num} -> ${episodePadded}`);
             console.log(`  - Final Structure: ${seriesFolderName}/${seasonFolderName}/${episodeFileName}`);
@@ -2912,6 +3015,29 @@ async function processDownloadQueue() {
         
         console.log(`📁 Final Plex Path: ${plexCompatiblePath}`);
         console.log(`🌐 Download URL: ${downloadUrl}`);
+
+        // ✅ DIAGNOSTYKA URL - sprawdź czy URL jest dostępny
+        console.log(`🔍 Testing download URL accessibility...`);
+        try {
+            const headResponse = await axios.head(downloadUrl, { 
+                timeout: 10000,
+                validateStatus: (status) => status < 500 // Akceptuj kody 4xx jako info, ale nie 5xx
+            });
+            console.log(`✅ URL accessible: HTTP ${headResponse.status}`);
+            if (headResponse.headers['content-length']) {
+                console.log(`📏 Content-Length: ${Math.round(headResponse.headers['content-length'] / 1024 / 1024)}MB`);
+            }
+            if (headResponse.headers['content-type']) {
+                console.log(`🎬 Content-Type: ${headResponse.headers['content-type']}`);
+            }
+        } catch (headError) {
+            console.warn(`⚠️ URL test failed: HTTP ${headError.response?.status || 'timeout'} - ${headError.message}`);
+            if (headError.response?.status === 404) {
+                console.error(`❌ CRITICAL: File not found (404). URL may be incorrect or episode unavailable.`);
+            } else if (headError.response?.status === 403) {
+                console.error(`❌ CRITICAL: Access forbidden (403). Check credentials or stream permissions.`);
+            }
+        }
 
         // Użyj download_manager.py do pobrania
         await new Promise((resolve, reject) => {
@@ -2937,7 +3063,26 @@ async function processDownloadQueue() {
                 if (code === 0 || stdoutData.includes('SUCCESS')) {
                     resolve();
                 } else {
-                    reject(new Error(`Download failed with code ${code}. Error: ${stderrData}`));
+                    // ✅ LEPSZA DIAGNOSTYKA BŁĘDÓW CURL
+                    let errorMessage = `Download failed with code ${code}`;
+                    
+                    if (code === 1) {
+                        if (stderrData.includes('curl code 22')) {
+                            errorMessage += ` (HTTP Error - probably 404 or 403)`;
+                        } else if (stderrData.includes('curl code 6')) {
+                            errorMessage += ` (DNS resolution failed)`;
+                        } else if (stderrData.includes('curl code 7')) {
+                            errorMessage += ` (Connection failed)`;
+                        } else if (stderrData.includes('curl code 28')) {
+                            errorMessage += ` (Timeout)`;
+                        }
+                    }
+                    
+                    console.error(`❌ ${errorMessage}`);
+                    console.error(`📋 STDERR: ${stderrData}`);
+                    console.error(`📋 STDOUT: ${stdoutData}`);
+                    
+                    reject(new Error(`${errorMessage}. Details: ${stderrData}`));
                 }
             });
 
