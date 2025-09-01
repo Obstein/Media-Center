@@ -3373,28 +3373,65 @@ app.get('/api/media/details/:type/:id', async (req, res) => {
     }
 });
 
+// Dodaj te endpoint'y do server.js, zastępując istniejący endpoint /api/downloads/archive
+
+// Rozszerzony endpoint archiwum z wyszukiwaniem i sortowaniem
 app.get('/api/downloads/archive', async (req, res) => {
     try {
-        const { page = 1, limit = 50 } = req.query;
+        const { 
+            page = 1, 
+            limit = 50, 
+            search = '', 
+            sort = 'newest',
+            group_by = 'none'
+        } = req.query;
+        
         const offset = (page - 1) * limit;
         
-        // Pobierz zarchiwizowane pobierania
+        // Przygotuj warunki WHERE dla wyszukiwania
+        let whereConditions = ['archived = 1'];
+        let params = [];
+        
+        if (search && search.trim()) {
+            whereConditions.push('(filename LIKE ? OR stream_type LIKE ?)');
+            const searchTerm = `%${search.trim()}%`;
+            params.push(searchTerm, searchTerm);
+        }
+        
+        const whereClause = whereConditions.join(' AND ');
+        
+        // Przygotuj ORDER BY na podstawie sortowania
+        let orderBy = 'added_at DESC'; // domyślnie
+        switch (sort) {
+            case 'oldest':
+                orderBy = 'added_at ASC';
+                break;
+            case 'name':
+                orderBy = 'filename ASC';
+                break;
+            case 'newest':
+            default:
+                orderBy = 'added_at DESC';
+                break;
+        }
+        
+        // Pobierz zarchiwizowane pobierania z wyszukiwaniem
         const archivedDownloads = await dbAll(`
             SELECT 
                 id, stream_id, stream_type, episode_id, filename, filepath,
                 status, worker_status, progress, added_at, archived
             FROM downloads 
-            WHERE archived = 1
-            ORDER BY added_at DESC 
+            WHERE ${whereClause}
+            ORDER BY ${orderBy}
             LIMIT ? OFFSET ?
-        `, [limit, offset]);
+        `, [...params, limit, offset]);
         
-        // Policz total
+        // Policz total z wyszukiwaniem
         const totalResult = await dbAll(`
             SELECT COUNT(*) as total 
             FROM downloads 
-            WHERE archived = 1
-        `);
+            WHERE ${whereClause}
+        `, params);
         
         const total = totalResult[0].total;
         const totalPages = Math.ceil(total / limit);
@@ -3406,11 +3443,311 @@ app.get('/api/downloads/archive', async (req, res) => {
                 totalPages,
                 totalItems: total,
                 itemsPerPage: parseInt(limit)
+            },
+            filters: {
+                search: search || null,
+                sort,
+                group_by
             }
         });
     } catch (error) {
         console.error("Błąd pobierania archiwum:", error);
         res.status(500).json({ error: 'Błąd pobierania archiwum.' });
+    }
+});
+
+
+app.get('/api/downloads/archive/stats', async (req, res) => {
+    try {
+        // Podstawowe statystyki archiwum
+        const basicStats = await dbAll(`
+            SELECT 
+                COUNT(*) as total_archived,
+                COUNT(CASE WHEN stream_type = 'series' THEN 1 END) as series_count,
+                COUNT(CASE WHEN stream_type = 'movie' THEN 1 END) as movie_count,
+                MIN(added_at) as oldest_entry,
+                MAX(added_at) as newest_entry
+            FROM downloads
+            WHERE archived = 1
+        `);
+
+        // Statystyki grup seriali
+        const seriesStats = await dbAll(`
+            SELECT 
+                CASE 
+                    WHEN filename LIKE '%S%E%' THEN 
+                        SUBSTR(filename, 1, 
+                            CASE 
+                                WHEN INSTR(filename, ' - S') > 0 THEN INSTR(filename, ' - S') - 1
+                                ELSE LENGTH(filename)
+                            END
+                        )
+                    ELSE 'Inne'
+                END as series_name,
+                COUNT(*) as episode_count,
+                MIN(added_at) as first_episode,
+                MAX(added_at) as last_episode
+            FROM downloads
+            WHERE archived = 1 AND stream_type = 'series'
+            GROUP BY series_name
+            HAVING episode_count > 1
+            ORDER BY episode_count DESC
+            LIMIT 10
+        `);
+
+        // Statystyki według miesięcy
+        const monthlyStats = await dbAll(`
+            SELECT 
+                strftime('%Y-%m', added_at) as month,
+                COUNT(*) as downloads_count,
+                COUNT(CASE WHEN stream_type = 'series' THEN 1 END) as series_count,
+                COUNT(CASE WHEN stream_type = 'movie' THEN 1 END) as movie_count
+            FROM downloads
+            WHERE archived = 1
+            GROUP BY strftime('%Y-%m', added_at)
+            ORDER BY month DESC
+            LIMIT 12
+        `);
+
+        // Top 5 najpopularniejszych seriali (według liczby odcinków)
+        const topSeries = await dbAll(`
+            SELECT 
+                CASE 
+                    WHEN filename LIKE '%S%E%' THEN 
+                        SUBSTR(filename, 1, 
+                            CASE 
+                                WHEN INSTR(filename, ' - S') > 0 THEN INSTR(filename, ' - S') - 1
+                                ELSE LENGTH(filename)
+                            END
+                        )
+                    ELSE filename
+                END as series_name,
+                COUNT(*) as total_episodes,
+                COUNT(DISTINCT 
+                    CASE 
+                        WHEN filename LIKE '%S%E%' THEN 
+                            SUBSTR(filename, INSTR(filename, ' - S') + 3, 3)
+                        ELSE NULL
+                    END
+                ) as seasons_count,
+                MIN(added_at) as first_download,
+                MAX(added_at) as last_download
+            FROM downloads
+            WHERE archived = 1 AND stream_type = 'series' AND filename LIKE '%S%E%'
+            GROUP BY series_name
+            HAVING total_episodes > 2
+            ORDER BY total_episodes DESC
+            LIMIT 10
+        `);
+
+        res.json({
+            basic: basicStats[0],
+            series_groups: seriesStats,
+            monthly_breakdown: monthlyStats,
+            top_series: topSeries,
+            summary: {
+                total_series: seriesStats.length,
+                avg_episodes_per_series: seriesStats.length > 0 
+                    ? Math.round(seriesStats.reduce((sum, s) => sum + s.episode_count, 0) / seriesStats.length)
+                    : 0
+            }
+        });
+    } catch (error) {
+        console.error("Błąd pobierania statystyk archiwum:", error);
+        res.status(500).json({ error: 'Błąd pobierania statystyk archiwum.' });
+    }
+});
+
+// NOWY: Endpoint do operacji grupowych w archiwum
+app.post('/api/downloads/archive/bulk-action', async (req, res) => {
+    try {
+        const { action, ids, series_name } = req.body;
+        
+        if (!action) {
+            return res.status(400).json({ error: 'Akcja jest wymagana.' });
+        }
+        
+        let affectedRows = 0;
+        
+        switch (action) {
+            case 'delete_selected':
+                if (!ids || !Array.isArray(ids) || ids.length === 0) {
+                    return res.status(400).json({ error: 'Lista ID jest wymagana.' });
+                }
+                
+                // Usuń wybrane pozycje
+                for (const id of ids) {
+                    await dbRun('DELETE FROM download_logs WHERE download_id = ?', [id]);
+                    await dbRun('DELETE FROM downloads WHERE id = ? AND archived = 1', [id]);
+                    affectedRows++;
+                }
+                break;
+                
+            case 'delete_series':
+                if (!series_name) {
+                    return res.status(400).json({ error: 'Nazwa serialu jest wymagana.' });
+                }
+                
+                // Znajdź wszystkie odcinki tego serialu
+                const seriesToDelete = await dbAll(`
+                    SELECT id FROM downloads 
+                    WHERE archived = 1 
+                    AND stream_type = 'series'
+                    AND filename LIKE ?
+                `, [`${series_name}%`]);
+                
+                // Usuń wszystkie odcinki serialu
+                for (const item of seriesToDelete) {
+                    await dbRun('DELETE FROM download_logs WHERE download_id = ?', [item.id]);
+                    await dbRun('DELETE FROM downloads WHERE id = ?', [item.id]);
+                    affectedRows++;
+                }
+                break;
+                
+            case 'delete_old':
+                const { days = 30 } = req.body;
+                const cutoffDate = new Date();
+                cutoffDate.setDate(cutoffDate.getDate() - days);
+                
+                // Znajdź stare pozycje
+                const oldItems = await dbAll(`
+                    SELECT id FROM downloads 
+                    WHERE archived = 1 
+                    AND added_at < ?
+                `, [cutoffDate.toISOString()]);
+                
+                // Usuń stare pozycje
+                for (const item of oldItems) {
+                    await dbRun('DELETE FROM download_logs WHERE download_id = ?', [item.id]);
+                    await dbRun('DELETE FROM downloads WHERE id = ?', [item.id]);
+                    affectedRows++;
+                }
+                break;
+                
+            default:
+                return res.status(400).json({ error: 'Nieznana akcja.' });
+        }
+        
+        res.json({ 
+            message: `Pomyślnie wykonano operację "${action}"`,
+            affected_rows: affectedRows
+        });
+        
+    } catch (error) {
+        console.error("Błąd operacji grupowej:", error);
+        res.status(500).json({ error: 'Błąd wykonania operacji grupowej.' });
+    }
+});
+
+// NOWY: Endpoint do eksportu listy archiwum (np. do CSV)
+app.get('/api/downloads/archive/export', async (req, res) => {
+    try {
+        const { format = 'json' } = req.query;
+        
+        const archiveData = await dbAll(`
+            SELECT 
+                filename,
+                stream_type,
+                added_at,
+                CASE 
+                    WHEN filename LIKE '%S%E%' THEN 
+                        SUBSTR(filename, 1, 
+                            CASE 
+                                WHEN INSTR(filename, ' - S') > 0 THEN INSTR(filename, ' - S') - 1
+                                ELSE LENGTH(filename)
+                            END
+                        )
+                    ELSE 'N/A'
+                END as series_name,
+                CASE 
+                    WHEN filename LIKE '%S%E%' THEN 
+                        SUBSTR(filename, INSTR(filename, ' - S') + 3, 3)
+                    ELSE 'N/A'
+                END as season,
+                CASE 
+                    WHEN filename LIKE '%S%E%' THEN 
+                        SUBSTR(filename, INSTR(filename, 'E') + 1, 2)
+                    ELSE 'N/A'
+                END as episode
+            FROM downloads
+            WHERE archived = 1
+            ORDER BY added_at DESC
+        `);
+        
+        if (format === 'csv') {
+            // Konwersja do CSV
+            const csvHeader = 'filename,stream_type,series_name,season,episode,added_at\n';
+            const csvRows = archiveData.map(row => 
+                `"${row.filename}","${row.stream_type}","${row.series_name}","${row.season}","${row.episode}","${row.added_at}"`
+            ).join('\n');
+            
+            res.setHeader('Content-Type', 'text/csv');
+            res.setHeader('Content-Disposition', 'attachment; filename="download_archive.csv"');
+            res.send(csvHeader + csvRows);
+        } else {
+            // JSON format
+            res.json({
+                export_date: new Date().toISOString(),
+                total_items: archiveData.length,
+                data: archiveData
+            });
+        }
+        
+    } catch (error) {
+        console.error("Błąd eksportu archiwum:", error);
+        res.status(500).json({ error: 'Błąd eksportu danych.' });
+    }
+});
+
+// NOWY: Endpoint do analizy duplikatów w archiwum
+app.get('/api/downloads/archive/duplicates', async (req, res) => {
+    try {
+        const duplicates = await dbAll(`
+            SELECT 
+                filename,
+                COUNT(*) as duplicate_count,
+                GROUP_CONCAT(id) as duplicate_ids,
+                MIN(added_at) as first_download,
+                MAX(added_at) as last_download
+            FROM downloads
+            WHERE archived = 1
+            GROUP BY filename
+            HAVING duplicate_count > 1
+            ORDER BY duplicate_count DESC, filename
+        `);
+        
+        // Szczegółowe informacje o duplikatach
+        const duplicateDetails = [];
+        for (const dup of duplicates) {
+            const details = await dbAll(`
+                SELECT id, filename, added_at, stream_id, episode_id, filepath
+                FROM downloads
+                WHERE archived = 1 AND filename = ?
+                ORDER BY added_at ASC
+            `, [dup.filename]);
+            
+            duplicateDetails.push({
+                filename: dup.filename,
+                count: dup.duplicate_count,
+                total_size_saved: `${dup.duplicate_count - 1} duplicate${dup.duplicate_count > 2 ? 's' : ''}`,
+                downloads: details
+            });
+        }
+        
+        const summary = {
+            total_duplicate_groups: duplicates.length,
+            total_duplicate_files: duplicates.reduce((sum, dup) => sum + dup.duplicate_count, 0),
+            files_that_could_be_removed: duplicates.reduce((sum, dup) => sum + (dup.duplicate_count - 1), 0)
+        };
+        
+        res.json({
+            summary,
+            duplicate_groups: duplicateDetails
+        });
+        
+    } catch (error) {
+        console.error("Błąd analizy duplikatów:", error);
+        res.status(500).json({ error: 'Błąd analizy duplikatów.' });
     }
 });
 

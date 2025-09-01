@@ -661,7 +661,354 @@ const MediaCard = ({ item, isFavorite, onToggleFavorite }) => (
     );
 };
 */
-// Zaktualizowany komponent DownloadWidget
+const ArchiveSeriesManager = ({ isOpen, onClose, onRefresh }) => {
+    const [seriesStats, setSeriesStats] = useState([]);
+    const [duplicates, setDuplicates] = useState([]);
+    const [loading, setLoading] = useState(false);
+    const [activeTab, setActiveTab] = useState('series'); // 'series', 'duplicates', 'cleanup'
+
+    useEffect(() => {
+        if (isOpen) {
+            fetchArchiveStats();
+            fetchDuplicates();
+        }
+    }, [isOpen]);
+
+    const fetchArchiveStats = async () => {
+        setLoading(true);
+        try {
+            const response = await axios.get('/api/downloads/archive/stats');
+            setSeriesStats(response.data.top_series || []);
+        } catch (error) {
+            console.error('Błąd pobierania statystyk:', error);
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    const fetchDuplicates = async () => {
+        try {
+            const response = await axios.get('/api/downloads/archive/duplicates');
+            setDuplicates(response.data.duplicate_groups || []);
+        } catch (error) {
+            console.error('Błąd pobierania duplikatów:', error);
+        }
+    };
+
+    const handleBulkAction = async (action, params = {}) => {
+        if (!window.confirm(`Czy na pewno chcesz wykonać akcję: ${action}?`)) {
+            return;
+        }
+
+        try {
+            await axios.post('/api/downloads/archive/bulk-action', {
+                action,
+                ...params
+            });
+            
+            // Odśwież dane
+            fetchArchiveStats();
+            fetchDuplicates();
+            onRefresh();
+        } catch (error) {
+            console.error('Błąd operacji grupowej:', error);
+            alert('Błąd wykonania operacji.');
+        }
+    };
+
+    const handleDeleteSeries = async (seriesName) => {
+        const episodeCount = seriesStats.find(s => s.series_name === seriesName)?.total_episodes || 0;
+        
+        if (!window.confirm(`Czy na pewno chcesz usunąć wszystkie ${episodeCount} odcinków serialu "${seriesName}" z archiwum?\n\nTo pozwoli systemowi pobrać te odcinki ponownie.`)) {
+            return;
+        }
+
+        await handleBulkAction('delete_series', { series_name: seriesName });
+    };
+
+    const handleExportArchive = async (format = 'json') => {
+        try {
+            const response = await axios.get(`/api/downloads/archive/export?format=${format}`, {
+                responseType: format === 'csv' ? 'blob' : 'json'
+            });
+
+            if (format === 'csv') {
+                // Pobierz CSV jako plik
+                const url = window.URL.createObjectURL(new Blob([response.data]));
+                const link = document.createElement('a');
+                link.href = url;
+                link.setAttribute('download', 'download_archive.csv');
+                document.body.appendChild(link);
+                link.click();
+                link.remove();
+                window.URL.revokeObjectURL(url);
+            } else {
+                // Wyświetl JSON
+                console.log('Archive export:', response.data);
+                alert('Dane zostały wyeksportowane do konsoli przeglądarki (F12)');
+            }
+        } catch (error) {
+            console.error('Błąd eksportu:', error);
+        }
+    };
+
+    if (!isOpen) return null;
+
+    return (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+            <div className="bg-gray-800 rounded-lg p-6 max-w-4xl w-full mx-4 max-h-[80vh] overflow-hidden flex flex-col">
+                <div className="flex justify-between items-center mb-4">
+                    <h3 className="text-xl font-bold text-white">
+                        📊 Zarządzanie Archiwum Pobierania
+                    </h3>
+                    <button
+                        onClick={onClose}
+                        className="text-gray-400 hover:text-white text-2xl"
+                    >
+                        ×
+                    </button>
+                </div>
+
+                {/* Zakładki */}
+                <div className="flex bg-gray-900 rounded-lg p-1 mb-4">
+                    <button
+                        onClick={() => setActiveTab('series')}
+                        className={`flex-1 py-2 px-3 rounded-md text-sm font-medium transition-colors ${
+                            activeTab === 'series'
+                                ? 'bg-gray-700 text-white'
+                                : 'text-gray-400 hover:text-gray-300'
+                        }`}
+                    >
+                        📺 Seriale ({seriesStats.length})
+                    </button>
+                    <button
+                        onClick={() => setActiveTab('duplicates')}
+                        className={`flex-1 py-2 px-3 rounded-md text-sm font-medium transition-colors ${
+                            activeTab === 'duplicates'
+                                ? 'bg-gray-700 text-white'
+                                : 'text-gray-400 hover:text-gray-300'
+                        }`}
+                    >
+                        🔄 Duplikaty ({duplicates.length})
+                    </button>
+                    <button
+                        onClick={() => setActiveTab('cleanup')}
+                        className={`flex-1 py-2 px-3 rounded-md text-sm font-medium transition-colors ${
+                            activeTab === 'cleanup'
+                                ? 'bg-gray-700 text-white'
+                                : 'text-gray-400 hover:text-gray-300'
+                        }`}
+                    >
+                        🧹 Czyszczenie
+                    </button>
+                </div>
+
+                <div className="flex-1 overflow-y-auto">
+                    {loading ? (
+                        <div className="text-center py-8 text-gray-400">
+                            Ładowanie danych archiwum...
+                        </div>
+                    ) : (
+                        <>
+                            {activeTab === 'series' && (
+                                <div className="space-y-3">
+                                    <div className="mb-4 p-3 bg-blue-900/30 rounded">
+                                        <h4 className="font-semibold text-blue-300 mb-2">📈 Top Seriale w Archiwum</h4>
+                                        <p className="text-blue-200 text-sm">
+                                            Lista seriali z największą liczbą pobranych odcinków. 
+                                            Możesz usunąć całe seriale aby pozwolić systemowi pobrać je ponownie.
+                                        </p>
+                                    </div>
+
+                                    {seriesStats.length === 0 ? (
+                                        <div className="text-center py-8 text-gray-400">
+                                            Brak seriali w archiwum
+                                        </div>
+                                    ) : (
+                                        seriesStats.map((series, index) => (
+                                            <div key={index} className="bg-gray-700/50 p-4 rounded border-l-4 border-blue-500">
+                                                <div className="flex justify-between items-start">
+                                                    <div className="flex-1">
+                                                        <h4 className="font-semibold text-white text-lg">
+                                                            {series.series_name}
+                                                        </h4>
+                                                        <div className="text-sm text-gray-400 mt-1 space-y-1">
+                                                            <div>📦 <strong>{series.total_episodes}</strong> odcinków w archiwum</div>
+                                                            <div>📅 <strong>{series.seasons_count}</strong> sezonów</div>
+                                                            <div>🕐 Od {new Date(series.first_download).toLocaleDateString('pl-PL')} do {new Date(series.last_download).toLocaleDateString('pl-PL')}</div>
+                                                        </div>
+                                                    </div>
+                                                    <div className="flex gap-2 ml-4">
+                                                        <button
+                                                            onClick={() => handleDeleteSeries(series.series_name)}
+                                                            className="px-3 py-1 bg-red-600 hover:bg-red-700 text-white rounded text-sm"
+                                                        >
+                                                            🗑️ Usuń Serial
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        ))
+                                    )}
+                                </div>
+                            )}
+
+                            {activeTab === 'duplicates' && (
+                                <div className="space-y-3">
+                                    <div className="mb-4 p-3 bg-orange-900/30 rounded">
+                                        <h4 className="font-semibold text-orange-300 mb-2">🔄 Duplikaty w Archiwum</h4>
+                                        <p className="text-orange-200 text-sm">
+                                            Znalezione duplikaty plików w archiwum. Usunięcie duplikatów może zaoszczędzić miejsce 
+                                            i uporządkować archiwum.
+                                        </p>
+                                    </div>
+
+                                    {duplicates.length === 0 ? (
+                                        <div className="text-center py-8 text-gray-400">
+                                            ✨ Brak duplikatów w archiwum
+                                        </div>
+                                    ) : (
+                                        duplicates.map((duplicate, index) => (
+                                            <div key={index} className="bg-gray-700/50 p-4 rounded border-l-4 border-orange-500">
+                                                <div className="flex justify-between items-start">
+                                                    <div className="flex-1">
+                                                        <h4 className="font-semibold text-white">
+                                                            {duplicate.filename}
+                                                        </h4>
+                                                        <div className="text-sm text-gray-400 mt-1">
+                                                            <div>🔄 <strong>{duplicate.count}</strong> duplikatów</div>
+                                                            <div className="mt-2">
+                                                                <strong>Pobrania:</strong>
+                                                                {duplicate.downloads.map((dl, idx) => (
+                                                                    <div key={idx} className="ml-2 text-xs">
+                                                                        • {new Date(dl.added_at).toLocaleString('pl-PL')} (ID: {dl.id})
+                                                                    </div>
+                                                                ))}
+                                                            </div>
+                                                        </div>
+                                                    </div>
+                                                    <div className="flex gap-2 ml-4">
+                                                        <button
+                                                            onClick={() => handleBulkAction('delete_selected', {
+                                                                ids: duplicate.downloads.slice(1).map(d => d.id) // Zostaw pierwszą kopię
+                                                            })}
+                                                            className="px-3 py-1 bg-orange-600 hover:bg-orange-700 text-white rounded text-sm"
+                                                        >
+                                                            🧹 Usuń Duplikaty ({duplicate.count - 1})
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        ))
+                                    )}
+                                </div>
+                            )}
+
+                            {activeTab === 'cleanup' && (
+                                <div className="space-y-6">
+                                    <div className="mb-4 p-3 bg-green-900/30 rounded">
+                                        <h4 className="font-semibold text-green-300 mb-2">🧹 Narzędzia Czyszczenia</h4>
+                                        <p className="text-green-200 text-sm">
+                                            Narzędzia do masowego czyszczenia i eksportu danych archiwum.
+                                        </p>
+                                    </div>
+
+                                    {/* Czyszczenie według wieku */}
+                                    <div className="bg-gray-700/50 p-4 rounded">
+                                        <h5 className="font-semibold text-white mb-3">📅 Usuń Stare Wpisy</h5>
+                                        <p className="text-gray-300 text-sm mb-3">
+                                            Usuń wszystkie wpisy z archiwum starsze niż określona liczba dni.
+                                        </p>
+                                        <div className="flex gap-2">
+                                            <button
+                                                onClick={() => handleBulkAction('delete_old', { days: 30 })}
+                                                className="px-4 py-2 bg-yellow-600 hover:bg-yellow-700 text-white rounded"
+                                            >
+                                                Usuń starsze niż 30 dni
+                                            </button>
+                                            <button
+                                                onClick={() => handleBulkAction('delete_old', { days: 90 })}
+                                                className="px-4 py-2 bg-orange-600 hover:bg-orange-700 text-white rounded"
+                                            >
+                                                Usuń starsze niż 90 dni
+                                            </button>
+                                            <button
+                                                onClick={() => handleBulkAction('delete_old', { days: 365 })}
+                                                className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded"
+                                            >
+                                                Usuń starsze niż rok
+                                            </button>
+                                        </div>
+                                    </div>
+
+                                    {/* Eksport danych */}
+                                    <div className="bg-gray-700/50 p-4 rounded">
+                                        <h5 className="font-semibold text-white mb-3">📤 Eksport Danych</h5>
+                                        <p className="text-gray-300 text-sm mb-3">
+                                            Wyeksportuj listę archiwum do pliku CSV lub JSON dla analizy zewnętrznej.
+                                        </p>
+                                        <div className="flex gap-2">
+                                            <button
+                                                onClick={() => handleExportArchive('csv')}
+                                                className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded"
+                                            >
+                                                📊 Eksportuj CSV
+                                            </button>
+                                            <button
+                                                onClick={() => handleExportArchive('json')}
+                                                className="px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded"
+                                            >
+                                                📋 Eksportuj JSON
+                                            </button>
+                                        </div>
+                                    </div>
+
+                                    {/* Statystyki szybkie */}
+                                    <div className="bg-gray-700/50 p-4 rounded">
+                                        <h5 className="font-semibold text-white mb-3">📊 Szybkie Statystyki</h5>
+                                        <div className="grid grid-cols-2 gap-4 text-sm">
+                                            <div className="bg-blue-900/50 p-3 rounded">
+                                                <div className="text-blue-300 font-semibold">{seriesStats.length}</div>
+                                                <div className="text-gray-400">Unikalne seriale</div>
+                                            </div>
+                                            <div className="bg-orange-900/50 p-3 rounded">
+                                                <div className="text-orange-300 font-semibold">
+                                                    {duplicates.reduce((sum, dup) => sum + (dup.count - 1), 0)}
+                                                </div>
+                                                <div className="text-gray-400">Duplikaty do usunięcia</div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
+                        </>
+                    )}
+                </div>
+
+                <div className="mt-6 flex justify-end gap-3 pt-4 border-t border-gray-600">
+                    <button
+                        onClick={onClose}
+                        className="px-4 py-2 bg-gray-600 hover:bg-gray-700 text-white rounded"
+                    >
+                        Zamknij
+                    </button>
+                    <button
+                        onClick={() => {
+                            fetchArchiveStats();
+                            fetchDuplicates();
+                            onRefresh();
+                        }}
+                        className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded"
+                    >
+                        🔄 Odśwież
+                    </button>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+// Zaktualizowany komponent DownloadWidget z wyszukiwaniem i grupowaniem
 const DownloadWidget = ({ downloads, onRemove, onClose, isOpen }) => {
     const [statistics, setStatistics] = useState(null);
     const [daemonStatus, setDaemonStatus] = useState(null);
@@ -669,6 +1016,13 @@ const DownloadWidget = ({ downloads, onRemove, onClose, isOpen }) => {
     const [archive, setArchive] = useState([]);
     const [archiveLoading, setArchiveLoading] = useState(false);
     const [archivePagination, setArchivePagination] = useState({ currentPage: 1, totalPages: 1 });
+    const [showArchiveManager, setShowArchiveManager] = useState(false);
+
+    
+    // NOWE: Stany dla wyszukiwania i grupowania
+    const [searchTerm, setSearchTerm] = useState('');
+    const [groupBy, setGroupBy] = useState('none'); // 'none', 'series', 'date', 'status'
+    const [sortBy, setSortBy] = useState('newest'); // 'newest', 'oldest', 'name'
 
     // Pobierz statystyki i status daemon
     useEffect(() => {
@@ -703,7 +1057,12 @@ const DownloadWidget = ({ downloads, onRemove, onClose, isOpen }) => {
         setArchiveLoading(true);
         try {
             const response = await axios.get('/api/downloads/archive', {
-                params: { page, limit: 20 }
+                params: { 
+                    page, 
+                    limit: 50, // Zwiększ limit dla lepszego wyszukiwania
+                    search: searchTerm, // Dodaj wyszukiwanie do API
+                    sort: sortBy
+                }
             });
             setArchive(response.data.downloads);
             setArchivePagination(response.data.pagination);
@@ -712,6 +1071,79 @@ const DownloadWidget = ({ downloads, onRemove, onClose, isOpen }) => {
         } finally {
             setArchiveLoading(false);
         }
+    };
+
+    // NOWA FUNKCJA: Filtrowanie i grupowanie danych
+    const processDownloads = (downloads) => {
+        let filtered = downloads;
+
+        // Filtrowanie po wyszukiwanej frazie
+        if (searchTerm) {
+            filtered = filtered.filter(item => 
+                item.filename?.toLowerCase().includes(searchTerm.toLowerCase()) ||
+                item.stream_type?.toLowerCase().includes(searchTerm.toLowerCase())
+            );
+        }
+
+        // Sortowanie
+        filtered.sort((a, b) => {
+            switch (sortBy) {
+                case 'oldest':
+                    return new Date(a.added_at) - new Date(b.added_at);
+                case 'name':
+                    return (a.filename || '').localeCompare(b.filename || '');
+                case 'newest':
+                default:
+                    return new Date(b.added_at) - new Date(a.added_at);
+            }
+        });
+
+        // Grupowanie
+        if (groupBy === 'none') {
+            return [{ groupName: null, items: filtered }];
+        }
+
+        const groups = {};
+        
+        filtered.forEach(item => {
+            let groupKey;
+            
+            switch (groupBy) {
+                case 'series':
+                    // Wyciągnij nazwę serialu z nazwy pliku
+                    const seriesMatch = item.filename?.match(/^(.+?)\s+-\s+S\d+E\d+/);
+                    groupKey = seriesMatch ? seriesMatch[1] : (item.stream_type === 'movie' ? '🎬 Filmy' : '📺 Inne');
+                    break;
+                    
+                case 'date':
+                    const date = new Date(item.added_at);
+                    groupKey = date.toLocaleDateString('pl-PL', { 
+                        year: 'numeric', 
+                        month: 'long',
+                        day: 'numeric'
+                    });
+                    break;
+                    
+                case 'status':
+                    groupKey = item.worker_status === 'completed' ? '✅ Ukończone' : 
+                              item.worker_status === 'failed' ? '❌ Nieudane' : 
+                              item.worker_status === 'downloading' ? '⏳ W trakcie' : 
+                              '⏸️ W kolejce';
+                    break;
+                    
+                default:
+                    groupKey = 'Wszystkie';
+            }
+            
+            if (!groups[groupKey]) {
+                groups[groupKey] = [];
+            }
+            groups[groupKey].push(item);
+        });
+
+        return Object.entries(groups)
+            .map(([groupName, items]) => ({ groupName, items }))
+            .sort((a, b) => a.groupName.localeCompare(b.groupName));
     };
 
     const handleDeleteFromArchive = async (id, filename) => {
@@ -755,6 +1187,16 @@ const DownloadWidget = ({ downloads, onRemove, onClose, isOpen }) => {
         }
     };
 
+    // Odśwież archiwum gdy zmienia się wyszukiwanie lub sortowanie
+    useEffect(() => {
+        if (activeTab === 'archive') {
+            const timer = setTimeout(() => {
+                fetchArchive(1);
+            }, 300);
+            return () => clearTimeout(timer);
+        }
+    }, [searchTerm, sortBy]);
+
     if (!isOpen) return null;
 
     const getStatusIcon = (status, workerStatus) => {
@@ -788,8 +1230,10 @@ const DownloadWidget = ({ downloads, onRemove, onClose, isOpen }) => {
         }
     };
 
+    const processedDownloads = processDownloads(activeTab === 'active' ? downloads : archive);
+
     return (
-        <div className="fixed bottom-4 right-4 w-96 bg-gray-800 rounded-lg shadow-2xl border border-gray-700 z-50 max-h-[80vh] overflow-hidden flex flex-col">
+        <div className="fixed bottom-4 right-4 w-[480px] bg-gray-800 rounded-lg shadow-2xl border border-gray-700 z-50 max-h-[80vh] overflow-hidden flex flex-col">
             <div className="p-4 flex-shrink-0">
                 <div className="flex justify-between items-center mb-3">
                     <h4 className="font-bold text-lg text-white">Download Manager</h4>
@@ -819,6 +1263,69 @@ const DownloadWidget = ({ downloads, onRemove, onClose, isOpen }) => {
                         Archiwum ({statistics?.statistics?.archived || 0})
                     </button>
                 </div>
+
+                {/* NOWE: Kontrolki wyszukiwania i grupowania dla archiwum */}
+                {activeTab === 'archive' && (
+                    <div className="mb-3 space-y-2">
+                        {/* Wyszukiwanie */}
+                        <div className="relative">
+                            <input
+                                type="text"
+                                placeholder="Szukaj w archiwum..."
+                                value={searchTerm}
+                                onChange={(e) => setSearchTerm(e.target.value)}
+                                className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-1 text-sm text-white placeholder-gray-400 focus:outline-none focus:border-blue-500"
+                            />
+                            {searchTerm && (
+                                <button
+                                    onClick={() => setSearchTerm('')}
+                                    className="absolute right-2 top-1/2 transform -translate-y-1/2 text-gray-400 hover:text-white"
+                                >
+                                    ×
+                                </button>
+                            )}
+                            {activeTab === 'archive' && (
+    <div className="mb-3 flex justify-between items-center">
+        <button
+            onClick={() => setShowArchiveManager(true)}
+            className="px-3 py-1 bg-purple-600 hover:bg-purple-700 text-white rounded text-sm"
+        >
+            📊 Zarządzaj Archiwum
+        </button>
+        <span className="text-xs text-gray-400">
+            {statistics?.statistics?.archived || 0} pozycji w archiwum
+        </span>
+    </div>
+)}
+                        </div>
+
+                        {/* Grupowanie i sortowanie */}
+                        <div className="grid grid-cols-2 gap-2">
+                            <select
+                                value={groupBy}
+                                onChange={(e) => setGroupBy(e.target.value)}
+                                className="bg-gray-700 border border-gray-600 rounded px-2 py-1 text-xs text-white focus:outline-none focus:border-blue-500"
+                            >
+                                <option value="none">Bez grupowania</option>
+                                <option value="series">📺 Grupuj po serialach</option>
+                                <option value="date">📅 Grupuj po datach</option>
+                                <option value="status">🔄 Grupuj po statusie</option>
+                            </select>
+
+                            <select
+                                value={sortBy}
+                                onChange={(e) => setSortBy(e.target.value)}
+                                className="bg-gray-700 border border-gray-600 rounded px-2 py-1 text-xs text-white focus:outline-none focus:border-blue-500"
+                            >
+                                <option value="newest">🕐 Najnowsze</option>
+                                <option value="oldest">🕕 Najstarsze</option>
+                                <option value="name">🔤 Nazwa</option>
+                            </select>
+                        </div>
+                    </div>
+                )}
+
+                
 
                 {/* Status Daemon - tylko dla aktywnych */}
                 {activeTab === 'active' && daemonStatus && (
@@ -924,78 +1431,79 @@ const DownloadWidget = ({ downloads, onRemove, onClose, isOpen }) => {
                                                     {d.error_message}
                                                 </div>
                                             )}
-                                            
-                                            {d.download_url && (
-                                                <div className="text-gray-500 text-xs mt-1 truncate" title={d.download_url}>
-                                                    {new URL(d.download_url).hostname}
-                                                </div>
-                                            )}
                                         </li>
                                     );
                                 })}
                             </ul>
                         )}
+                    </div>
+                ) : (
+                    /* ULEPSZONE ARCHIWUM z grupowaniem */
+                    <div className="px-4 pb-4 h-full overflow-y-auto">
+                        {archiveLoading ? (
+                            <p className="text-gray-400 text-sm text-center py-4">Ładowanie archiwum...</p>
+                        ) : processedDownloads.length === 0 ? (
+                            <p className="text-gray-400 text-sm text-center py-4">
+                                {searchTerm ? `Brak wyników dla "${searchTerm}"` : 'Archiwum jest puste'}
+                            </p>
+                        ) : (
+                            <>
+                                {/* Informacja o wynikach */}
+                                {searchTerm && (
+                                    <div className="mb-3 text-xs text-gray-400 bg-gray-700/30 p-2 rounded">
+                                        📊 Znaleziono {processedDownloads.reduce((sum, group) => sum + group.items.length, 0)} wyników dla "{searchTerm}"
+                                    </div>
+                                )}
 
-                        {/* Ostatnia aktywność */}
-                        {statistics?.recent_activity && statistics.recent_activity.length > 0 && (
-                            <div className="mt-3 pt-3 border-t border-gray-600">
-                                <h5 className="text-xs font-semibold text-gray-400 mb-2">Ostatnia aktywność</h5>
-                                <div className="max-h-20 overflow-y-auto text-xs space-y-1">
-                                    {statistics.recent_activity.slice(0, 5).map((log, idx) => (
-                                        <div key={idx} className="text-gray-500">
-                                            <span className={`
-                                                ${log.level === 'ERROR' ? 'text-red-400' : 
-                                                  log.level === 'SUCCESS' ? 'text-green-400' : 
-                                                  log.level === 'WARNING' ? 'text-yellow-400' : 
-                                                  'text-gray-400'}
-                                            `}>
-                                                {log.level}
-                                            </span>: {log.message.substring(0, 50)}...
+                                <div className="space-y-4">
+                                    {processedDownloads.map((group, groupIndex) => (
+                                        <div key={groupIndex}>
+                                            {/* Nagłówek grupy */}
+                                            {group.groupName && groupBy !== 'none' && (
+                                                <div className="flex items-center justify-between mb-2 pb-1 border-b border-gray-600">
+                                                    <h5 className="text-sm font-semibold text-white">
+                                                        {group.groupName}
+                                                    </h5>
+                                                    <span className="text-xs text-gray-400">
+                                                        {group.items.length} {group.items.length === 1 ? 'pozycja' : 'pozycji'}
+                                                    </span>
+                                                </div>
+                                            )}
+
+                                            {/* Elementy grupy */}
+                                            <div className="space-y-2">
+                                                {group.items.map(d => (
+                                                    <div key={d.id} className="bg-purple-900/20 p-2 rounded border border-purple-700/30">
+                                                        <div className="flex justify-between items-center mb-1">
+                                                            <span className="truncate text-gray-300 flex-1 text-sm">
+                                                                📦 {d.filename}
+                                                            </span>
+                                                            <div className="flex items-center gap-2 ml-2">
+                                                                <span className="text-xs text-purple-400">
+                                                                    {new Date(d.added_at).toLocaleDateString('pl-PL')}
+                                                                </span>
+                                                                <button 
+                                                                    onClick={() => handleDeleteFromArchive(d.id, d.filename)} 
+                                                                    className="text-red-400 hover:text-red-300 text-lg"
+                                                                    title="Usuń z archiwum (pozwoli na ponowne pobranie)"
+                                                                >
+                                                                    🗑️
+                                                                </button>
+                                                            </div>
+                                                        </div>
+                                                        
+                                                        {/* Dodatkowe info dla grupy seriali */}
+                                                        {groupBy === 'series' && d.stream_type === 'series' && (
+                                                            <div className="text-xs text-gray-500">
+                                                                {d.episode_id ? `Odcinek ID: ${d.episode_id}` : 'Serial'}
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                ))}
+                                            </div>
                                         </div>
                                     ))}
                                 </div>
-                            </div>
-                        )}
-                    </div>
-                ) : (
-                    /* Archiwum */
-                    <div className="px-4 pb-4 h-full overflow-y-auto">
-                        <div className="mb-3 text-sm text-gray-400 bg-purple-900/30 p-2 rounded">
-                            📦 Archiwum zawiera ukończone pobierania. Usunięcie pozwoli na ponowne pobranie.
-                        </div>
-
-                        {archiveLoading ? (
-                            <p className="text-gray-400 text-sm text-center py-4">Ładowanie archiwum...</p>
-                        ) : archive.length === 0 ? (
-                            <p className="text-gray-400 text-sm text-center py-4">Archiwum jest puste</p>
-                        ) : (
-                            <>
-                                <ul className="space-y-2 text-sm">
-                                    {archive.map(d => (
-                                        <li key={d.id} className="bg-purple-900/20 p-2 rounded border border-purple-700/30">
-                                            <div className="flex justify-between items-center mb-1">
-                                                <span className="truncate text-gray-300 flex-1">
-                                                    📦 {d.filename}
-                                                </span>
-                                                <div className="flex items-center gap-2 ml-2">
-                                                    <span className="text-xs text-purple-400">
-                                                        Zarchiwizowane
-                                                    </span>
-                                                    <button 
-                                                        onClick={() => handleDeleteFromArchive(d.id, d.filename)} 
-                                                        className="text-red-400 hover:text-red-300 text-lg"
-                                                        title="Usuń z archiwum (pozwoli na ponowne pobranie)"
-                                                    >
-                                                        🗑️
-                                                    </button>
-                                                </div>
-                                            </div>
-                                            <div className="text-xs text-gray-500">
-                                                Pobrano: {new Date(d.added_at).toLocaleDateString()}
-                                            </div>
-                                        </li>
-                                    ))}
-                                </ul>
 
                                 {/* Paginacja archiwum */}
                                 {archivePagination.totalPages > 1 && (
@@ -1024,6 +1532,27 @@ const DownloadWidget = ({ downloads, onRemove, onClose, isOpen }) => {
                     </div>
                 )}
             </div>
+            {showArchiveManager && (
+    <ArchiveSeriesManager
+        isOpen={showArchiveManager}
+        onClose={() => setShowArchiveManager(false)}
+        onRefresh={() => {
+            if (activeTab === 'archive') {
+                fetchArchive(1);
+            }
+            // Odśwież także statystyki
+            const fetchStats = async () => {
+                try {
+                    const statsResponse = await axios.get('/api/downloads/statistics');
+                    setStatistics(statsResponse.data);
+                } catch (error) {
+                    console.error('Błąd odświeżania statystyk:', error);
+                }
+            };
+            fetchStats();
+        }}
+    />
+)}
         </div>
     );
 };
