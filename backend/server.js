@@ -4311,6 +4311,175 @@ function calculateSearchConfidence(originalName, tmdbName) {
     return (matchingWords.length / Math.max(origWords.length, tmdbWords.length)) * 0.8;
 }
 
+// Dodaj ten endpoint do backend/server.js (po istniejących endpointach API)
+
+// Endpoint do przypisywania TMDB ID do media
+app.post('/api/media/:stream_id/:stream_type/assign-tmdb', async (req, res) => {
+    const { stream_id, stream_type } = req.params;
+    const { tmdb_id, playlist_id } = req.body;
+    
+    console.log(`🔗 Przypisywanie TMDB ID ${tmdb_id} do ${stream_type}/${stream_id}`);
+    
+    if (!tmdb_id) {
+        return res.status(400).json({ error: 'TMDB ID jest wymagane.' });
+    }
+    
+    try {
+        // Sprawdź czy media istnieje
+        let mediaQuery = 'SELECT * FROM media WHERE stream_id = ? AND stream_type = ?';
+        let mediaParams = [stream_id, stream_type];
+        
+        if (playlist_id) {
+            mediaQuery += ' AND playlist_id = ?';
+            mediaParams.push(playlist_id);
+        }
+        
+        const existingMedia = await dbAll(mediaQuery, mediaParams);
+        
+        if (existingMedia.length === 0) {
+            return res.status(404).json({ error: 'Media nie znalezione.' });
+        }
+        
+        // Pobierz klucz API TMDB
+        const tmdbApiRows = await dbAll('SELECT value FROM settings WHERE key = ?', ['tmdbApi']);
+        const tmdbApi = tmdbApiRows[0]?.value;
+        
+        if (!tmdbApi) {
+            return res.status(400).json({ error: 'Brak klucza API TMDB w ustawieniach.' });
+        }
+        
+        // Zweryfikuj TMDB ID przez API
+        try {
+            const tmdbType = stream_type === 'series' ? 'tv' : 'movie';
+            const tmdbUrl = `https://api.themoviedb.org/3/${tmdbType}/${tmdb_id}?api_key=${tmdbApi}&language=pl-PL`;
+            
+            console.log(`🎭 Weryfikacja TMDB: ${tmdbUrl}`);
+            const tmdbResponse = await axios.get(tmdbUrl, { timeout: 10000 });
+            
+            if (!tmdbResponse.data || !tmdbResponse.data.id) {
+                return res.status(400).json({ error: 'Nieprawidłowe TMDB ID lub pozycja nie istnieje.' });
+            }
+            
+            console.log(`✅ TMDB weryfikacja OK: "${tmdbResponse.data.title || tmdbResponse.data.name}"`);
+            
+        } catch (tmdbError) {
+            console.error('❌ Błąd weryfikacji TMDB:', tmdbError.message);
+            if (tmdbError.response?.status === 404) {
+                return res.status(400).json({ error: 'TMDB ID nie istnieje.' });
+            }
+            return res.status(500).json({ error: 'Błąd weryfikacji TMDB ID.' });
+        }
+        
+        await dbRun('BEGIN TRANSACTION');
+        
+        try {
+            // Aktualizuj TMDB ID dla media
+            let updateQuery = 'UPDATE media SET tmdb_id = ? WHERE stream_id = ? AND stream_type = ?';
+            let updateParams = [tmdb_id, stream_id, stream_type];
+            
+            if (playlist_id) {
+                updateQuery += ' AND playlist_id = ?';
+                updateParams.push(playlist_id);
+            }
+            
+            const updateResult = await dbRun(updateQuery, updateParams);
+            
+            if (updateResult.changes === 0) {
+                throw new Error('Nie udało się zaktualizować media.');
+            }
+            
+            console.log(`📝 Zaktualizowano ${updateResult.changes} pozycji media`);
+            
+            // Usuń stare gatunki dla tego media (ze wszystkich playlist jeśli nie określono playlist_id)
+            let deleteGenresQuery = `
+                DELETE FROM media_genres 
+                WHERE media_stream_id = ? AND media_stream_type = ?
+            `;
+            let deleteGenresParams = [stream_id, stream_type];
+            
+            // Jeśli playlist_id określone, usuń gatunki tylko dla tego konkretnego media
+            if (playlist_id) {
+                deleteGenresQuery = `
+                    DELETE FROM media_genres 
+                    WHERE media_stream_id = ? AND media_stream_type = ? 
+                    AND EXISTS (
+                        SELECT 1 FROM media m 
+                        WHERE m.stream_id = ? AND m.stream_type = ? AND m.playlist_id = ?
+                    )
+                `;
+                deleteGenresParams = [stream_id, stream_type, stream_id, stream_type, playlist_id];
+            }
+            
+            await dbRun(deleteGenresQuery, deleteGenresParams);
+            console.log(`🗑️ Usunięto stare gatunki dla ${stream_type}/${stream_id}`);
+            
+            // Pobierz i dodaj nowe gatunki z TMDB
+            try {
+                const tmdbType = stream_type === 'series' ? 'tv' : 'movie';
+                const tmdbDetailsUrl = `https://api.themoviedb.org/3/${tmdbType}/${tmdb_id}?api_key=${tmdbApi}&language=pl-PL`;
+                
+                const tmdbDetailsResponse = await axios.get(tmdbDetailsUrl, { timeout: 10000 });
+                const tmdbData = tmdbDetailsResponse.data;
+                
+                if (tmdbData.genres && tmdbData.genres.length > 0) {
+                    console.log(`🎭 Dodawanie ${tmdbData.genres.length} gatunków z TMDB...`);
+                    
+                    const insertGenreStmt = db.prepare('INSERT OR IGNORE INTO genres (id, name) VALUES (?, ?)');
+                    const insertMediaGenreStmt = db.prepare('INSERT OR IGNORE INTO media_genres (media_stream_id, media_stream_type, genre_id) VALUES (?, ?, ?)');
+                    
+                    try {
+                        for (const genre of tmdbData.genres) {
+                            await stmtRun(insertGenreStmt, [genre.id, genre.name]);
+                            await stmtRun(insertMediaGenreStmt, [stream_id, stream_type, genre.id]);
+                        }
+                        
+                        console.log(`✅ Dodano gatunki: ${tmdbData.genres.map(g => g.name).join(', ')}`);
+                    } finally {
+                        insertGenreStmt.finalize();
+                        insertMediaGenreStmt.finalize();
+                    }
+                } else {
+                    // Brak gatunków w TMDB - dodaj domyślny
+                    await dbRun(
+                        'INSERT OR IGNORE INTO media_genres (media_stream_id, media_stream_type, genre_id) VALUES (?, ?, ?)',
+                        [stream_id, stream_type, -1]
+                    );
+                    console.log(`⚠️ Brak gatunków w TMDB - dodano domyślny`);
+                }
+                
+            } catch (genresError) {
+                console.error('❌ Błąd pobierania gatunków z TMDB:', genresError.message);
+                // Dodaj domyślny gatunek przy błędzie
+                await dbRun(
+                    'INSERT OR IGNORE INTO media_genres (media_stream_id, media_stream_type, genre_id) VALUES (?, ?, ?)',
+                    [stream_id, stream_type, -1]
+                );
+            }
+            
+            await dbRun('COMMIT');
+            
+            res.json({
+                message: 'TMDB ID zostało pomyślnie przypisane.',
+                tmdb_id: tmdb_id,
+                media_updated: updateResult.changes
+            });
+            
+            console.log(`🎉 Pomyślnie przypisano TMDB ID ${tmdb_id} do ${stream_type}/${stream_id}`);
+            
+        } catch (transactionError) {
+            await dbRun('ROLLBACK');
+            throw transactionError;
+        }
+        
+    } catch (error) {
+        console.error(`❌ Błąd przypisywania TMDB ID:`, error);
+        res.status(500).json({ 
+            error: 'Nie udało się przypisać TMDB ID.',
+            details: error.message
+        });
+    }
+});
+
 app.listen(PORT, () => {
     console.log(`Serwer backendu działa na porcie ${PORT}`);
     
