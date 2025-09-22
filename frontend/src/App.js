@@ -1557,11 +1557,188 @@ const DownloadWidget = ({ downloads, onRemove, onClose, isOpen }) => {
         </div>
     );
 };
+
+const TMDBAssignmentModal = ({ isOpen, onClose, onAssign, currentItem }) => {
+    const [searchQuery, setSearchQuery] = useState('');
+    const [searchResults, setSearchResults] = useState([]);
+    const [searching, setSearching] = useState(false);
+    const [assigning, setAssigning] = useState(false);
+
+    useEffect(() => {
+        if (isOpen && currentItem) {
+            // Automatyczne wyszukiwanie na podstawie nazwy media
+            setSearchQuery(currentItem.name || '');
+        }
+    }, [isOpen, currentItem]);
+
+    const searchTMDB = React.useCallback(async () => {
+        if (!searchQuery.trim() || searchQuery.length < 2) {
+            setSearchResults([]);
+            return;
+        }
+
+        setSearching(true);
+        try {
+            const mediaType = currentItem?.stream_type === 'series' ? 'tv' : 'movie';
+            const response = await axios.get('/api/tmdb/search', {
+                params: { 
+                    query: searchQuery, 
+                    type: mediaType // Wyszukaj tylko odpowiedni typ
+                }
+            });
+            setSearchResults(response.data.results || []);
+        } catch (error) {
+            console.error('Błąd wyszukiwania TMDB:', error);
+        } finally {
+            setSearching(false);
+        }
+    }, [searchQuery, currentItem]);
+
+    useEffect(() => {
+        const timer = setTimeout(() => {
+            searchTMDB();
+        }, 500);
+        return () => clearTimeout(timer);
+    }, [searchQuery, searchTMDB]);
+
+    const handleAssign = async (tmdbItem) => {
+        setAssigning(true);
+        try {
+            await onAssign(tmdbItem);
+            onClose();
+        } catch (error) {
+            console.error('Błąd przypisywania TMDB ID:', error);
+        } finally {
+            setAssigning(false);
+        }
+    };
+
+    if (!isOpen) return null;
+
+    return (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+            <div className="bg-gray-800 rounded-lg p-6 max-w-2xl w-full mx-4 max-h-[80vh] overflow-hidden flex flex-col">
+                <div className="flex justify-between items-center mb-4">
+                    <h3 className="text-xl font-bold text-white">
+                        Przypisz TMDB ID dla: {currentItem?.name}
+                    </h3>
+                    <button
+                        onClick={onClose}
+                        className="text-gray-400 hover:text-white text-2xl"
+                        disabled={assigning}
+                    >
+                        ×
+                    </button>
+                </div>
+
+                <div className="mb-4">
+                    <div className="flex gap-3">
+                        <input
+                            type="text"
+                            value={searchQuery}
+                            onChange={(e) => setSearchQuery(e.target.value)}
+                            placeholder={`Wyszukaj ${currentItem?.stream_type === 'series' ? 'serial' : 'film'} w TMDB...`}
+                            className="flex-1 bg-gray-700 border border-gray-600 rounded-md p-3 text-white focus:outline-none focus:ring-2 focus:ring-red-500"
+                            disabled={assigning}
+                        />
+                        <button
+                            onClick={searchTMDB}
+                            disabled={searching || assigning}
+                            className="bg-red-600 hover:bg-red-700 disabled:bg-red-800 text-white font-bold py-3 px-6 rounded-lg transition duration-300"
+                        >
+                            {searching ? 'Szukam...' : 'Szukaj'}
+                        </button>
+                    </div>
+                </div>
+
+                <div className="flex-1 overflow-y-auto space-y-3">
+                    {searchResults.length === 0 && searchQuery.length >= 2 && !searching ? (
+                        <div className="bg-gray-700 rounded-lg p-6 text-center text-gray-400">
+                            Brak wyników dla "{searchQuery}"
+                        </div>
+                    ) : (
+                        searchResults.map((item) => (
+                            <div key={item.id} className="bg-gray-700 rounded-lg p-4 border border-gray-600">
+                                <div className="flex gap-3">
+                                    <div className="w-16 h-24 flex-shrink-0">
+                                        <img
+                                            src={item.poster_path ? 
+                                                `https://image.tmdb.org/t/p/w200${item.poster_path}` : 
+                                                'https://placehold.co/200x300/1f2937/ffffff?text=No+Image'
+                                            }
+                                            alt={item.title || item.name}
+                                            className="w-full h-full object-cover rounded"
+                                        />
+                                    </div>
+                                    
+                                    <div className="flex-1 min-w-0">
+                                        <h4 className="font-semibold text-white truncate">
+                                            {item.title || item.name}
+                                        </h4>
+                                        
+                                        {item.original_title && item.original_title !== (item.title || item.name) && (
+                                            <p className="text-sm text-gray-400 truncate">
+                                                Oryginalny: {item.original_title || item.original_name}
+                                            </p>
+                                        )}
+                                        
+                                        <div className="text-sm text-gray-400 mb-2">
+                                            <span>TMDB ID: {item.id}</span>
+                                            {(item.release_date || item.first_air_date) && (
+                                                <span className="ml-2">
+                                                    ({new Date(item.release_date || item.first_air_date).getFullYear()})
+                                                </span>
+                                            )}
+                                            {item.vote_average > 0 && (
+                                                <span className="ml-2">⭐ {item.vote_average.toFixed(1)}</span>
+                                            )}
+                                        </div>
+                                        
+                                        {item.overview && (
+                                            <p className="text-gray-300 text-sm leading-tight line-clamp-2">
+                                                {item.overview.length > 150 ? 
+                                                    `${item.overview.substring(0, 150)}...` : 
+                                                    item.overview
+                                                }
+                                            </p>
+                                        )}
+                                    </div>
+                                    
+                                    <div className="flex flex-col justify-between">
+                                        <button
+                                            onClick={() => handleAssign(item)}
+                                            disabled={assigning}
+                                            className="px-4 py-2 bg-green-600 hover:bg-green-700 disabled:bg-green-800 text-white rounded text-sm transition-colors"
+                                        >
+                                            {assigning ? '...' : '✓ Przypisz'}
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        ))
+                    )}
+                </div>
+
+                <div className="mt-4 flex justify-end gap-3 pt-4 border-t border-gray-600">
+                    <button
+                        onClick={onClose}
+                        disabled={assigning}
+                        className="px-4 py-2 bg-gray-600 hover:bg-gray-700 disabled:bg-gray-800 text-white rounded transition-colors"
+                    >
+                        Anuluj
+                    </button>
+                </div>
+            </div>
+        </div>
+    );
+};
 // --- Komponent Widoku Szczegółów ---
 const DetailsView = ({ type, id, favorites, onToggleFavorite, onDownload }) => {
     const [details, setDetails] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
+    const [showTMDBModal, setShowTMDBModal] = useState(false);
+    const [updating, setUpdating] = useState(false);
 
     const isFavorite = favorites.has(`${id}_${type}`);
 
@@ -1610,6 +1787,28 @@ const DetailsView = ({ type, id, favorites, onToggleFavorite, onDownload }) => {
         onDownload(details.stream_id, 'series', episodesToDownload);
     };
 
+    const handleAssignTMDB = async (tmdbItem) => {
+        setUpdating(true);
+        try {
+            // Wyślij zapytanie do backend aby zaktualizować TMDB ID
+            await axios.post(`/api/media/${details.stream_id}/${details.stream_type}/assign-tmdb`, {
+                tmdb_id: tmdbItem.id,
+                playlist_id: details.playlist_id
+            });
+            
+            // Odśwież szczegóły aby pobrać nowe dane TMDB
+            const response = await axios.get(`/api/media/details/${type}/${id}`);
+            setDetails(response.data);
+            
+            console.log(`✅ Przypisano TMDB ID ${tmdbItem.id} do ${details.name}`);
+        } catch (error) {
+            console.error('Błąd przypisywania TMDB ID:', error);
+            throw error;
+        } finally {
+            setUpdating(false);
+        }
+    };
+
     if (loading) return <p className="text-center text-gray-400">Ładowanie szczegółów...</p>;
     if (error) return <p className="text-center text-red-400">{error}</p>;
     if (!details) return null;
@@ -1632,13 +1831,54 @@ const DetailsView = ({ type, id, favorites, onToggleFavorite, onDownload }) => {
                     <img src={imageProxy(details.stream_icon)} alt={`Okładka ${details.name}`} className="rounded-lg shadow-lg w-full" />
                 </div>
                 <div className="md:w-2/3 lg:w-3/4">
-                    <h2 className="text-4xl font-bold">{tmdb?.title || tmdb?.name || details.name}</h2>
-                    <div className="flex items-center my-2 text-lg text-gray-400 flex-wrap">
-                        {releaseYear && <span>{releaseYear}</span>}
-                        {genres && <span className="mx-2">&bull;</span>}
-                        <span>{genres}</span>
+                    <div className="flex items-start justify-between mb-4">
+                        <div className="flex-1">
+                            <h2 className="text-4xl font-bold">{tmdb?.title || tmdb?.name || details.name}</h2>
+                            <div className="flex items-center my-2 text-lg text-gray-400 flex-wrap">
+                                {releaseYear && <span>{releaseYear}</span>}
+                                {genres && <span className="mx-2">&bull;</span>}
+                                <span>{genres}</span>
+                            </div>
+                        </div>
+                        
+                        {/* NOWA SEKCJA: Info o TMDB i przycisk przypisania */}
+                        <div className="ml-4 text-right">
+                            {details.tmdb_id ? (
+                                <div className="mb-2">
+                                    <div className="text-sm text-green-400 mb-1">✅ TMDB ID przypisany</div>
+                                    <div className="text-xs text-gray-400">ID: {details.tmdb_id}</div>
+                                    <button
+                                        onClick={() => setShowTMDBModal(true)}
+                                        disabled={updating}
+                                        className="text-xs text-blue-400 hover:text-blue-300 underline mt-1"
+                                    >
+                                        Zmień przypisanie
+                                    </button>
+                                </div>
+                            ) : (
+                                <div className="mb-2">
+                                    <div className="text-sm text-yellow-400 mb-1">⚠️ Brak TMDB ID</div>
+                                    <button
+                                        onClick={() => setShowTMDBModal(true)}
+                                        disabled={updating}
+                                        className="px-3 py-1 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-800 text-white rounded text-sm transition-colors"
+                                    >
+                                        {updating ? 'Aktualizacja...' : '🔗 Przypisz TMDB'}
+                                    </button>
+                                </div>
+                            )}
+                            
+                            {/* Info o playliście */}
+                            {details.playlist_name && (
+                                <div className="text-xs text-gray-500">
+                                    📺 {details.playlist_name}
+                                </div>
+                            )}
+                        </div>
                     </div>
+                    
                     <p className="text-gray-300 mt-4">{plot}</p>
+                    
                     <div className="flex items-center gap-4 mt-6">
                         <button onClick={() => onToggleFavorite(details)} className={`inline-flex items-center gap-2 px-4 py-2 rounded-lg font-semibold transition-colors ${isFavorite ? 'bg-red-600 hover:bg-red-700 text-white' : 'bg-gray-600 hover:bg-gray-500 text-gray-200'}`}>
                             <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
@@ -1697,6 +1937,14 @@ const DetailsView = ({ type, id, favorites, onToggleFavorite, onDownload }) => {
                     ))}
                 </div>
             )}
+
+            {/* Modal przypisania TMDB */}
+            <TMDBAssignmentModal
+                isOpen={showTMDBModal}
+                onClose={() => setShowTMDBModal(false)}
+                onAssign={handleAssignTMDB}
+                currentItem={details}
+            />
         </div>
     );
 };

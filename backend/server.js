@@ -1530,14 +1530,14 @@ app.post('/api/media/refresh', async (req, res) => {
 // --- API POBIERANIA ---
 app.get('/api/downloads/status', async (req, res) => {
     try {
-        // Pobierz z bazy danych z dodatkowymi kolumnami, POMIJAJĄC ZARCHIWIZOWANE
+        // ✅ POPRAWKA: Pobierz tylko niezarchiwizowane pobierania
         const downloads = await dbAll(`
             SELECT 
                 id, stream_id, stream_type, episode_id, filename, filepath,
                 status, worker_status, progress, error_message, download_url,
                 added_at, archived
             FROM downloads 
-            WHERE archived = 0 OR archived IS NULL
+            WHERE (archived = 0 OR archived IS NULL)
             ORDER BY added_at DESC 
             LIMIT 50
         `);
@@ -1568,6 +1568,36 @@ app.get('/api/downloads/status', async (req, res) => {
         res.status(500).json({ error: 'Błąd pobierania statusu.' });
     }
 });
+
+async function archiveOldCompletedDownloads() {
+    try {
+        console.log('🗂️ Archiwizacja starych ukończonych pobierań...');
+        
+        // Znajdź wszystkie ukończone zadania które nie są jeszcze zarchiwizowane
+        const unarchived = await dbAll(`
+            SELECT id, filename FROM downloads 
+            WHERE worker_status = 'completed' 
+            AND (archived = 0 OR archived IS NULL)
+        `);
+        
+        if (unarchived.length > 0) {
+            // Archiwizuj je
+            await dbRun(`
+                UPDATE downloads 
+                SET archived = 1 
+                WHERE worker_status = 'completed' 
+                AND (archived = 0 OR archived IS NULL)
+            `);
+            
+            console.log(`📦 Zarchiwizowano ${unarchived.length} ukończonych pobierań`);
+        } else {
+            console.log('✅ Wszystkie ukończone pobierania są już zarchiwizowane');
+        }
+        
+    } catch (error) {
+        console.error('❌ Błąd archiwizacji:', error);
+    }
+}
 
 // Nowy endpoint do statystyk download managera
 app.get('/api/downloads/statistics', async (req, res) => {
@@ -1694,33 +1724,34 @@ app.post('/api/downloads/start', async (req, res) => {
 app.post('/api/downloads/remove/:id', async (req, res) => {
     const { id } = req.params;
     try {
-        // Anuluj aktywne pobieranie, jeśli istnieje
-        if (activeDownloads.has(parseInt(id))) {
-            console.log(`Anulowanie aktywnego pobierania dla zadania ID: ${id}`);
-            activeDownloads.get(parseInt(id)).kill('SIGKILL');
-            activeDownloads.delete(parseInt(id));
-        }
+        // Sprawdź czy wpis istnieje
+        const downloadJob = await dbAll('SELECT * FROM downloads WHERE id = ?', [id]);
         
-        // Usuń z kolejki w pamięci
-        downloadQueue = downloadQueue.filter(job => job.id != id);
-
-        // Pobierz informacje o zadaniu z bazy danych
-        const jobToDelete = await dbAll('SELECT * FROM downloads WHERE id = ?', [id]);
-        
-        if (jobToDelete.length === 0) {
+        if (downloadJob.length === 0) {
             return res.status(404).json({ error: 'Zadanie nie znalezione.' });
         }
 
-        const job = jobToDelete[0];
+        const job = downloadJob[0];
         
-        // NOWA LOGIKA: Sprawdź status zadania
+        // ✅ NOWA LOGIKA: Ukończone zadania są już zarchiwizowane automatycznie
         if (job.worker_status === 'completed') {
-            // Dla ukończonych - tylko archiwizuj
-            await dbRun('UPDATE downloads SET archived = 1 WHERE id = ?', [id]);
-            console.log(`📦 Zarchiwizowano ukończone pobieranie: ${job.filename}`);
-            res.status(200).json({ message: 'Pobieranie zostało zarchiwizowane.', action: 'archived' });
+            // Ukończone są już w archiwum (archived = 1), nie rób nic więcej
+            console.log(`📦 Zadanie ${id} jest już zarchiwizowane: ${job.filename}`);
+            res.status(200).json({ 
+                message: 'Zadanie jest już w archiwum.', 
+                action: 'already_archived' 
+            });
         } else {
-            // Dla nieukończonych - usuń fizycznie (jak wcześniej)
+            // Anuluj aktywne pobieranie, jeśli istnieje
+            if (activeDownloads.has(parseInt(id))) {
+                console.log(`Anulowanie aktywnego pobierania dla zadania ID: ${id}`);
+                activeDownloads.get(parseInt(id)).kill('SIGKILL');
+                activeDownloads.delete(parseInt(id));
+            }
+            
+            // Usuń z kolejki w pamięci
+            downloadQueue = downloadQueue.filter(job => job.id != id);
+
             // Sprawdź, czy zadanie nie zostało w pełni pobrane i usuń plik
             if (job.filepath && fs.existsSync(job.filepath)) {
                 console.log(`Usuwanie niekompletnego pliku: ${job.filepath}`);
@@ -2598,6 +2629,7 @@ app.get('/api/tmdb/search', async (req, res) => {
 });
 
 // Pełna funkcja processDownloadQueue z poprawkami nazewnictwa Plex i TMDB
+// Pełna funkcja processDownloadQueue z poprawkami nazewnictwa Plex i TMDB oraz automatyczną archiwizacją
 async function processDownloadQueue() {
     if (isProcessing || downloadQueue.length === 0) {
         return;
@@ -3037,10 +3069,10 @@ async function processDownloadQueue() {
             });
         });
 
-        // Oznacz jako ukończone
-        await dbRun('UPDATE downloads SET status = ?, worker_status = ?, progress = 100 WHERE id = ?', 
+        // ✅ POPRAWKA: Oznacz jako ukończone I automatycznie archiwizuj
+        await dbRun('UPDATE downloads SET status = ?, worker_status = ?, progress = 100, archived = 1 WHERE id = ?', 
                     ['completed', 'completed', downloadJob.id]);
-        console.log(`✅ Download completed for job ${downloadJob.id}: ${finalFileName}`);
+        console.log(`✅ Download completed and automatically archived for job ${downloadJob.id}: ${finalFileName}`);
 
     } catch (error) {
         console.error(`❌ Błąd przetwarzania zadania ${job.id}:`, error);
@@ -3053,6 +3085,27 @@ async function processDownloadQueue() {
         setTimeout(processDownloadQueue, 1000);
     }
 }
+
+// Poprawiona funkcja handleRemoveDownload w frontend/src/App.js
+const handleRemoveDownload = async (id) => {
+    try {
+        // Sprawdź status zadania przed usunięciem
+        const downloadToRemove = downloads.find(d => d.id === parseInt(id));
+        
+        if (downloadToRemove && downloadToRemove.worker_status === 'completed') {
+            // Dla ukończonych - już są zarchiwizowane automatycznie, po prostu usuń z widoku
+            console.log(`Ukończone pobieranie ${downloadToRemove.filename} zostało automatycznie zarchiwizowane`);
+        } else {
+            // Dla nieukończonych - wyślij zapytanie do backend
+            await axios.post(`/api/downloads/remove/${id}`);
+        }
+        
+        // Usuń z lokalnego stanu (z widoku aktywnych)
+        setDownloads(prev => prev.filter(d => d.id !== parseInt(id)));
+    } catch (error) {
+        console.error("Błąd podczas usuwania zadania", error);
+    }
+};
 
 async function monitorFavorites() {
     console.log('Uruchamianie zadania monitorowania ulubionych...');
@@ -3984,6 +4037,279 @@ app.delete('/api/downloads/archive/:id', async (req, res) => {
         res.status(500).json({ error: 'Błąd usuwania z archiwum.' });
     }
 });
+
+// Endpoint do usuwania przypisania TMDB ID (opcjonalny)
+app.delete('/api/media/:stream_id/:stream_type/remove-tmdb', async (req, res) => {
+    const { stream_id, stream_type } = req.params;
+    const { playlist_id } = req.query;
+    
+    console.log(`🗑️ Usuwanie przypisania TMDB ID dla ${stream_type}/${stream_id}`);
+    
+    try {
+        let updateQuery = 'UPDATE media SET tmdb_id = NULL WHERE stream_id = ? AND stream_type = ?';
+        let updateParams = [stream_id, stream_type];
+        
+        if (playlist_id) {
+            updateQuery += ' AND playlist_id = ?';
+            updateParams.push(playlist_id);
+        }
+        
+        const updateResult = await dbRun(updateQuery, updateParams);
+        
+        if (updateResult.changes === 0) {
+            return res.status(404).json({ error: 'Media nie znalezione.' });
+        }
+        
+        // Usuń gatunki przypisane z TMDB (zachowaj tylko domyślny jeśli nie ma innych)
+        const mediaWithSameId = await dbAll(`
+            SELECT COUNT(*) as count FROM media 
+            WHERE stream_id = ? AND stream_type = ?
+        `, [stream_id, stream_type]);
+        
+        if (mediaWithSameId[0].count === 1) {
+            // Usuń wszystkie gatunki i dodaj domyślny "brak gatunku"
+            await dbRun(`
+                DELETE FROM media_genres 
+                WHERE media_stream_id = ? AND media_stream_type = ?
+            `, [stream_id, stream_type]);
+            
+            await dbRun(`
+                INSERT OR IGNORE INTO media_genres (media_stream_id, media_stream_type, genre_id) 
+                VALUES (?, ?, ?)
+            `, [stream_id, stream_type, -1]);
+        }
+        
+        res.json({
+            message: 'Przypisanie TMDB ID zostało usunięte.',
+            media_updated: updateResult.changes
+        });
+        
+        console.log(`✅ Usunięto przypisanie TMDB ID dla ${stream_type}/${stream_id}`);
+        
+    } catch (error) {
+        console.error(`❌ Błąd usuwania przypisania TMDB ID:`, error);
+        res.status(500).json({ 
+            error: 'Nie udało się usunąć przypisania TMDB ID.' 
+        });
+    }
+});
+
+// Endpoint do pobierania listy media bez TMDB ID (pomocniczy dla adminów)
+app.get('/api/media/without-tmdb', async (req, res) => {
+    try {
+        const { limit = 50, playlist_id } = req.query;
+        
+        let query = `
+            SELECT m.*, p.name as playlist_name, COUNT(mg.genre_id) as genre_count
+            FROM media m
+            LEFT JOIN playlists p ON m.playlist_id = p.id
+            LEFT JOIN media_genres mg ON m.stream_id = mg.media_stream_id AND m.stream_type = mg.media_stream_type
+            WHERE (m.tmdb_id IS NULL OR m.tmdb_id = '')
+        `;
+        
+        let params = [];
+        
+        if (playlist_id && playlist_id !== 'all') {
+            query += ' AND m.playlist_id = ?';
+            params.push(playlist_id);
+        }
+        
+        query += `
+            GROUP BY m.stream_id, m.stream_type, m.playlist_id
+            ORDER BY m.name ASC
+            LIMIT ?
+        `;
+        
+        params.push(parseInt(limit));
+        
+        const mediaWithoutTMDB = await dbAll(query, params);
+        
+        // Statystyki
+        let statsQuery = `
+            SELECT 
+                COUNT(*) as total_without_tmdb,
+                COUNT(CASE WHEN m.stream_type = 'movie' THEN 1 END) as movies_without_tmdb,
+                COUNT(CASE WHEN m.stream_type = 'series' THEN 1 END) as series_without_tmdb
+            FROM media m
+            WHERE (m.tmdb_id IS NULL OR m.tmdb_id = '')
+        `;
+        
+        let statsParams = [];
+        
+        if (playlist_id && playlist_id !== 'all') {
+            statsQuery += ' AND m.playlist_id = ?';
+            statsParams.push(playlist_id);
+        }
+        
+        const stats = await dbAll(statsQuery, statsParams);
+        
+        res.json({
+            media: mediaWithoutTMDB,
+            statistics: stats[0],
+            showing: mediaWithoutTMDB.length,
+            total: stats[0].total_without_tmdb
+        });
+        
+    } catch (error) {
+        console.error('Błąd pobierania media bez TMDB ID:', error);
+        res.status(500).json({ error: 'Nie udało się pobrać listy media.' });
+    }
+});
+
+// Endpoint do masowego przypisywania TMDB ID na podstawie automatycznego wyszukiwania
+app.post('/api/media/auto-assign-tmdb', async (req, res) => {
+    try {
+        const { limit = 10, playlist_id } = req.body;
+        
+        // Pobierz klucz API TMDB
+        const tmdbApiRows = await dbAll('SELECT value FROM settings WHERE key = ?', ['tmdbApi']);
+        const tmdbApi = tmdbApiRows[0]?.value;
+        
+        if (!tmdbApi) {
+            return res.status(400).json({ error: 'Brak klucza API TMDB w ustawieniach.' });
+        }
+        
+        // Pobierz media bez TMDB ID
+        let query = `
+            SELECT m.*, p.name as playlist_name
+            FROM media m
+            LEFT JOIN playlists p ON m.playlist_id = p.id
+            WHERE (m.tmdb_id IS NULL OR m.tmdb_id = '')
+        `;
+        
+        let params = [];
+        
+        if (playlist_id && playlist_id !== 'all') {
+            query += ' AND m.playlist_id = ?';
+            params.push(playlist_id);
+        }
+        
+        query += ' ORDER BY m.name ASC LIMIT ?';
+        params.push(parseInt(limit));
+        
+        const mediaToProcess = await dbAll(query, params);
+        
+        if (mediaToProcess.length === 0) {
+            return res.json({
+                message: 'Brak media do przetworzenia.',
+                processed: 0,
+                total: 0
+            });
+        }
+        
+        console.log(`🤖 Auto-przypisywanie TMDB ID dla ${mediaToProcess.length} pozycji...`);
+        
+        let processed = 0;
+        let assigned = 0;
+        let errors = 0;
+        
+        for (const media of mediaToProcess) {
+            try {
+                processed++;
+                
+                // Przygotuj zapytanie wyszukiwania
+                let searchQuery = media.name;
+                
+                // Usuń typowe prefiksy i sufiksy
+                searchQuery = searchQuery.replace(/^(PL|EN|US|DE|FR)\s*[-\s]*/i, '').trim();
+                searchQuery = searchQuery.replace(/\s*\(?\d{4}\)?\s*$/, '').trim();
+                searchQuery = searchQuery.replace(/\s*[-\s]*S\d+.*$/i, '').trim();
+                
+                const mediaType = media.stream_type === 'series' ? 'tv' : 'movie';
+                
+                console.log(`🔍 Szukam "${searchQuery}" jako ${mediaType}...`);
+                
+                // Wyszukaj w TMDB
+                const searchUrl = `https://api.themoviedb.org/3/search/${mediaType}?api_key=${tmdbApi}&language=pl-PL&query=${encodeURIComponent(searchQuery)}`;
+                const searchResponse = await axios.get(searchUrl, { timeout: 10000 });
+                
+                if (searchResponse.data.results && searchResponse.data.results.length > 0) {
+                    // Weź pierwszy wynik (najlepsze dopasowanie)
+                    const bestMatch = searchResponse.data.results[0];
+                    const confidence = calculateSearchConfidence(media.name, bestMatch.title || bestMatch.name);
+                    
+                    // Przypisz tylko jeśli pewność > 80%
+                    if (confidence > 0.8) {
+                        await dbRun(`
+                            UPDATE media 
+                            SET tmdb_id = ? 
+                            WHERE stream_id = ? AND stream_type = ? AND playlist_id = ?
+                        `, [bestMatch.id, media.stream_id, media.stream_type, media.playlist_id]);
+                        
+                        assigned++;
+                        console.log(`✅ Przypisano TMDB ID ${bestMatch.id} do "${media.name}" (pewność: ${Math.round(confidence * 100)}%)`);
+                    } else {
+                        console.log(`⚠️ Pominięto "${media.name}" - niska pewność: ${Math.round(confidence * 100)}%`);
+                    }
+                } else {
+                    console.log(`❓ Brak wyników dla "${searchQuery}"`);
+                }
+                
+                // Opóźnienie aby nie przeciążyć TMDB API
+                await new Promise(resolve => setTimeout(resolve, 250));
+                
+            } catch (itemError) {
+                errors++;
+                console.error(`❌ Błąd przetwarzania "${media.name}":`, itemError.message);
+            }
+        }
+        
+        const summary = `Auto-przypisywanie zakończone. Przetworzono: ${processed}, Przypisano: ${assigned}, Błędy: ${errors}`;
+        console.log(summary);
+        
+        res.json({
+            message: summary,
+            processed: processed,
+            assigned: assigned,
+            errors: errors,
+            total: mediaToProcess.length
+        });
+        
+    } catch (error) {
+        console.error('Błąd auto-przypisywania TMDB ID:', error);
+        res.status(500).json({ error: 'Błąd auto-przypisywania TMDB ID.' });
+    }
+});
+
+// Funkcja pomocnicza do obliczania pewności wyszukiwania
+function calculateSearchConfidence(originalName, tmdbName) {
+    if (!originalName || !tmdbName) return 0;
+    
+    const orig = originalName.toLowerCase().trim();
+    const tmdb = tmdbName.toLowerCase().trim();
+    
+    // Dokładne dopasowanie
+    if (orig === tmdb) return 1.0;
+    
+    // Usuń znaki specjalne i porównaj
+    const cleanOrig = orig.replace(/[^\w\s]/g, '').replace(/\s+/g, ' ').trim();
+    const cleanTmdb = tmdb.replace(/[^\w\s]/g, '').replace(/\s+/g, ' ').trim();
+    
+    if (cleanOrig === cleanTmdb) return 0.95;
+    
+    // Sprawdź czy jedno zawiera drugie
+    if (cleanOrig.includes(cleanTmdb) || cleanTmdb.includes(cleanOrig)) {
+        const shorter = cleanOrig.length < cleanTmdb.length ? cleanOrig : cleanTmdb;
+        const longer = cleanOrig.length >= cleanTmdb.length ? cleanOrig : cleanTmdb;
+        return (shorter.length / longer.length) * 0.9;
+    }
+    
+    // Podobieństwo słów
+    const origWords = cleanOrig.split(' ').filter(w => w.length > 2);
+    const tmdbWords = cleanTmdb.split(' ').filter(w => w.length > 2);
+    
+    if (origWords.length === 0 || tmdbWords.length === 0) return 0;
+    
+    const matchingWords = origWords.filter(word => 
+        tmdbWords.some(tmdbWord => 
+            word === tmdbWord || 
+            word.includes(tmdbWord) || 
+            tmdbWord.includes(word)
+        )
+    );
+    
+    return (matchingWords.length / Math.max(origWords.length, tmdbWords.length)) * 0.8;
+}
 
 app.listen(PORT, () => {
     console.log(`Serwer backendu działa na porcie ${PORT}`);
