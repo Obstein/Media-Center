@@ -615,28 +615,32 @@ const PlaylistManager = () => {
     const [editingPlaylist, setEditingPlaylist] = useState(null);
     const [message, setMessage] = useState('');
     const [overview, setOverview] = useState(null);
-    const [syncing, setSyncing] = useState({ all: false, single: {} }); // NOWE: Stan synchronizacji
+    const [syncing, setSyncing] = useState({ all: false, single: {} });
     const [showFilterEditor, setShowFilterEditor] = useState(false);
-const [editingPlaylistForFilters, setEditingPlaylistForFilters] = useState(null);
+    const [editingPlaylistForFilters, setEditingPlaylistForFilters] = useState(null);
 
-const handleEditFilters = (playlist) => {
-    setEditingPlaylistForFilters(playlist);
-    setShowFilterEditor(true);
-};
+    // Funkcja do obsługi edycji filtrów
+    const handleEditFilters = (playlist) => {
+        setEditingPlaylistForFilters(playlist);
+        setShowFilterEditor(true);
+    };
 
-const handleSaveFilters = async (filters) => {
-    try {
-        await axios.put(`/api/playlists/${editingPlaylistForFilters.id}`, filters);
-        setMessage('Filtry synchronizacji zostały zapisane.');
-        await fetchPlaylists();
-        setShowFilterEditor(false);
-        setEditingPlaylistForFilters(null);
-        setTimeout(() => setMessage(''), 3000);
-    } catch (error) {
-        console.error('Błąd zapisywania filtrów:', error);
-        setMessage('Błąd zapisywania filtrów.');
-    }
-};
+    // Funkcja do zapisywania filtrów
+    const handleSaveFilters = async (filters) => {
+        try {
+            await axios.put(`/api/playlists/${editingPlaylistForFilters.id}`, {
+                ...filters
+            });
+            setMessage('Filtry synchronizacji zostały zapisane.');
+            await fetchPlaylists();
+            setShowFilterEditor(false);
+            setEditingPlaylistForFilters(null);
+            setTimeout(() => setMessage(''), 3000);
+        } catch (error) {
+            console.error('Błąd zapisywania filtrów:', error);
+            setMessage('Błąd zapisywania filtrów.');
+        }
+    };
 
     // Pobierz playlisty
     const fetchPlaylists = async () => {
@@ -673,7 +677,7 @@ const handleSaveFilters = async (filters) => {
         try {
             if (editingPlaylist) {
                 // Edytuj istniejącą
-                await axios.post(`/api/playlists/${editingPlaylist.id}`, formData);
+                await axios.put(`/api/playlists/${editingPlaylist.id}`, formData);
                 setMessage('Playlista została zaktualizowana.');
             } else {
                 // Dodaj nową
@@ -723,7 +727,7 @@ const handleSaveFilters = async (filters) => {
         }
     };
 
-    // NOWE: Synchronizuj pojedynczą playlistę
+    // Synchronizuj pojedynczą playlistę
     const handleSyncPlaylist = async (id) => {
         setSyncing(prev => ({ ...prev, single: { ...prev.single, [id]: true } }));
         
@@ -741,7 +745,7 @@ const handleSaveFilters = async (filters) => {
         }
     };
 
-    // NOWE: Synchronizuj wszystkie playlisty
+    // Synchronizuj wszystkie playlisty
     const handleSyncAllPlaylists = async () => {
         setSyncing(prev => ({ ...prev, all: true }));
         
@@ -760,7 +764,6 @@ const handleSaveFilters = async (filters) => {
                     messageText += `❌ Błędy: ${errorCount}\n`;
                 }
                 
-                // Pokaż pierwsze kilka wyników
                 result.results.slice(0, 3).forEach(r => {
                     if (r.error) {
                         messageText += `• ${r.playlist_name}: ERROR - ${r.error}\n`;
@@ -837,7 +840,6 @@ const handleSaveFilters = async (filters) => {
             <div className="flex justify-between items-center">
                 <h3 className="text-xl font-bold text-white">Zarządzaj Playlistami</h3>
                 <div className="flex gap-3">
-                    {/* NOWY: Przycisk synchronizacji wszystkich */}
                     <button
                         onClick={handleSyncAllPlaylists}
                         disabled={syncing.all || activePlaylists.length === 0}
@@ -877,16 +879,19 @@ const handleSaveFilters = async (filters) => {
                     isEditing={!!editingPlaylist}
                 />
             )}
-{showFilterEditor && (
-    <FilterEditor
-        playlist={editingPlaylistForFilters}
-        onSave={handleSaveFilters}
-        onCancel={() => {
-            setShowFilterEditor(false);
-            setEditingPlaylistForFilters(null);
-        }}
-    />
-)}
+
+            {/* Editor filtrów */}
+            {showFilterEditor && (
+                <FilterEditor
+                    playlist={editingPlaylistForFilters}
+                    onSave={handleSaveFilters}
+                    onCancel={() => {
+                        setShowFilterEditor(false);
+                        setEditingPlaylistForFilters(null);
+                    }}
+                />
+            )}
+
             {/* Lista playlist */}
             <div className="grid gap-4">
                 {playlists.length === 0 ? (
@@ -911,7 +916,8 @@ const handleSaveFilters = async (filters) => {
                             onDelete={handleDeletePlaylist}
                             onToggle={handleTogglePlaylist}
                             onSync={handleSyncPlaylist}
-                            syncing={syncing.single[playlist.id] || false} // NOWE: Przekaż stan synchronizacji
+                            onEditFilters={handleEditFilters}
+                            syncing={syncing.single[playlist.id] || false}
                         />
                     ))
                 )}
