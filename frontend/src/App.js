@@ -21,8 +21,7 @@ const Pagination = ({ currentPage, totalPages, onPageChange }) => {
 };
 
 // === KOMPONENTY PLAYLIST MANAGER ===
-
-const PlaylistCard = ({ playlist, onEdit, onDelete, onToggle, onSync, syncing = false }) => { // NOWE: prop syncing
+const PlaylistCard = ({ playlist, onEdit, onDelete, onToggle, onSync, onEditFilters, syncing = false }) => { // NOWE: prop syncing i onEditFilters
     const [isExpanded, setIsExpanded] = useState(false);
     
     return (
