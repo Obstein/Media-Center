@@ -44,6 +44,39 @@ function initializeDb() {
                 media_count INTEGER DEFAULT 0
             )
         `);
+
+        
+
+db.all("PRAGMA table_info(playlists)", [], (err, columns) => {
+    if (err) {
+        console.error("Błąd sprawdzania struktury tabeli playlists:", err);
+        return;
+    }
+    
+    const columnNames = columns.map(col => col.name);
+    
+    if (!columnNames.includes('category_filters')) {
+        console.log("Dodawanie kolumny category_filters...");
+        db.run("ALTER TABLE playlists ADD COLUMN category_filters TEXT", (alterErr) => {
+            if (alterErr) {
+                console.error("Błąd dodawania kolumny category_filters:", alterErr);
+            } else {
+                console.log("✅ Dodano kolumnę category_filters");
+            }
+        });
+    }
+    
+    if (!columnNames.includes('language_filters')) {
+        console.log("Dodawanie kolumny language_filters...");
+        db.run("ALTER TABLE playlists ADD COLUMN language_filters TEXT", (alterErr) => {
+            if (alterErr) {
+                console.error("Błąd dodawania kolumny language_filters:", alterErr);
+            } else {
+                console.log("✅ Dodano kolumnę language_filters");
+            }
+        });
+    }
+});
       db.all("PRAGMA table_info(media)", [], (err, columns) => {
     if (err) {
         console.error("Błąd sprawdzania struktury tabeli media:", err);
@@ -619,6 +652,121 @@ app.get('/api/playlists/overview', async (req, res) => {
     }
 });
 
+// === FUNKCJA: Pobierz kategorie VOD z Xtream ===
+async function fetchXtreamCategories(serverUrl, username, password) {
+    try {
+        const xtreamBaseUrl = `${serverUrl}/player_api.php?username=${username}&password=${password}`;
+        
+        // Pobierz kategorie dla filmów
+        const moviesRes = await axios.get(`${xtreamBaseUrl}&action=get_vod_categories`, { timeout: 15000 });
+        const movieCategories = Array.isArray(moviesRes.data) ? moviesRes.data : [];
+        
+        // Pobierz kategorie dla seriali
+        const seriesRes = await axios.get(`${xtreamBaseUrl}&action=get_series_categories`, { timeout: 15000 });
+        const seriesCategories = Array.isArray(seriesRes.data) ? seriesRes.data : [];
+        
+        return {
+            movies: movieCategories,
+            series: seriesCategories
+        };
+    } catch (error) {
+        console.error('Błąd pobierania kategorii Xtream:', error);
+        return { movies: [], series: [] };
+    }
+}
+
+// === ENDPOINT: Pobierz kategorie dla playlisty ===
+app.get('/api/playlists/:id/categories', async (req, res) => {
+    const { id } = req.params;
+    
+    try {
+        const playlist = await dbAll('SELECT * FROM playlists WHERE id = ?', [id]);
+        
+        if (playlist.length === 0) {
+            return res.status(404).json({ error: 'Playlista nie znaleziona.' });
+        }
+        
+        const playlistData = playlist[0];
+        const categories = await fetchXtreamCategories(
+            playlistData.server_url,
+            playlistData.username,
+            playlistData.password
+        );
+        
+        res.json(categories);
+    } catch (error) {
+        console.error('Błąd pobierania kategorii:', error);
+        res.status(500).json({ error: 'Błąd pobierania kategorii.' });
+    }
+});
+
+// === ENDPOINT: Wykryj dostępne języki w playliście ===
+app.get('/api/playlists/:id/languages', async (req, res) => {
+    const { id } = req.params;
+    
+    try {
+        const playlist = await dbAll('SELECT * FROM playlists WHERE id = ?', [id]);
+        
+        if (playlist.length === 0) {
+            return res.status(404).json({ error: 'Playlista nie znaleziona.' });
+        }
+        
+        const playlistData = playlist[0];
+        const xtreamBaseUrl = `${playlistData.server_url}/player_api.php?username=${playlistData.username}&password=${playlistData.password}`;
+        
+        // Pobierz próbkę mediów
+        const [moviesRes, seriesRes] = await Promise.all([
+            axios.get(`${xtreamBaseUrl}&action=get_vod_streams`, { timeout: 15000 }),
+            axios.get(`${xtreamBaseUrl}&action=get_series`, { timeout: 15000 })
+        ]);
+        
+        const allMedia = [
+            ...(Array.isArray(moviesRes.data) ? moviesRes.data : []),
+            ...(Array.isArray(seriesRes.data) ? seriesRes.data : [])
+        ];
+        
+        // Wykryj języki na podstawie prefiksów nazw
+        const languageRegex = /^([A-Z]{2,3})\s*[-:\s]/;
+        const detectedLanguages = new Set();
+        
+        allMedia.forEach(item => {
+            const match = item.name?.match(languageRegex);
+            if (match) {
+                detectedLanguages.add(match[1]);
+            }
+        });
+        
+        // Mapuj kody na pełne nazwy
+        const languageMap = {
+            'PL': 'Polski',
+            'EN': 'English',
+            'US': 'English (US)',
+            'DE': 'Deutsch',
+            'FR': 'Français',
+            'ES': 'Español',
+            'IT': 'Italiano',
+            'RU': 'Русский',
+            'TR': 'Türkçe',
+            'PT': 'Português',
+            'NL': 'Nederlands',
+            'SE': 'Svenska',
+            'NO': 'Norsk',
+            'DK': 'Dansk',
+            'NF': 'Netflix'
+        };
+        
+        const languages = Array.from(detectedLanguages).map(code => ({
+            code,
+            name: languageMap[code] || code
+        }));
+        
+        res.json(languages);
+    } catch (error) {
+        console.error('Błąd wykrywania języków:', error);
+        res.status(500).json({ error: 'Błąd wykrywania języków.' });
+    }
+});
+
 // Synchronizuj pojedynczą playlistę
 app.post('/api/playlists/:id/sync', async (req, res) => {
     const { id } = req.params;
@@ -722,27 +870,70 @@ async function syncSinglePlaylist(playlist) {
         // Pobierz filmy i seriale z tej playlisty
         console.log(`  📡 Pobieranie danych z: ${server_url}...`);
         
-        let moviesList = [];
-        let seriesList = [];
         
-        // Pobierz filmy
-        try {
-            const moviesRes = await axios.get(`${xtreamBaseUrl}&action=get_vod_streams`, { timeout: 30000 });
-            moviesList = Array.isArray(moviesRes.data) ? moviesRes.data.map(m => ({ ...m, stream_type: 'movie' })) : [];
-            console.log(`  🎬 Pobrano ${moviesList.length} filmów`);
-        } catch (error) {
-            console.warn(`  ⚠️ Błąd pobierania filmów z ${name}: ${error.message}`);
-        }
-        
-        // Pobierz seriale
-        try {
-            const seriesRes = await axios.get(`${xtreamBaseUrl}&action=get_series`, { timeout: 30000 });
-            seriesList = Array.isArray(seriesRes.data) ? seriesRes.data.map(s => ({ ...s, stream_type: 'series', stream_id: s.series_id })) : [];
-            console.log(`  📺 Pobrano ${seriesList.length} seriali`);
-        } catch (error) {
-            console.warn(`  ⚠️ Błąd pobierania seriali z ${name}: ${error.message}`);
-        }
-        
+        // Pobierz filmy i seriale z filtrami kategorii
+let moviesList = [];
+let seriesList = [];
+
+// Parsuj filtry z playlisty
+const categoryFilters = playlist.category_filters ? JSON.parse(playlist.category_filters) : null;
+const languageFilters = playlist.language_filters ? JSON.parse(playlist.language_filters) : null;
+
+// Pobierz filmy
+try {
+    const moviesRes = await axios.get(`${xtreamBaseUrl}&action=get_vod_streams`, { timeout: 30000 });
+    moviesList = Array.isArray(moviesRes.data) ? moviesRes.data.map(m => ({ ...m, stream_type: 'movie' })) : [];
+    
+    // Filtruj po kategoriach
+    if (categoryFilters?.movies && categoryFilters.movies.length > 0) {
+        moviesList = moviesList.filter(m => 
+            categoryFilters.movies.includes(m.category_id?.toString())
+        );
+        console.log(`  🎬 Filtrowanie filmów: ${moviesList.length} po zastosowaniu filtrów kategorii`);
+    }
+    
+    // Filtruj po językach
+    if (languageFilters && languageFilters.length > 0) {
+        const languageRegex = /^([A-Z]{2,3})\s*[-:\s]/;
+        moviesList = moviesList.filter(m => {
+            const match = m.name?.match(languageRegex);
+            return !match || languageFilters.includes(match[1]);
+        });
+        console.log(`  🌐 Filtrowanie filmów po języku: ${moviesList.length}`);
+    }
+    
+    console.log(`  🎬 Pobrano ${moviesList.length} filmów (po filtrach)`);
+} catch (error) {
+    console.warn(`  ⚠️ Błąd pobierania filmów z ${name}: ${error.message}`);
+}
+
+// Pobierz seriale z analogicznymi filtrami
+try {
+    const seriesRes = await axios.get(`${xtreamBaseUrl}&action=get_series`, { timeout: 30000 });
+    seriesList = Array.isArray(seriesRes.data) ? seriesRes.data.map(s => ({ ...s, stream_type: 'series', stream_id: s.series_id })) : [];
+    
+    // Filtruj po kategoriach
+    if (categoryFilters?.series && categoryFilters.series.length > 0) {
+        seriesList = seriesList.filter(s => 
+            categoryFilters.series.includes(s.category_id?.toString())
+        );
+        console.log(`  📺 Filtrowanie seriali: ${seriesList.length} po zastosowaniu filtrów kategorii`);
+    }
+    
+    // Filtruj po językach
+    if (languageFilters && languageFilters.length > 0) {
+        const languageRegex = /^([A-Z]{2,3})\s*[-:\s]/;
+        seriesList = seriesList.filter(s => {
+            const match = s.name?.match(languageRegex);
+            return !match || languageFilters.includes(match[1]);
+        });
+        console.log(`  🌐 Filtrowanie seriali po języku: ${seriesList.length}`);
+    }
+    
+    console.log(`  📺 Pobrano ${seriesList.length} seriali (po filtrach)`);
+} catch (error) {
+    console.warn(`  ⚠️ Błąd pobierania seriali z ${name}: ${error.message}`);
+}
         const incomingList = [...moviesList, ...seriesList];
         
         if (incomingList.length === 0) {

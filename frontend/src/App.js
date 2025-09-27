@@ -303,6 +303,305 @@ const PlaylistForm = ({ playlist, onSave, onCancel, isEditing = false }) => {
     );
 };
 
+const FilterEditor = ({ playlist, onSave, onCancel }) => {
+    const [loading, setLoading] = useState(true);
+    const [categories, setCategories] = useState({ movies: [], series: [] });
+    const [languages, setLanguages] = useState([]);
+    const [selectedCategories, setSelectedCategories] = useState({
+        movies: [],
+        series: []
+    });
+    const [selectedLanguages, setSelectedLanguages] = useState([]);
+
+    useEffect(() => {
+        const fetchFilters = async () => {
+            setLoading(true);
+            try {
+                // Pobierz kategorie i języki
+                const [categoriesRes, languagesRes] = await Promise.all([
+                    axios.get(`/api/playlists/${playlist.id}/categories`),
+                    axios.get(`/api/playlists/${playlist.id}/languages`)
+                ]);
+
+                setCategories(categoriesRes.data);
+                setLanguages(languagesRes.data);
+
+                // Załaduj obecne filtry
+                if (playlist.category_filters) {
+                    try {
+                        setSelectedCategories(JSON.parse(playlist.category_filters));
+                    } catch (e) {
+                        console.error('Błąd parsowania category_filters:', e);
+                    }
+                }
+
+                if (playlist.language_filters) {
+                    try {
+                        setSelectedLanguages(JSON.parse(playlist.language_filters));
+                    } catch (e) {
+                        console.error('Błąd parsowania language_filters:', e);
+                    }
+                }
+            } catch (error) {
+                console.error('Błąd ładowania filtrów:', error);
+            } finally {
+                setLoading(false);
+            }
+        };
+
+        if (playlist?.id) {
+            fetchFilters();
+        }
+    }, [playlist]);
+
+    const handleCategoryToggle = (type, categoryId) => {
+        setSelectedCategories(prev => {
+            const current = prev[type] || [];
+            const updated = current.includes(categoryId)
+                ? current.filter(id => id !== categoryId)
+                : [...current, categoryId];
+            
+            return { ...prev, [type]: updated };
+        });
+    };
+
+    const handleSelectAllCategories = (type) => {
+        const allIds = categories[type].map(cat => cat.category_id.toString());
+        setSelectedCategories(prev => ({ ...prev, [type]: allIds }));
+    };
+
+    const handleDeselectAllCategories = (type) => {
+        setSelectedCategories(prev => ({ ...prev, [type]: [] }));
+    };
+
+    const handleLanguageToggle = (langCode) => {
+        setSelectedLanguages(prev => 
+            prev.includes(langCode)
+                ? prev.filter(code => code !== langCode)
+                : [...prev, langCode]
+        );
+    };
+
+    const handleSelectAllLanguages = () => {
+        setSelectedLanguages(languages.map(lang => lang.code));
+    };
+
+    const handleDeselectAllLanguages = () => {
+        setSelectedLanguages([]);
+    };
+
+    const handleSave = async () => {
+        try {
+            await onSave({
+                category_filters: JSON.stringify(selectedCategories),
+                language_filters: JSON.stringify(selectedLanguages)
+            });
+        } catch (error) {
+            console.error('Błąd zapisywania filtrów:', error);
+        }
+    };
+
+    if (loading) {
+        return (
+            <div className="bg-gray-800 rounded-lg p-6">
+                <div className="text-center text-gray-400">Ładowanie filtrów...</div>
+            </div>
+        );
+    }
+
+    const movieCategoriesCount = selectedCategories.movies?.length || 0;
+    const seriesCategoriesCount = selectedCategories.series?.length || 0;
+    const languagesCount = selectedLanguages.length;
+
+    return (
+        <div className="bg-gray-800 rounded-lg p-6 space-y-6">
+            <div className="flex justify-between items-center">
+                <h3 className="text-xl font-bold text-white">
+                    Filtry synchronizacji: {playlist.name}
+                </h3>
+                <div className="text-sm text-gray-400">
+                    📊 Filmy: {movieCategoriesCount} | Seriale: {seriesCategoriesCount} | Języki: {languagesCount}
+                </div>
+            </div>
+
+            {/* Filtry języków */}
+            <div className="bg-gray-900/50 rounded-lg p-4">
+                <div className="flex justify-between items-center mb-3">
+                    <h4 className="font-semibold text-white">🌐 Filtry językowe</h4>
+                    <div className="flex gap-2">
+                        <button
+                            onClick={handleSelectAllLanguages}
+                            className="text-xs px-2 py-1 bg-green-600 hover:bg-green-700 text-white rounded"
+                        >
+                            Zaznacz wszystkie
+                        </button>
+                        <button
+                            onClick={handleDeselectAllLanguages}
+                            className="text-xs px-2 py-1 bg-red-600 hover:bg-red-700 text-white rounded"
+                        >
+                            Odznacz wszystkie
+                        </button>
+                    </div>
+                </div>
+
+                {languages.length === 0 ? (
+                    <p className="text-sm text-gray-400">Nie wykryto prefiksów językowych w tej playliście</p>
+                ) : (
+                    <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-2">
+                        {languages.map(lang => (
+                            <label
+                                key={lang.code}
+                                className={`flex items-center gap-2 p-2 rounded cursor-pointer transition-colors ${
+                                    selectedLanguages.includes(lang.code)
+                                        ? 'bg-blue-900/50 border border-blue-600'
+                                        : 'bg-gray-700/50 hover:bg-gray-700'
+                                }`}
+                            >
+                                <input
+                                    type="checkbox"
+                                    checked={selectedLanguages.includes(lang.code)}
+                                    onChange={() => handleLanguageToggle(lang.code)}
+                                    className="w-4 h-4"
+                                />
+                                <div className="flex-1 min-w-0">
+                                    <div className="text-sm font-medium text-white">{lang.code}</div>
+                                    <div className="text-xs text-gray-400 truncate">{lang.name}</div>
+                                </div>
+                            </label>
+                        ))}
+                    </div>
+                )}
+
+                {selectedLanguages.length === 0 && (
+                    <div className="mt-2 text-xs text-yellow-400">
+                        ⚠️ Nie wybrano żadnego języka - zostaną synchronizowane wszystkie pozycje
+                    </div>
+                )}
+            </div>
+
+            {/* Kategorie filmów */}
+            <div className="bg-gray-900/50 rounded-lg p-4">
+                <div className="flex justify-between items-center mb-3">
+                    <h4 className="font-semibold text-white">🎬 Kategorie filmów</h4>
+                    <div className="flex gap-2">
+                        <button
+                            onClick={() => handleSelectAllCategories('movies')}
+                            className="text-xs px-2 py-1 bg-green-600 hover:bg-green-700 text-white rounded"
+                        >
+                            Zaznacz wszystkie
+                        </button>
+                        <button
+                            onClick={() => handleDeselectAllCategories('movies')}
+                            className="text-xs px-2 py-1 bg-red-600 hover:bg-red-700 text-white rounded"
+                        >
+                            Odznacz wszystkie
+                        </button>
+                    </div>
+                </div>
+
+                {categories.movies.length === 0 ? (
+                    <p className="text-sm text-gray-400">Brak kategorii filmów</p>
+                ) : (
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">
+                        {categories.movies.map(cat => (
+                            <label
+                                key={cat.category_id}
+                                className={`flex items-center gap-2 p-2 rounded cursor-pointer transition-colors ${
+                                    selectedCategories.movies?.includes(cat.category_id.toString())
+                                        ? 'bg-blue-900/50 border border-blue-600'
+                                        : 'bg-gray-700/50 hover:bg-gray-700'
+                                }`}
+                            >
+                                <input
+                                    type="checkbox"
+                                    checked={selectedCategories.movies?.includes(cat.category_id.toString())}
+                                    onChange={() => handleCategoryToggle('movies', cat.category_id.toString())}
+                                    className="w-4 h-4"
+                                />
+                                <span className="text-sm text-white">{cat.category_name}</span>
+                            </label>
+                        ))}
+                    </div>
+                )}
+
+                {(!selectedCategories.movies || selectedCategories.movies.length === 0) && (
+                    <div className="mt-2 text-xs text-yellow-400">
+                        ⚠️ Nie wybrano kategorii - zostaną synchronizowane wszystkie filmy
+                    </div>
+                )}
+            </div>
+
+            {/* Kategorie seriali */}
+            <div className="bg-gray-900/50 rounded-lg p-4">
+                <div className="flex justify-between items-center mb-3">
+                    <h4 className="font-semibold text-white">📺 Kategorie seriali</h4>
+                    <div className="flex gap-2">
+                        <button
+                            onClick={() => handleSelectAllCategories('series')}
+                            className="text-xs px-2 py-1 bg-green-600 hover:bg-green-700 text-white rounded"
+                        >
+                            Zaznacz wszystkie
+                        </button>
+                        <button
+                            onClick={() => handleDeselectAllCategories('series')}
+                            className="text-xs px-2 py-1 bg-red-600 hover:bg-red-700 text-white rounded"
+                        >
+                            Odznacz wszystkie
+                        </button>
+                    </div>
+                </div>
+
+                {categories.series.length === 0 ? (
+                    <p className="text-sm text-gray-400">Brak kategorii seriali</p>
+                ) : (
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">
+                        {categories.series.map(cat => (
+                            <label
+                                key={cat.category_id}
+                                className={`flex items-center gap-2 p-2 rounded cursor-pointer transition-colors ${
+                                    selectedCategories.series?.includes(cat.category_id.toString())
+                                        ? 'bg-blue-900/50 border border-blue-600'
+                                        : 'bg-gray-700/50 hover:bg-gray-700'
+                                }`}
+                            >
+                                <input
+                                    type="checkbox"
+                                    checked={selectedCategories.series?.includes(cat.category_id.toString())}
+                                    onChange={() => handleCategoryToggle('series', cat.category_id.toString())}
+                                    className="w-4 h-4"
+                                />
+                                <span className="text-sm text-white">{cat.category_name}</span>
+                            </label>
+                        ))}
+                    </div>
+                )}
+
+                {(!selectedCategories.series || selectedCategories.series.length === 0) && (
+                    <div className="mt-2 text-xs text-yellow-400">
+                        ⚠️ Nie wybrano kategorii - zostaną synchronizowane wszystkie seriale
+                    </div>
+                )}
+            </div>
+
+            {/* Przyciski akcji */}
+            <div className="flex gap-3 pt-4">
+                <button
+                    onClick={handleSave}
+                    className="flex-1 bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-4 rounded-lg transition duration-300"
+                >
+                    Zapisz Filtry
+                </button>
+                
+                <button
+                    onClick={onCancel}
+                    className="px-6 py-2 bg-gray-600 hover:bg-gray-700 text-white font-bold rounded-lg transition duration-300"
+                >
+                    Anuluj
+                </button>
+            </div>
+        </div>
+    );
+};
 
 const PlaylistManager = () => {
     const [playlists, setPlaylists] = useState([]);
@@ -312,6 +611,27 @@ const PlaylistManager = () => {
     const [message, setMessage] = useState('');
     const [overview, setOverview] = useState(null);
     const [syncing, setSyncing] = useState({ all: false, single: {} }); // NOWE: Stan synchronizacji
+    const [showFilterEditor, setShowFilterEditor] = useState(false);
+const [editingPlaylistForFilters, setEditingPlaylistForFilters] = useState(null);
+
+const handleEditFilters = (playlist) => {
+    setEditingPlaylistForFilters(playlist);
+    setShowFilterEditor(true);
+};
+
+const handleSaveFilters = async (filters) => {
+    try {
+        await axios.put(`/api/playlists/${editingPlaylistForFilters.id}`, filters);
+        setMessage('Filtry synchronizacji zostały zapisane.');
+        await fetchPlaylists();
+        setShowFilterEditor(false);
+        setEditingPlaylistForFilters(null);
+        setTimeout(() => setMessage(''), 3000);
+    } catch (error) {
+        console.error('Błąd zapisywania filtrów:', error);
+        setMessage('Błąd zapisywania filtrów.');
+    }
+};
 
     // Pobierz playlisty
     const fetchPlaylists = async () => {
@@ -527,7 +847,13 @@ const PlaylistManager = () => {
                             <>🔄 Synchronizuj Wszystkie ({activePlaylists.length})</>
                         )}
                     </button>
-                    
+                    <button
+    onClick={() => onEditFilters(playlist)}
+    disabled={syncing}
+    className="px-3 py-2 rounded text-sm font-medium bg-purple-600 hover:bg-purple-700 disabled:bg-purple-800 disabled:cursor-not-allowed text-white transition-colors"
+>
+    🎛️ Filtry
+</button>
                     <button
                         onClick={() => {
                             setShowForm(true);
@@ -552,7 +878,16 @@ const PlaylistManager = () => {
                     isEditing={!!editingPlaylist}
                 />
             )}
-
+{showFilterEditor && (
+    <FilterEditor
+        playlist={editingPlaylistForFilters}
+        onSave={handleSaveFilters}
+        onCancel={() => {
+            setShowFilterEditor(false);
+            setEditingPlaylistForFilters(null);
+        }}
+    />
+)}
             {/* Lista playlist */}
             <div className="grid gap-4">
                 {playlists.length === 0 ? (
