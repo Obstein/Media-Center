@@ -127,7 +127,13 @@ const PlaylistCard = ({ playlist, onEdit, onDelete, onToggle, onSync, syncing = 
                 >
                     ✏️ Edytuj
                 </button>
-                
+                <button
+    onClick={() => onEditFilters(playlist)}
+    disabled={syncing}
+    className="px-3 py-2 rounded text-sm font-medium bg-purple-600 hover:bg-purple-700 disabled:bg-purple-800 disabled:cursor-not-allowed text-white transition-colors"
+>
+    🎛️ Filtry
+</button>
                 <button
                     onClick={() => onDelete(playlist.id, playlist.name)}
                     disabled={playlist.media_count > 0 || syncing}
@@ -847,13 +853,7 @@ const handleSaveFilters = async (filters) => {
                             <>🔄 Synchronizuj Wszystkie ({activePlaylists.length})</>
                         )}
                     </button>
-                    <button
-    onClick={() => onEditFilters(playlist)}
-    disabled={syncing}
-    className="px-3 py-2 rounded text-sm font-medium bg-purple-600 hover:bg-purple-700 disabled:bg-purple-800 disabled:cursor-not-allowed text-white transition-colors"
->
-    🎛️ Filtry
-</button>
+                    
                     <button
                         onClick={() => {
                             setShowForm(true);
