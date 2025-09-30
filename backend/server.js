@@ -525,13 +525,18 @@ app.post('/api/playlists', async (req, res) => {
 });
 
 // Edytuj playlistę
+// Edytuj playlistę
 app.put('/api/playlists/:id', async (req, res) => {
     const { id } = req.params;
-    const { name, server_url, username, password, is_active } = req.body;
-    
-    if (!name || !server_url || !username || !password) {
-        return res.status(400).json({ error: 'Wszystkie pola są wymagane.' });
-    }
+    const { 
+        name, 
+        server_url, 
+        username, 
+        password, 
+        is_active,
+        category_filters,
+        language_filters
+    } = req.body;
     
     try {
         // Sprawdź czy playlista istnieje
@@ -540,21 +545,56 @@ app.put('/api/playlists/:id', async (req, res) => {
             return res.status(404).json({ error: 'Playlista nie znaleziona.' });
         }
         
-        // Sprawdź czy nazwa nie koliduje z inną playlistą
-        const nameConflict = await dbAll('SELECT id FROM playlists WHERE name = ? AND id != ?', [name, id]);
-        if (nameConflict.length > 0) {
-            return res.status(400).json({ error: 'Playlista o tej nazwie już istnieje.' });
+        // Przygotuj zapytanie UPDATE z filtrami
+        let updateQuery = 'UPDATE playlists SET ';
+        let updateFields = [];
+        let updateParams = [];
+        
+        if (name !== undefined) {
+            updateFields.push('name = ?');
+            updateParams.push(name);
+        }
+        if (server_url !== undefined) {
+            updateFields.push('server_url = ?');
+            updateParams.push(server_url);
+        }
+        if (username !== undefined) {
+            updateFields.push('username = ?');
+            updateParams.push(username);
+        }
+        if (password !== undefined) {
+            updateFields.push('password = ?');
+            updateParams.push(password);
+        }
+        if (is_active !== undefined) {
+            updateFields.push('is_active = ?');
+            updateParams.push(is_active ? 1 : 0);
+        }
+        if (category_filters !== undefined) {
+            updateFields.push('category_filters = ?');
+            updateParams.push(category_filters);
+        }
+        if (language_filters !== undefined) {
+            updateFields.push('language_filters = ?');
+            updateParams.push(language_filters);
         }
         
-        await dbRun(`
-            UPDATE playlists 
-            SET name = ?, server_url = ?, username = ?, password = ?, is_active = ?
-            WHERE id = ?
-        `, [name, server_url, username, password, is_active ? 1 : 0, id]);
+        if (updateFields.length === 0) {
+            return res.status(400).json({ error: 'Brak danych do aktualizacji.' });
+        }
+        
+        updateQuery += updateFields.join(', ') + ' WHERE id = ?';
+        updateParams.push(id);
+        
+        await dbRun(updateQuery, updateParams);
         
         const updatedPlaylist = await dbAll('SELECT * FROM playlists WHERE id = ?', [id]);
         
-        console.log(`✅ Zaktualizowano playlistę: ${name} (ID: ${id})`);
+        console.log(`✅ Zaktualizowano playlistę: ${updatedPlaylist[0].name} (ID: ${id})`);
+        if (category_filters || language_filters) {
+            console.log(`📊 Zaktualizowano filtry dla playlisty ${id}`);
+        }
+        
         res.json(updatedPlaylist[0]);
         
     } catch (error) {
@@ -861,6 +901,7 @@ app.post('/api/playlists/sync-all', async (req, res) => {
 });
 
 // Funkcja pomocnicza do synchronizacji pojedynczej playlisty
+// Funkcja pomocnicza do synchronizacji pojedynczej playlisty
 async function syncSinglePlaylist(playlist) {
     const { id: playlistId, server_url, username, password, name } = playlist;
     
@@ -870,76 +911,154 @@ async function syncSinglePlaylist(playlist) {
         // Pobierz filmy i seriale z tej playlisty
         console.log(`  📡 Pobieranie danych z: ${server_url}...`);
         
-        
+        // Parsuj filtry z playlisty
+        const categoryFilters = playlist.category_filters ? JSON.parse(playlist.category_filters) : null;
+        const languageFilters = playlist.language_filters ? JSON.parse(playlist.language_filters) : null;
+
+        console.log(`📊 FILTRY dla ${name}:`);
+        console.log(`  - Category filters:`, categoryFilters);
+        console.log(`  - Language filters:`, languageFilters);
+
         // Pobierz filmy i seriale z filtrami kategorii
-let moviesList = [];
-let seriesList = [];
+        let moviesList = [];
+        let seriesList = [];
 
-// Parsuj filtry z playlisty
-const categoryFilters = playlist.category_filters ? JSON.parse(playlist.category_filters) : null;
-const languageFilters = playlist.language_filters ? JSON.parse(playlist.language_filters) : null;
+        // Pobierz filmy
+        try {
+            const moviesRes = await axios.get(`${xtreamBaseUrl}&action=get_vod_streams`, { timeout: 30000 });
+            moviesList = Array.isArray(moviesRes.data) ? moviesRes.data.map(m => ({ ...m, stream_type: 'movie' })) : [];
+            
+            console.log(`🎬 Pobrano ${moviesList.length} filmów (przed filtrami)`);
+            
+            // Filtruj po kategoriach
+            if (categoryFilters?.movies && categoryFilters.movies.length > 0) {
+                console.log(`  🎯 Stosowanie filtra kategorii filmów: ${categoryFilters.movies.length} kategorii`);
+                const categoryIds = categoryFilters.movies.map(id => String(id));
+                
+                const beforeCount = moviesList.length;
+                moviesList = moviesList.filter(m => {
+                    const itemCategoryId = String(m.category_id || '');
+                    const isIncluded = categoryIds.includes(itemCategoryId);
+                    
+                    if (!isIncluded && beforeCount <= 10) { // Loguj tylko dla małych list
+                        console.log(`    ❌ Film "${m.name}" pominięty (kategoria: ${itemCategoryId})`);
+                    }
+                    
+                    return isIncluded;
+                });
+                
+                console.log(`  ✅ Po filtrze kategorii: ${moviesList.length} filmów (odrzucono: ${beforeCount - moviesList.length})`);
+            } else {
+                console.log(`  ℹ️ Brak filtra kategorii filmów - pobieranie wszystkich`);
+            }
+            
+            // Filtruj po językach
+            if (languageFilters && languageFilters.length > 0) {
+                console.log(`  🌐 Stosowanie filtra językowego: ${languageFilters.join(', ')}`);
+                const languageRegex = /^([A-Z]{2,3})\s*[-:\s]/;
+                
+                const beforeCount = moviesList.length;
+                moviesList = moviesList.filter(m => {
+                    const match = m.name?.match(languageRegex);
+                    
+                    // Jeśli nie ma prefiksu językowego, domyślnie AKCEPTUJ
+                    if (!match) {
+                        return true;
+                    }
+                    
+                    const langCode = match[1];
+                    const isIncluded = languageFilters.includes(langCode);
+                    
+                    if (!isIncluded && beforeCount <= 10) {
+                        console.log(`    ❌ Film "${m.name}" pominięty (język: ${langCode})`);
+                    }
+                    
+                    return isIncluded;
+                });
+                
+                console.log(`  ✅ Po filtrze językowym: ${moviesList.length} filmów (odrzucono: ${beforeCount - moviesList.length})`);
+            } else {
+                console.log(`  ℹ️ Brak filtra językowego - pobieranie wszystkich`);
+            }
+            
+            console.log(`🎬 WYNIK: ${moviesList.length} filmów po wszystkich filtrach`);
+            
+        } catch (error) {
+            console.warn(`  ⚠️ Błąd pobierania filmów z ${name}: ${error.message}`);
+        }
 
-// Pobierz filmy
-try {
-    const moviesRes = await axios.get(`${xtreamBaseUrl}&action=get_vod_streams`, { timeout: 30000 });
-    moviesList = Array.isArray(moviesRes.data) ? moviesRes.data.map(m => ({ ...m, stream_type: 'movie' })) : [];
-    
-    // Filtruj po kategoriach
-    if (categoryFilters?.movies && categoryFilters.movies.length > 0) {
-        moviesList = moviesList.filter(m => 
-            categoryFilters.movies.includes(m.category_id?.toString())
-        );
-        console.log(`  🎬 Filtrowanie filmów: ${moviesList.length} po zastosowaniu filtrów kategorii`);
-    }
-    
-    // Filtruj po językach
-    if (languageFilters && languageFilters.length > 0) {
-        const languageRegex = /^([A-Z]{2,3})\s*[-:\s]/;
-        moviesList = moviesList.filter(m => {
-            const match = m.name?.match(languageRegex);
-            return !match || languageFilters.includes(match[1]);
-        });
-        console.log(`  🌐 Filtrowanie filmów po języku: ${moviesList.length}`);
-    }
-    
-    console.log(`  🎬 Pobrano ${moviesList.length} filmów (po filtrach)`);
-} catch (error) {
-    console.warn(`  ⚠️ Błąd pobierania filmów z ${name}: ${error.message}`);
-}
-
-// Pobierz seriale z analogicznymi filtrami
-try {
-    const seriesRes = await axios.get(`${xtreamBaseUrl}&action=get_series`, { timeout: 30000 });
-    seriesList = Array.isArray(seriesRes.data) ? seriesRes.data.map(s => ({ ...s, stream_type: 'series', stream_id: s.series_id })) : [];
-    
-    // Filtruj po kategoriach
-    if (categoryFilters?.series && categoryFilters.series.length > 0) {
-        seriesList = seriesList.filter(s => 
-            categoryFilters.series.includes(s.category_id?.toString())
-        );
-        console.log(`  📺 Filtrowanie seriali: ${seriesList.length} po zastosowaniu filtrów kategorii`);
-    }
-    
-    // Filtruj po językach
-    if (languageFilters && languageFilters.length > 0) {
-        const languageRegex = /^([A-Z]{2,3})\s*[-:\s]/;
-        seriesList = seriesList.filter(s => {
-            const match = s.name?.match(languageRegex);
-            return !match || languageFilters.includes(match[1]);
-        });
-        console.log(`  🌐 Filtrowanie seriali po języku: ${seriesList.length}`);
-    }
-    
-    console.log(`  📺 Pobrano ${seriesList.length} seriali (po filtrach)`);
-} catch (error) {
-    console.warn(`  ⚠️ Błąd pobierania seriali z ${name}: ${error.message}`);
-}
+        // Pobierz seriale z analogicznymi filtrami
+        try {
+            const seriesRes = await axios.get(`${xtreamBaseUrl}&action=get_series`, { timeout: 30000 });
+            seriesList = Array.isArray(seriesRes.data) ? seriesRes.data.map(s => ({ ...s, stream_type: 'series', stream_id: s.series_id })) : [];
+            
+            console.log(`📺 Pobrano ${seriesList.length} seriali (przed filtrami)`);
+            
+            // Filtruj po kategoriach
+            if (categoryFilters?.series && categoryFilters.series.length > 0) {
+                console.log(`  🎯 Stosowanie filtra kategorii seriali: ${categoryFilters.series.length} kategorii`);
+                const categoryIds = categoryFilters.series.map(id => String(id));
+                
+                const beforeCount = seriesList.length;
+                seriesList = seriesList.filter(s => {
+                    const itemCategoryId = String(s.category_id || '');
+                    const isIncluded = categoryIds.includes(itemCategoryId);
+                    
+                    if (!isIncluded && beforeCount <= 10) {
+                        console.log(`    ❌ Serial "${s.name}" pominięty (kategoria: ${itemCategoryId})`);
+                    }
+                    
+                    return isIncluded;
+                });
+                
+                console.log(`  ✅ Po filtrze kategorii: ${seriesList.length} seriali (odrzucono: ${beforeCount - seriesList.length})`);
+            } else {
+                console.log(`  ℹ️ Brak filtra kategorii seriali - pobieranie wszystkich`);
+            }
+            
+            // Filtruj po językach
+            if (languageFilters && languageFilters.length > 0) {
+                console.log(`  🌐 Stosowanie filtra językowego: ${languageFilters.join(', ')}`);
+                const languageRegex = /^([A-Z]{2,3})\s*[-:\s]/;
+                
+                const beforeCount = seriesList.length;
+                seriesList = seriesList.filter(s => {
+                    const match = s.name?.match(languageRegex);
+                    
+                    // Jeśli nie ma prefiksu językowego, domyślnie AKCEPTUJ
+                    if (!match) {
+                        return true;
+                    }
+                    
+                    const langCode = match[1];
+                    const isIncluded = languageFilters.includes(langCode);
+                    
+                    if (!isIncluded && beforeCount <= 10) {
+                        console.log(`    ❌ Serial "${s.name}" pominięty (język: ${langCode})`);
+                    }
+                    
+                    return isIncluded;
+                });
+                
+                console.log(`  ✅ Po filtrze językowym: ${seriesList.length} seriali (odrzucono: ${beforeCount - seriesList.length})`);
+            } else {
+                console.log(`  ℹ️ Brak filtra językowego - pobieranie wszystkich`);
+            }
+            
+            console.log(`📺 WYNIK: ${seriesList.length} seriali po wszystkich filtrach`);
+            
+        } catch (error) {
+            console.warn(`  ⚠️ Błąd pobierania seriali z ${name}: ${error.message}`);
+        }
+        
         const incomingList = [...moviesList, ...seriesList];
         
         if (incomingList.length === 0) {
-            console.warn(`  ⚠️ Brak danych z playlisty ${name}`);
-            return { added: 0, removed: 0, message: 'Brak danych z serwera' };
+            console.warn(`  ⚠️ Brak danych z playlisty ${name} (po filtrach)`);
+            return { added: 0, removed: 0, message: 'Brak danych po zastosowaniu filtrów' };
         }
+        
+        console.log(`📊 PODSUMOWANIE: ${incomingList.length} pozycji (${moviesList.length} filmów + ${seriesList.length} seriali)`);
         
         // Pobierz istniejące media TYLKO dla tej konkretnej playlisty
         const existingMedia = await dbAll(
@@ -997,7 +1116,6 @@ try {
                 const tmdbApiRows = await dbAll(`SELECT value FROM settings WHERE key = 'tmdbApi'`);
                 const tmdbApi = tmdbApiRows[0]?.value;
                 
-                // ✅ POPRAWKA: ZACHOWAJ ORYGINALNĄ NAZWĘ Z IPTV
                 const insertMediaSql = `INSERT OR REPLACE INTO media 
                     (stream_id, name, stream_icon, rating, tmdb_id, stream_type, container_extension, playlist_id, original_name) 
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`;
@@ -1013,19 +1131,19 @@ try {
                     let processedCount = 0;
                     for (const item of itemsToAdd) {
                         const tmdbId = item.tmdb;
-                        const originalName = item.name; // ✅ ZACHOWAJ ORYGINALNĄ NAZWĘ
+                        const originalName = item.name;
                         
                         // Dodaj media z ORYGINALNĄ nazwą z IPTV
                         await stmtRun(mediaStmt, [
                             item.stream_id,
-                            originalName, // ✅ UŻYJ ORYGINALNEJ NAZWY ZAMIAST TMDB
+                            originalName,
                             item.stream_icon || item.cover,
                             item.rating_5based || item.rating,
                             tmdbId,
                             item.stream_type,
                             item.container_extension,
                             playlistId,
-                            originalName // ✅ ZAPISZ TAKŻE JAKO original_name
+                            originalName
                         ]);
                         
                         // Sprawdź czy gatunki już istnieją dla tego media
@@ -1039,23 +1157,12 @@ try {
                         if (existingGenres[0].count === 0 && tmdbId && tmdbApi) {
                             try {
                                 const tmdbType = item.stream_type === 'series' ? 'tv' : 'movie';
-                                // ✅ POPRAWKA: UŻYJ JĘZYKA POLSKIEGO + FALLBACK NA ANGIELSKI
                                 const tmdbUrl = `https://api.themoviedb.org/3/${tmdbType}/${tmdbId}?api_key=${tmdbApi}&language=pl-PL&append_to_response=translations`;
                                 
                                 const tmdbRes = await axios.get(tmdbUrl, { timeout: 10000 });
                                 let tmdbData = tmdbRes.data;
                                 
-                                // ✅ PRIORYTET DLA POLSKIEGO TŁUMACZENIA
-                                if (tmdbData.translations?.translations) {
-                                    const polishTranslation = tmdbData.translations.translations.find(t => t.iso_639_1 === 'pl');
-                                    if (polishTranslation?.data) {
-                                        // Jeśli mamy polskie tłumaczenie, użyj go TYLKO dla opisów, NIE dla tytułów
-                                        console.log(`  🇵🇱 Znaleziono polskie tłumaczenie dla ${originalName}`);
-                                        // NIE NADPISUJ NAZWY! Zachowaj oryginalną z IPTV
-                                    }
-                                }
-                                
-                                // Dodaj gatunki (niezależnie od języka)
+                                // Dodaj gatunki
                                 if (tmdbData.genres) {
                                     for (const genre of tmdbData.genres) {
                                         await stmtRun(genreStmt, [genre.id, genre.name]);

@@ -334,7 +334,9 @@ const FilterEditor = ({ playlist, onSave, onCancel }) => {
                 // Załaduj obecne filtry
                 if (playlist.category_filters) {
                     try {
-                        setSelectedCategories(JSON.parse(playlist.category_filters));
+                        const parsed = JSON.parse(playlist.category_filters);
+                        console.log('📊 Załadowano filtry kategorii:', parsed);
+                        setSelectedCategories(parsed);
                     } catch (e) {
                         console.error('Błąd parsowania category_filters:', e);
                     }
@@ -342,7 +344,9 @@ const FilterEditor = ({ playlist, onSave, onCancel }) => {
 
                 if (playlist.language_filters) {
                     try {
-                        setSelectedLanguages(JSON.parse(playlist.language_filters));
+                        const parsed = JSON.parse(playlist.language_filters);
+                        console.log('🌐 Załadowano filtry językowe:', parsed);
+                        setSelectedLanguages(parsed);
                     } catch (e) {
                         console.error('Błąd parsowania language_filters:', e);
                     }
@@ -397,12 +401,18 @@ const FilterEditor = ({ playlist, onSave, onCancel }) => {
 
     const handleSave = async () => {
         try {
+            console.log('💾 Zapisywanie filtrów:', {
+                categories: selectedCategories,
+                languages: selectedLanguages
+            });
+            
+            // Wywołaj callback z tylko filtrami
             await onSave({
                 category_filters: JSON.stringify(selectedCategories),
                 language_filters: JSON.stringify(selectedLanguages)
             });
         } catch (error) {
-            console.error('Błąd zapisywania filtrów:', error);
+            console.error('❌ Błąd zapisywania filtrów:', error);
         }
     };
 
@@ -565,7 +575,7 @@ const FilterEditor = ({ playlist, onSave, onCancel }) => {
                                 key={cat.category_id}
                                 className={`flex items-center gap-2 p-2 rounded cursor-pointer transition-colors ${
                                     selectedCategories.series?.includes(cat.category_id.toString())
-                                        ? 'bg-blue-900/50 border border-blue-600'
+                                    ? 'bg-blue-900/50 border border-blue-600'
                                         : 'bg-gray-700/50 hover:bg-gray-700'
                                 }`}
                             >
@@ -626,21 +636,39 @@ const PlaylistManager = () => {
     };
 
     // Funkcja do zapisywania filtrów
-    const handleSaveFilters = async (filters) => {
-        try {
-            await axios.put(`/api/playlists/${editingPlaylistForFilters.id}`, {
-                ...filters
-            });
-            setMessage('Filtry synchronizacji zostały zapisane.');
-            await fetchPlaylists();
-            setShowFilterEditor(false);
-            setEditingPlaylistForFilters(null);
-            setTimeout(() => setMessage(''), 3000);
-        } catch (error) {
-            console.error('Błąd zapisywania filtrów:', error);
-            setMessage('Błąd zapisywania filtrów.');
-        }
-    };
+   // Funkcja do zapisywania filtrów
+const handleSaveFilters = async (filters) => {
+    try {
+        console.log('💾 Zapisywanie filtrów dla playlisty:', editingPlaylistForFilters.id);
+        console.log('📊 Dane filtrów:', filters);
+        
+        // Wyślij PUT request z pełnymi danymi playlisty + filtry
+        const response = await axios.put(`/api/playlists/${editingPlaylistForFilters.id}`, {
+            // Podstawowe dane playlisty (wymagane)
+            name: editingPlaylistForFilters.name,
+            server_url: editingPlaylistForFilters.server_url,
+            username: editingPlaylistForFilters.username,
+            password: editingPlaylistForFilters.password,
+            is_active: editingPlaylistForFilters.is_active,
+            // Filtry
+            category_filters: filters.category_filters,
+            language_filters: filters.language_filters
+        });
+        
+        console.log('✅ Odpowiedź serwera:', response.data);
+        
+        setMessage('✅ Filtry synchronizacji zostały zapisane.');
+        await fetchPlaylists();
+        setShowFilterEditor(false);
+        setEditingPlaylistForFilters(null);
+        setTimeout(() => setMessage(''), 3000);
+    } catch (error) {
+        console.error('❌ Błąd zapisywania filtrów:', error);
+        console.error('📋 Error response:', error.response?.data);
+        setMessage('❌ Błąd zapisywania filtrów: ' + (error.response?.data?.error || error.message));
+        setTimeout(() => setMessage(''), 5000);
+    }
+};
 
     // Pobierz playlisty
     const fetchPlaylists = async () => {
