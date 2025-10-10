@@ -2926,8 +2926,10 @@ app.get('/api/tmdb/search', async (req, res) => {
     }
 });
 
-// Pełna funkcja processDownloadQueue z poprawkami nazewnictwa Plex i TMDB
-// Pełna funkcja processDownloadQueue z poprawkami nazewnictwa Plex i TMDB oraz automatyczną archiwizacją
+// KOMPLETNA FUNKCJA DO PODMIANY w backend/server.js
+// Znajdź funkcję "async function processDownloadQueue()" (około linii 2350-2600)
+// i ZASTĄP JĄ CAŁKOWICIE tym kodem:
+
 async function processDownloadQueue() {
     if (isProcessing || downloadQueue.length === 0) {
         return;
@@ -2981,14 +2983,13 @@ async function processDownloadQueue() {
         let tmdbDetails = null;
         let tmdbEpisodeDetails = null;
         try {
-            // Pobierz TMDB ID z bazy danych
             const mediaFromDb = await dbAll(`
                 SELECT tmdb_id FROM media 
                 WHERE stream_id = ? AND stream_type = ? 
                 LIMIT 1
             `, [downloadJob.stream_id, downloadJob.stream_type]);
             
-            const tmdbId = mediaFromDb[0]?.tmdb_id || mediaDetailsResponse?.data?.info?.tmdb;
+            const tmdbId = mediaFromDb[0]?.tmdb_id || mediaDetailsResponse?.data?.info?.tmdb || mediaDetailsResponse?.data?.movie_data?.tmdb_id;
             
             if (tmdbId) {
                 const tmdbApiRows = await dbAll('SELECT value FROM settings WHERE key = ?', ['tmdbApi']);
@@ -3003,7 +3004,7 @@ async function processDownloadQueue() {
                     tmdbDetails = tmdbResponse.data;
                     console.log(`✅ TMDB: "${tmdbDetails.title || tmdbDetails.name}" (${tmdbDetails.release_date || tmdbDetails.first_air_date})`);
                     
-                    // ✅ POBIERZ SZCZEGÓŁY ODCINKA Z TMDB (tylko dla seriali)
+                    // Pobierz szczegóły odcinka z TMDB (tylko dla seriali)
                     if (downloadJob.stream_type === 'series' && downloadJob.episode_id) {
                         const allEpisodes = mediaDetailsResponse?.data?.episodes ? Object.values(mediaDetailsResponse.data.episodes).flat() : [];
                         const episodeData = allEpisodes.find(ep => ep.id == downloadJob.episode_id);
@@ -3041,17 +3042,40 @@ async function processDownloadQueue() {
         let downloadUrl;
 
         if (downloadJob.stream_type === 'movie') {
-            // Sprawdź różne źródła rozszerzenia dla filmów
-            if (details.xtream_details?.info?.container_extension) {
+            // ✅ POPRAWKA: Sprawdź różne źródła rozszerzenia dla filmów
+            console.log('🎬 Determining movie file extension...');
+            console.log('📊 Available data sources:', {
+                has_xtream_details: !!details.xtream_details,
+                has_movie_data: !!details.xtream_details?.movie_data,
+                has_info: !!details.xtream_details?.info,
+                movie_data_extension: details.xtream_details?.movie_data?.container_extension,
+                info_extension: details.xtream_details?.info?.container_extension
+            });
+            
+            // PRIORYTET 1: container_extension z movie_data (to jest główne źródło!)
+            if (details.xtream_details?.movie_data?.container_extension) {
+                extension = details.xtream_details.movie_data.container_extension;
+                console.log(`✅ Using extension from movie_data: ${extension}`);
+            } 
+            // PRIORYTET 2: container_extension z info
+            else if (details.xtream_details?.info?.container_extension) {
                 extension = details.xtream_details.info.container_extension;
-            } else {
+                console.log(`✅ Using extension from info: ${extension}`);
+            }
+            // PRIORYTET 3: wykryj z nazwy pliku
+            else {
                 const filenameMatch = downloadJob.filename?.match(/\.(mp4|mkv|avi|mov|m4v|wmv|flv|ts|m2ts)$/i);
                 if (filenameMatch) {
                     extension = filenameMatch[1].toLowerCase();
+                    console.log(`✅ Detected extension from filename: ${extension}`);
+                } else {
+                    console.log(`⚠️ No extension found, using default: ${extension}`);
                 }
             }
             
             downloadUrl = `${downloadJob.server_url}/movie/${downloadJob.username}/${downloadJob.password}/${downloadJob.stream_id}.${extension}`;
+            
+            console.log(`🎬 FINAL MOVIE DOWNLOAD URL: ${downloadUrl}`);
             
         } else {
             // Dla seriali: znajdź konkretny odcinek i weź jego rozszerzenie
@@ -3060,6 +3084,8 @@ async function processDownloadQueue() {
             extension = episodeData?.container_extension || 'mkv';
             
             downloadUrl = `${downloadJob.server_url}/series/${downloadJob.username}/${downloadJob.password}/${downloadJob.episode_id}.${extension}`;
+            
+            console.log(`📺 FINAL SERIES DOWNLOAD URL: ${downloadUrl}`);
         }
 
         // === PLEX-KOMPATYBILNA STRUKTURA FOLDERÓW I NAZW ===
@@ -3068,11 +3094,11 @@ async function processDownloadQueue() {
         if (downloadJob.stream_type === 'movie') {
             // === FILMY: /Movies/Movie Title (Year)/Movie Title (Year).ext ===
             
-            const movieInfo = details.xtream_details?.info || {};
+            const movieInfo = details.xtream_details?.movie_data || details.xtream_details?.info || {};
             const tmdbData = details.tmdb_details;
             
             // ✅ PRIORYTET: Użyj nazwy i roku z TMDB jeśli dostępne
-            let movieTitle = tmdbData?.title || movieInfo.name || details.name || downloadJob.filename;
+            let movieTitle = tmdbData?.title || movieInfo?.name || details.name || downloadJob.filename;
             let releaseYear = 'Unknown';
             
             // ✅ PRIORYTETOWE ŹRÓDŁA ROKU (TMDB FIRST)
@@ -3125,7 +3151,7 @@ async function processDownloadQueue() {
             console.log(`  - TMDB Date: "${tmdbData?.release_date || 'N/A'}"`);
             console.log(`  - Final Title: "${movieTitle}"`);
             console.log(`  - Final Year: ${releaseYear}`);
-            console.log(`  - Safe: "${safeMovieTitle}"`);
+            console.log(`  - Extension: ${extension}`);
             console.log(`  - Structure: ${movieFolderName}/${movieFileName}`);
             
         } else {
@@ -3170,7 +3196,6 @@ async function processDownloadQueue() {
                     console.log(`📺 Używam roku z last_modified: ${releaseYear}`);
                 }
             } else {
-                // Fallback: wykryj rok z nazwy
                 const yearMatches = seriesTitle.match(/[\(\[]?(\d{4})[\)\]]?/g);
                 if (yearMatches) {
                     const firstYearMatch = yearMatches[0];
@@ -3183,71 +3208,43 @@ async function processDownloadQueue() {
                 }
             }
             
-            // ✅ LEPSZY FALLBACK: Jeśli nadal Unknown, użyj inteligentnego domyślnego
             if (releaseYear === 'Unknown') {
                 const currentYear = new Date().getFullYear();
                 releaseYear = currentYear - 2;
                 console.log(`⚠️ Brak roku dla serialu "${seriesTitle}", używam domyślnego: ${releaseYear}`);
             }
             
-            // Wyczyść nazwy dla systemu plików
             const safeSeriesTitle = seriesTitle
                 .replace(/[<>:"/\\|?*]/g, '')
                 .replace(/\s+/g, ' ')
                 .trim();
 
-            // ✅ INTELIGENTNY TYTUŁ ODCINKA Z TMDB
-            let cleanEpisodeTitle = 'Odcinek ' + episodeData.episode_num; // domyślny fallback
+            // Inteligentny tytuł odcinka z TMDB
+            let cleanEpisodeTitle = 'Odcinek ' + episodeData.episode_num;
             
-            console.log(`📺 EPISODE TITLE PROCESSING:`);
-            console.log(`  - Original Xtream Title: "${episodeData.title || 'N/A'}"`);
-            console.log(`  - TMDB Episode Title: "${details.tmdb_episode_details?.name || 'N/A'}"`);
-            
-            // ✅ PRIORYTET 1: Użyj tytułu z TMDB jeśli dostępny
             if (details.tmdb_episode_details?.name) {
                 cleanEpisodeTitle = details.tmdb_episode_details.name;
                 console.log(`  ✅ Using TMDB episode title: "${cleanEpisodeTitle}"`);
-            } 
-            // ✅ PRIORYTET 2: Spróbuj wyczyścić tytuł z Xtream
-            else if (episodeData.title) {
+            } else if (episodeData.title) {
                 cleanEpisodeTitle = episodeData.title;
-                console.log(`  📺 Using Xtream title, will clean: "${cleanEpisodeTitle}"`);
-                
-                // Usuń prefiksy językowe (PL, EN, US, DE, FR, ES, IT, itp.)
                 cleanEpisodeTitle = cleanEpisodeTitle.replace(/^[A-Z]{2,3}\s*[-\s]*/, '').trim();
-                console.log(`  - After language prefix removal: "${cleanEpisodeTitle}"`);
-
-                // Usuń nazwę serialu z TMDB (najdokładniejsza)
+                
                 if (tmdbData?.name) {
                     const tmdbNameRegex = new RegExp(tmdbData.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
                     cleanEpisodeTitle = cleanEpisodeTitle.replace(tmdbNameRegex, '').trim();
-                    console.log(`  - After TMDB series name removal: "${cleanEpisodeTitle}"`);
                 }
-
-                // Usuń kody odcinków (S01E01, S1E1, 1x01, itp.)
+                
                 cleanEpisodeTitle = cleanEpisodeTitle.replace(/S\d{1,2}E\d{1,2}/gi, '').trim();
                 cleanEpisodeTitle = cleanEpisodeTitle.replace(/\d{1,2}x\d{1,2}/gi, '').trim();
                 cleanEpisodeTitle = cleanEpisodeTitle.replace(/Season\s*\d+\s*Episode\s*\d+/gi, '').trim();
-                console.log(`  - After episode code removal: "${cleanEpisodeTitle}"`);
-
-                // Usuń pozostałe separatory i słowa językowe
-                cleanEpisodeTitle = cleanEpisodeTitle.replace(/^[\s\-–—_\|]+/, '').trim(); // wiodące
-                cleanEpisodeTitle = cleanEpisodeTitle.replace(/[\s\-–—_\|]+$/, '').trim(); // końcowe  
-                cleanEpisodeTitle = cleanEpisodeTitle.replace(/\s*-\s*-\s*/g, ' - ').trim(); // podwójne myślniki
-                cleanEpisodeTitle = cleanEpisodeTitle.replace(/^(Polski|Polish|English|Deutsch|Français|Español|Italiano)\s*[-\s]*/i, '').trim();
-                cleanEpisodeTitle = cleanEpisodeTitle.replace(/\s+/g, ' ').trim(); // wielokrotne spacje
-                console.log(`  - After full cleanup: "${cleanEpisodeTitle}"`);
-
-                // Jeśli po czyszczeniu zostało bardzo mało, użyj domyślnego
+                cleanEpisodeTitle = cleanEpisodeTitle.replace(/^[\s\-–—_\|]+/, '').trim();
+                cleanEpisodeTitle = cleanEpisodeTitle.replace(/[\s\-–—_\|]+$/, '').trim();
+                cleanEpisodeTitle = cleanEpisodeTitle.replace(/\s*-\s*-\s*/g, ' - ').trim();
+                cleanEpisodeTitle = cleanEpisodeTitle.replace(/\s+/g, ' ').trim();
+                
                 if (!cleanEpisodeTitle || cleanEpisodeTitle.length < 3 || /^[-\s]*$/.test(cleanEpisodeTitle)) {
                     cleanEpisodeTitle = `Odcinek ${episodeData.episode_num}`;
-                    console.log(`  - Using fallback: "${cleanEpisodeTitle}"`);
                 }
-            }
-            
-            // ✅ DODATKOWE INFO: Jeśli TMDB ma opis odcinka, pokaż go w logach
-            if (details.tmdb_episode_details?.overview) {
-                console.log(`  📖 TMDB Episode Overview: "${details.tmdb_episode_details.overview.substring(0, 100)}..."`);
             }
 
             const safeEpisodeTitle = cleanEpisodeTitle
@@ -3255,32 +3252,21 @@ async function processDownloadQueue() {
                 .replace(/\s+/g, ' ')
                 .trim();
             
-            // Format numerów z zerami wiodącymi
             const seasonPadded = String(episodeData.season || 1).padStart(2, '0');
             const episodePadded = String(episodeData.episode_num || 1).padStart(2, '0');
             
-            // Struktura Plex dla seriali
             const seriesFolderName = `${safeSeriesTitle} (${releaseYear})`;
             const seasonFolderName = `Season ${seasonPadded}`;
-            
-            // ✅ Format nazwy pliku zgodny z Plex: "Show Title - S01E05 - Episode Title.ext"
             const episodeFileName = `${safeSeriesTitle} - S${seasonPadded}E${episodePadded} - ${safeEpisodeTitle}.${extension}`;
             
             plexCompatiblePath = path.join('/downloads/series', seriesFolderName, seasonFolderName, episodeFileName);
             
-            console.log(`📺 PLEX SERIES (TMDB ENHANCED):`);
-            console.log(`  - TMDB Series: "${tmdbData?.name || 'N/A'}"`);
-            console.log(`  - TMDB Air Date: "${tmdbData?.first_air_date || 'N/A'}"`);
-            console.log(`  - TMDB Episode: "${details.tmdb_episode_details?.name || 'N/A'}"`);
-            console.log(`  - TMDB Episode Air: "${details.tmdb_episode_details?.air_date || 'N/A'}"`);
-            console.log(`  - Xtream Series: "${seriesInfo.name || 'N/A'}"`);
-            console.log(`  - Xtream Episode: "${episodeData.title || 'N/A'}"`);
+            console.log(`📺 PLEX SERIES:`);
             console.log(`  - Final Series: "${seriesTitle}"`);
             console.log(`  - Final Episode: "${safeEpisodeTitle}"`);
             console.log(`  - Final Year: ${releaseYear}`);
-            console.log(`  - Season: ${episodeData.season} -> ${seasonPadded}`);
-            console.log(`  - Episode: ${episodeData.episode_num} -> ${episodePadded}`);
-            console.log(`  - Final Structure: ${seriesFolderName}/${seasonFolderName}/${episodeFileName}`);
+            console.log(`  - Extension: ${extension}`);
+            console.log(`  - Structure: ${seriesFolderName}/${seasonFolderName}/${episodeFileName}`);
         }
 
         // Aktualizuj szczegóły w bazie z Plex-kompatybilną ścieżką
@@ -3291,12 +3277,12 @@ async function processDownloadQueue() {
         console.log(`📁 Final Plex Path: ${plexCompatiblePath}`);
         console.log(`🌐 Download URL: ${downloadUrl}`);
 
-        // ✅ DIAGNOSTYKA URL - sprawdź czy URL jest dostępny
+        // Diagnostyka URL - sprawdź czy URL jest dostępny
         console.log(`🔍 Testing download URL accessibility...`);
         try {
             const headResponse = await axios.head(downloadUrl, { 
                 timeout: 10000,
-                validateStatus: (status) => status < 500 // Akceptuj kody 4xx jako info, ale nie 5xx
+                validateStatus: (status) => status < 500
             });
             console.log(`✅ URL accessible: HTTP ${headResponse.status}`);
             if (headResponse.headers['content-length']) {
@@ -3308,7 +3294,7 @@ async function processDownloadQueue() {
         } catch (headError) {
             console.warn(`⚠️ URL test failed: HTTP ${headError.response?.status || 'timeout'} - ${headError.message}`);
             if (headError.response?.status === 404) {
-                console.error(`❌ CRITICAL: File not found (404). URL may be incorrect or episode unavailable.`);
+                console.error(`❌ CRITICAL: File not found (404). URL may be incorrect or file unavailable.`);
             } else if (headError.response?.status === 403) {
                 console.error(`❌ CRITICAL: Access forbidden (403). Check credentials or stream permissions.`);
             }
@@ -3338,7 +3324,6 @@ async function processDownloadQueue() {
                 if (code === 0 || stdoutData.includes('SUCCESS')) {
                     resolve();
                 } else {
-                    // ✅ LEPSZA DIAGNOSTYKA BŁĘDÓW CURL
                     let errorMessage = `Download failed with code ${code}`;
                     
                     if (code === 1) {
@@ -3367,7 +3352,7 @@ async function processDownloadQueue() {
             });
         });
 
-        // ✅ POPRAWKA: Oznacz jako ukończone I automatycznie archiwizuj
+        // Oznacz jako ukończone I automatycznie archiwizuj
         await dbRun('UPDATE downloads SET status = ?, worker_status = ?, progress = 100, archived = 1 WHERE id = ?', 
                     ['completed', 'completed', downloadJob.id]);
         console.log(`✅ Download completed and automatically archived for job ${downloadJob.id}: ${finalFileName}`);
