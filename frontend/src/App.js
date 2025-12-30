@@ -2202,6 +2202,11 @@ const DetailsView = ({ type, id, favorites, onToggleFavorite, onDownload }) => {
                     <div className="flex items-start justify-between mb-4">
                         <div className="flex-1">
                             <h2 className="text-4xl font-bold">{tmdb?.title || tmdb?.name || details.name}</h2>
+                            {details.original_name && details.original_name !== details.name && (
+                                <p className="text-lg text-gray-400 mt-1">
+                                    Oryginalna nazwa: {details.original_name}
+                                </p>
+                            )}
                             <div className="flex items-center my-2 text-lg text-gray-400 flex-wrap">
                                 {releaseYear && <span>{releaseYear}</span>}
                                 {genres && <span className="mx-2">&bull;</span>}
