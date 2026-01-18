@@ -1020,26 +1020,31 @@ async function syncSinglePlaylist(playlist) {
             if (languageFilters && languageFilters.length > 0) {
                 console.log(`  🌐 Stosowanie filtra językowego: ${languageFilters.join(', ')}`);
                 const languageRegex = /^([A-Z]{2,3})\s*[-:\s]/;
-                
+
                 const beforeCount = seriesList.length;
                 seriesList = seriesList.filter(s => {
                     const match = s.name?.match(languageRegex);
-                    
+
+                    // DEBUG: Loguj "PL - THE PITT" jeśli się pojawi
+                    if (s.name && s.name.includes('PITT')) {
+                        console.log(`  🔍 DEBUG "THE PITT": name="${s.name}", match=${JSON.stringify(match)}, langCode=${match?.[1]}, filters=${JSON.stringify(languageFilters)}`);
+                    }
+
                     // Jeśli nie ma prefiksu językowego, domyślnie AKCEPTUJ
                     if (!match) {
                         return true;
                     }
-                    
+
                     const langCode = match[1];
                     const isIncluded = languageFilters.includes(langCode);
-                    
+
                     if (!isIncluded && beforeCount <= 10) {
                         console.log(`    ❌ Serial "${s.name}" pominięty (język: ${langCode})`);
                     }
-                    
+
                     return isIncluded;
                 });
-                
+
                 console.log(`  ✅ Po filtrze językowym: ${seriesList.length} seriali (odrzucono: ${beforeCount - seriesList.length})`);
             } else {
                 console.log(`  ℹ️ Brak filtra językowego - pobieranie wszystkich`);
