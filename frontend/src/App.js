@@ -2330,15 +2330,16 @@ const HomeView = ({ queryParams, onNavigate, favorites, onToggleFavorite }) => {
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
     const [searchTerm, setSearchTerm] = useState(queryParams.search || '');
+    const [searchMode, setSearchMode] = useState(queryParams.searchMode || 'name');
 
     useEffect(() => {
         const timerId = setTimeout(() => {
-            if (searchTerm !== queryParams.search) {
-                onNavigate({ ...queryParams, search: searchTerm, page: 1 });
+            if (searchTerm !== queryParams.search || searchMode !== queryParams.searchMode) {
+                onNavigate({ ...queryParams, search: searchTerm, searchMode: searchMode, page: 1 });
             }
         }, 500);
         return () => clearTimeout(timerId);
-    }, [searchTerm, queryParams, onNavigate]);
+    }, [searchTerm, searchMode, queryParams, onNavigate]);
 
     useEffect(() => {
         const fetchGenres = async () => {
@@ -2355,11 +2356,12 @@ const HomeView = ({ queryParams, onNavigate, favorites, onToggleFavorite }) => {
             setLoading(true);
             setError(null);
             try {
-                const params = { 
-                    page: queryParams.page || 1, 
-                    limit: 30, 
-                    genre: queryParams.genre || 'all', 
+                const params = {
+                    page: queryParams.page || 1,
+                    limit: 30,
+                    genre: queryParams.genre || 'all',
                     search: queryParams.search || '',
+                    searchMode: queryParams.searchMode || 'name',
                     filter: queryParams.filter || ''
                 };
                 const response = await axios.get('/api/media', { params });
@@ -2392,7 +2394,17 @@ const HomeView = ({ queryParams, onNavigate, favorites, onToggleFavorite }) => {
                 <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
                     <div className="md:col-span-2">
                         <label htmlFor="search" className="block text-sm font-medium text-gray-300 mb-1">Wyszukaj tytuł</label>
-                        <input type="text" id="search" placeholder="np. The Boys..." value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} className="w-full bg-gray-700 border border-gray-600 rounded-md p-2 text-white focus:outline-none focus:ring-2 focus:ring-red-500"/>
+                        <input type="text" id="search" placeholder={searchMode === 'tmdb' ? "np. 12345..." : "np. The Boys..."} value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} className="w-full bg-gray-700 border border-gray-600 rounded-md p-2 text-white focus:outline-none focus:ring-2 focus:ring-red-500"/>
+                        <div className="flex gap-4 mt-2">
+                            <label className="flex items-center text-sm text-gray-300 cursor-pointer">
+                                <input type="radio" name="searchMode" value="name" checked={searchMode === 'name'} onChange={(e) => setSearchMode(e.target.value)} className="mr-1.5 accent-red-500"/>
+                                Nazwa
+                            </label>
+                            <label className="flex items-center text-sm text-gray-300 cursor-pointer">
+                                <input type="radio" name="searchMode" value="tmdb" checked={searchMode === 'tmdb'} onChange={(e) => setSearchMode(e.target.value)} className="mr-1.5 accent-red-500"/>
+                                TMDB ID
+                            </label>
+                        </div>
                     </div>
                     <div>
                         <label htmlFor="genreFilter" className="block text-sm font-medium text-gray-300 mb-1">Gatunek</label>

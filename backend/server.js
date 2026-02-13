@@ -1530,11 +1530,12 @@ app.post('/api/favorites/toggle', async (req, res) => {
 // --- API MEDIA ---
 
 app.get('/api/media', (req, res) => {
-    const { 
-        page = 1, 
-        limit = 30, 
-        search = '', 
-        genre = 'all', 
+    const {
+        page = 1,
+        limit = 30,
+        search = '',
+        searchMode = 'name',
+        genre = 'all',
         filter = '',
         playlist = 'all'
     } = req.query;
@@ -1565,8 +1566,13 @@ app.get('/api/media', (req, res) => {
     
     // Filtr wyszukiwania
     if (search) {
-        whereClauses.push(`m.name LIKE ?`);
-        params.push(`%${search}%`);
+        if (searchMode === 'tmdb') {
+            whereClauses.push(`m.tmdb_id = ?`);
+            params.push(search);
+        } else {
+            whereClauses.push(`m.name LIKE ?`);
+            params.push(`%${search}%`);
+        }
     }
     
     // NOWY: Filtr playlist
