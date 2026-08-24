@@ -2963,6 +2963,122 @@ app.get('/api/tmdb/search', async (req, res) => {
 // Znajdź funkcję "async function processDownloadQueue()" (około linii 2350-2600)
 // i ZASTĄP JĄ CAŁKOWICIE tym kodem:
 
+// ============================================================
+// === SEMAFOR SLOTU XTREAM ===
+// Konto Xtream ma limit rownoczesnych polaczen (u nas: 1).
+// Przekroczenie limitu = serwer odrzuca polaczenie (403), curl wchodzi
+// w dlugie retry i pobieranie "muli". Ten modul pilnuje, zeby aplikacja
+// nigdy nie przekroczyla limitu i zeby czekala, gdy slot zajmuje
+// inny klient (TV, telefon).
+// ============================================================
+
+const xtreamSlot = {
+    // ile slotow zajmuje teraz sama aplikacja
+    inUse: 0,
+    // limit odczytany z konta; do czasu odczytu zakladamy 1 (najbezpieczniej)
+    maxConnections: 1,
+    // kolejka oczekujacych (FIFO) - kazdy wpis to funkcja wznawiajaca
+    waiting: [],
+    // cache odpowiedzi get_account_info, zeby nie pytac serwera co chwile
+    lastCheck: { at: 0, activeCons: 0, maxCons: 1 },
+    CHECK_TTL_MS: 15000,
+};
+
+/**
+ * Pyta serwer Xtream ile polaczen jest aktywnych.
+ * Zwraca null, gdy nie da sie ustalic (wtedy polegamy na samym semaforze).
+ */
+async function checkXtreamConnections(playlist, { useCache = true } = {}) {
+    if (!playlist || !playlist.server_url) return null;
+
+    const now = Date.now();
+    if (useCache && (now - xtreamSlot.lastCheck.at) < xtreamSlot.CHECK_TTL_MS) {
+        return xtreamSlot.lastCheck;
+    }
+
+    try {
+        const url = `${playlist.server_url}/player_api.php`
+            + `?username=${encodeURIComponent(playlist.username)}`
+            + `&password=${encodeURIComponent(playlist.password)}`;
+
+        const res = await axios.get(url, { timeout: 10000 });
+        const info = res.data && res.data.user_info;
+        if (!info) return null;
+
+        const activeCons = parseInt(info.active_cons, 10);
+        const maxCons = parseInt(info.max_connections, 10);
+
+        const result = {
+            at: now,
+            activeCons: Number.isNaN(activeCons) ? 0 : activeCons,
+            maxCons: Number.isNaN(maxCons) || maxCons < 1 ? 1 : maxCons,
+        };
+
+        xtreamSlot.lastCheck = result;
+        xtreamSlot.maxConnections = result.maxCons;
+        return result;
+    } catch (err) {
+        console.warn(`[SLOT] Nie udalo sie odczytac stanu polaczen: ${err.message}`);
+        return null;
+    }
+}
+
+/**
+ * Rezerwuje slot Xtream i uruchamia fn(). Slot jest zwalniany zawsze,
+ * takze gdy fn() rzuci wyjatek.
+ *
+ * @param {object}   playlist  dane playlisty (server_url/username/password)
+ * @param {function} fn        praca do wykonania na zajetym slocie
+ * @param {object}   opts      { label, checkRemote, onWait }
+ */
+async function withXtreamSlot(playlist, fn, opts = {}) {
+    const { label = 'zadanie', checkRemote = true, onWait = null } = opts;
+
+    // 1) Czekaj na wolny slot wewnatrz aplikacji (semafor).
+    if (xtreamSlot.inUse >= xtreamSlot.maxConnections) {
+        console.log(`[SLOT] ${label}: czekam na wolny slot (zajete ${xtreamSlot.inUse}/${xtreamSlot.maxConnections})`);
+        if (onWait) { try { await onWait('queue'); } catch (e) { /* nieistotne */ } }
+        await new Promise(resolve => xtreamSlot.waiting.push(resolve));
+    }
+
+    xtreamSlot.inUse++;
+
+    try {
+        // 2) Sprawdz u zrodla, czy slotu nie zajmuje inny klient (TV, telefon).
+        if (checkRemote && playlist) {
+            let attempt = 0;
+            const MAX_WAIT_ATTEMPTS = 40;      // 40 * 30s = do 20 minut
+            const WAIT_MS = 30000;
+
+            while (attempt < MAX_WAIT_ATTEMPTS) {
+                const status = await checkXtreamConnections(playlist, { useCache: attempt === 0 });
+                if (!status) break;            // nie wiemy - ufamy semaforowi
+
+                // Nasze wlasne, wlasnie zajete polaczenie jeszcze nie istnieje,
+                // wiec caly activeCons pochodzi od innych klientow.
+                const otherClients = Math.max(0, status.activeCons - (xtreamSlot.inUse - 1));
+
+                if (otherClients + xtreamSlot.inUse <= status.maxCons) break;  // jest miejsce
+
+                attempt++;
+                console.log(`[SLOT] ${label}: slot zajety przez innego klienta `
+                    + `(${status.activeCons}/${status.maxCons}), ponawiam za ${WAIT_MS / 1000}s `
+                    + `(proba ${attempt}/${MAX_WAIT_ATTEMPTS})`);
+                if (onWait) { try { await onWait('remote'); } catch (e) { /* nieistotne */ } }
+
+                xtreamSlot.lastCheck.at = 0;   // wymus swiezy odczyt
+                await new Promise(r => setTimeout(r, WAIT_MS));
+            }
+        }
+
+        return await fn();
+    } finally {
+        xtreamSlot.inUse--;
+        const next = xtreamSlot.waiting.shift();
+        if (next) next();
+    }
+}
+
 /**
  * Oczyszcza tytul do uzycia jako nazwa pliku/folderu dla Jellyfin.
  * Lapie przypadki, ktorych samo usuwanie <>:"/\|?* nie obsluguje:
@@ -3020,13 +3136,17 @@ async function processDownloadQueue() {
         
         let mediaDetailsResponse;
         try {
-            if (downloadJob.stream_type === 'series') {
-                const apiUrl = `${xtreamBaseUrl}&action=get_series_info&series_id=${downloadJob.stream_id}`;
-                mediaDetailsResponse = await axios.get(apiUrl, { timeout: 15000 });
-            } else {
-                const apiUrl = `${xtreamBaseUrl}&action=get_vod_info&vod_id=${downloadJob.stream_id}`;
-                mediaDetailsResponse = await axios.get(apiUrl, { timeout: 15000 });
-            }
+            const apiUrl = downloadJob.stream_type === 'series'
+                ? `${xtreamBaseUrl}&action=get_series_info&series_id=${downloadJob.stream_id}`
+                : `${xtreamBaseUrl}&action=get_vod_info&vod_id=${downloadJob.stream_id}`;
+
+            // player_api tez liczy sie do limitu polaczen - bierzemy slot,
+            // ale bez odpytywania zdalnego (to szybkie zapytanie, nie transfer).
+            mediaDetailsResponse = await withXtreamSlot(
+                downloadJob,
+                () => axios.get(apiUrl, { timeout: 15000 }),
+                { label: `info #${downloadJob.id}`, checkRemote: false }
+            );
         } catch (apiError) {
             console.warn(`⚠️ Nie udało się pobrać szczegółów z API: ${apiError.message}`);
             mediaDetailsResponse = { data: null };
@@ -3036,18 +3156,19 @@ async function processDownloadQueue() {
         let tmdbDetails = null;
         let tmdbEpisodeDetails = null;
         try {
-            const mediaFromDb = await dbAll(`
-                SELECT tmdb_id FROM media 
-                WHERE stream_id = ? AND stream_type = ? 
-                LIMIT 1
-            `, [downloadJob.stream_id, downloadJob.stream_type]);
-            
+            // Oba zapytania sa niezalezne - pytamy rownolegle zamiast po kolei.
+            const [mediaFromDb, tmdbApiRows] = await Promise.all([
+                dbAll(
+                    'SELECT tmdb_id FROM media WHERE stream_id = ? AND stream_type = ? LIMIT 1',
+                    [downloadJob.stream_id, downloadJob.stream_type]
+                ),
+                dbAll('SELECT value FROM settings WHERE key = ?', ['tmdbApi'])
+            ]);
+
             const tmdbId = mediaFromDb[0]?.tmdb_id || mediaDetailsResponse?.data?.info?.tmdb || mediaDetailsResponse?.data?.movie_data?.tmdb_id;
-            
+            const tmdbApi = tmdbApiRows[0]?.value;
+
             if (tmdbId) {
-                const tmdbApiRows = await dbAll('SELECT value FROM settings WHERE key = ?', ['tmdbApi']);
-                const tmdbApi = tmdbApiRows[0]?.value;
-                
                 if (tmdbApi) {
                     const tmdbType = downloadJob.stream_type === 'series' ? 'tv' : 'movie';
                     const tmdbUrl = `https://api.themoviedb.org/3/${tmdbType}/${tmdbId}?api_key=${tmdbApi}&language=pl-PL`;
@@ -3334,31 +3455,12 @@ async function processDownloadQueue() {
         console.log(`📁 Final Plex Path: ${plexCompatiblePath}`);
         console.log(`🌐 Download URL: ${downloadUrl}`);
 
-        // Diagnostyka URL - sprawdź czy URL jest dostępny
-        console.log(`🔍 Testing download URL accessibility...`);
-        try {
-            const headResponse = await axios.head(downloadUrl, { 
-                timeout: 10000,
-                validateStatus: (status) => status < 500
-            });
-            console.log(`✅ URL accessible: HTTP ${headResponse.status}`);
-            if (headResponse.headers['content-length']) {
-                console.log(`📏 Content-Length: ${Math.round(headResponse.headers['content-length'] / 1024 / 1024)}MB`);
-            }
-            if (headResponse.headers['content-type']) {
-                console.log(`🎬 Content-Type: ${headResponse.headers['content-type']}`);
-            }
-        } catch (headError) {
-            console.warn(`⚠️ URL test failed: HTTP ${headError.response?.status || 'timeout'} - ${headError.message}`);
-            if (headError.response?.status === 404) {
-                console.error(`❌ CRITICAL: File not found (404). URL may be incorrect or file unavailable.`);
-            } else if (headError.response?.status === 403) {
-                console.error(`❌ CRITICAL: Access forbidden (403). Check credentials or stream permissions.`);
-            }
-        }
-
-        // Użyj download_manager.py do pobrania
-        await new Promise((resolve, reject) => {
+        // Diagnostyczny HEAD zostal usuniety: otwieral dodatkowe polaczenie
+        // do Xtream (przy limicie 1 slotu potrafil zablokowac wlasne pobieranie),
+        // a jego wynik i tak nie wplywal na dalszy przebieg - nawet 404 nie
+        // przerywalo pobierania. Bledy HTTP wychwytuje curl w download_manager.py.
+        // Pobieranie zajmuje slot Xtream na caly czas transferu.
+        await withXtreamSlot(downloadJob, () => new Promise((resolve, reject) => {
             const pythonProcess = spawn('python3', ['download_manager.py', downloadUrl, plexCompatiblePath]);
             activeDownloads.set(downloadJob.id, pythonProcess);
 
@@ -3407,6 +3509,19 @@ async function processDownloadQueue() {
                 console.error(`Download ${downloadJob.id} process error:`, error);
                 reject(error);
             });
+        }), {
+            label: `pobieranie #${downloadJob.id}`,
+            // Gdy slot zajmuje inny klient, zadanie czeka w kolejce
+            // zamiast konczyc sie bledem.
+            onWait: async (powod) => {
+                await dbRun(
+                    'UPDATE downloads SET status = ?, worker_status = ? WHERE id = ?',
+                    ['waiting_for_slot', 'waiting_for_slot', downloadJob.id]
+                );
+                if (powod === 'remote') {
+                    console.log(`[SLOT] #${downloadJob.id} czeka - slot zajety poza aplikacja`);
+                }
+            }
         });
 
         // Oznacz jako ukończone I automatycznie archiwizuj
@@ -4823,8 +4938,13 @@ app.post('/api/media/:stream_id/:stream_type/assign-tmdb', async (req, res) => {
 app.listen(PORT, () => {
     console.log(`Serwer backendu działa na porcie ${PORT}`);
     
-    // Auto-start Download Manager po uruchomieniu serwera
-    setTimeout(autoStartDownloadManager, 3000); // Czekaj 3s na inicjalizację bazy
+    // Pythonowy daemon (download_manager.py --daemon) NIE startuje juz
+    // automatycznie. Mial wlasna kolejke czytana z tej samej tabeli downloads
+    // i rownolegle z kolejka Node uruchamial curl - przy limicie 1 polaczenia
+    // Xtream drugie zadanie dostawalo 403 i wpadalo w dlugie retry.
+    // Pobieraniem zarzadza teraz wylacznie processDownloadQueue() w Node,
+    // ktore przechodzi przez xtreamSlot (patrz: semafor slotu).
+    // Daemon mozna nadal uruchomic recznie przez /api/downloads/start-daemon.
 });
 
 // W server.js, zamień istniejący cron job na ten zaktualizowany:
