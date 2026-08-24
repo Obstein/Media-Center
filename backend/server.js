@@ -513,15 +513,16 @@ app.use(express.json());
 // Pobierz wszystkie playlisty
 app.get('/api/playlists', async (req, res) => {
     try {
+        // Kazdy licznik w osobnym podzapytaniu. Dwa LEFT JOIN naraz
+        // (media + favorites) daly iloczyn kartezjanski: kazdy wiersz mediow
+        // mnozyl sie przez kazde ulubione, wiec karta playlisty pokazywala
+        // setki tysiecy pozycji, a oba liczniki mialy identyczna wartosc.
         const playlists = await dbAll(`
-            SELECT 
+            SELECT
                 p.*,
-                COUNT(m.stream_id) as media_count,
-                COUNT(CASE WHEN f.stream_id IS NOT NULL THEN 1 END) as favorites_count
+                (SELECT COUNT(*) FROM media m WHERE m.playlist_id = p.id) as media_count,
+                (SELECT COUNT(*) FROM favorites f WHERE f.playlist_id = p.id) as favorites_count
             FROM playlists p
-            LEFT JOIN media m ON p.id = m.playlist_id
-            LEFT JOIN favorites f ON p.id = f.playlist_id
-            GROUP BY p.id
             ORDER BY p.created_at DESC
         `);
         
@@ -536,16 +537,14 @@ app.get('/api/playlists', async (req, res) => {
 app.get('/api/playlists/:id', async (req, res) => {
     const { id } = req.params;
     try {
+        // Liczniki w podzapytaniach - patrz komentarz przy GET /api/playlists.
         const playlist = await dbAll(`
-            SELECT 
+            SELECT
                 p.*,
-                COUNT(m.stream_id) as media_count,
-                COUNT(CASE WHEN f.stream_id IS NOT NULL THEN 1 END) as favorites_count
+                (SELECT COUNT(*) FROM media m WHERE m.playlist_id = p.id) as media_count,
+                (SELECT COUNT(*) FROM favorites f WHERE f.playlist_id = p.id) as favorites_count
             FROM playlists p
-            LEFT JOIN media m ON p.id = m.playlist_id
-            LEFT JOIN favorites f ON p.id = f.playlist_id
             WHERE p.id = ?
-            GROUP BY p.id
         `, [id]);
         
         if (playlist.length === 0) {

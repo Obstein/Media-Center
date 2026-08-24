@@ -197,9 +197,11 @@ const PlaylistCard = ({ playlist, onEdit, onDelete, onToggle, onSync, onEditFilt
 </button>
                 <button
                     onClick={() => onDelete(playlist.id, playlist.name)}
-                    disabled={playlist.media_count > 0 || syncing}
+                    disabled={syncing}
                     className="px-3 py-2 rounded text-sm font-medium bg-red-600 hover:bg-red-700 disabled:bg-red-800 disabled:cursor-not-allowed text-white transition-colors"
-                    title={playlist.media_count > 0 ? 'Nie można usunąć playlisty z mediami' : 'Usuń playlistę'}
+                    title={playlist.media_count > 0
+                        ? `Usuń playlistę wraz z ${playlist.media_count} pozycjami`
+                        : 'Usuń playlistę'}
                 >
                     🗑️
                 </button>
