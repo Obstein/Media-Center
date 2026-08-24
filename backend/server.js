@@ -1897,7 +1897,7 @@ app.post('/api/media/refresh', async (req, res) => {
         if (itemsToAdd.length > 0) {
             console.log(`Dodawanie ${itemsToAdd.length} nowych pozycji...`);
             
-            const insertMediaSql = `INSERT OR REPLACE INTO media (stream_id, name, stream_icon, rating, tmdb_id, stream_type, container_extension) VALUES (?, ?, ?, ?, ?, ?, ?)`;
+            const insertMediaSql = `INSERT OR REPLACE INTO media (stream_id, name, stream_icon, rating, tmdb_id, stream_type, container_extension, lang_code, quality_tag, clean_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
             const insertGenreSql = `INSERT OR IGNORE INTO genres (id, name) VALUES (?, ?)`;
             const insertMediaGenreSql = `INSERT OR IGNORE INTO media_genres (media_stream_id, media_stream_type, genre_id) VALUES (?, ?, ?)`;
             
@@ -1909,14 +1909,18 @@ app.post('/api/media/refresh', async (req, res) => {
                 let processedCount = 0;
                 for (const item of itemsToAdd) {
                     const tmdbId = item.tmdb;
+                    const classified = classifyMediaName(item.name);
                     await stmtRun(mediaStmt, [
-                        item.stream_id, 
-                        item.name, 
-                        item.stream_icon || item.cover, 
-                        item.rating_5based || item.rating, 
-                        tmdbId, 
-                        item.stream_type, 
-                        item.container_extension
+                        item.stream_id,
+                        item.name,
+                        item.stream_icon || item.cover,
+                        item.rating_5based || item.rating,
+                        tmdbId,
+                        item.stream_type,
+                        item.container_extension,
+                        classified.langCode,
+                        classified.qualityTag,
+                        classified.cleanName
                     ]);
                     
                     // Pobierz gatunki z TMDB jeśli mamy ID

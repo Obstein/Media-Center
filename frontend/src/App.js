@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
 import './index.css';
 
@@ -10,12 +10,74 @@ const imageProxy = (url) => {
 
 // --- Komponent Paginacji ---
 const Pagination = ({ currentPage, totalPages, onPageChange }) => {
+    const [jumpTo, setJumpTo] = useState('');
     if (totalPages <= 1) return null;
+
+    // Okno numerow wokol biezacej strony - przy tysiacach stron nie ma sensu
+    // rysowac wszystkich przyciskow.
+    const WINDOW = 2;
+    const pages = [];
+    let from = Math.max(1, currentPage - WINDOW);
+    let to = Math.min(totalPages, currentPage + WINDOW);
+
+    // Utrzymaj stala szerokosc okna takze na brzegach zakresu.
+    if (currentPage <= WINDOW) to = Math.min(totalPages, WINDOW * 2 + 1);
+    if (currentPage > totalPages - WINDOW) from = Math.max(1, totalPages - WINDOW * 2);
+
+    for (let p = from; p <= to; p++) pages.push(p);
+
+    const btn = 'px-3 py-2 rounded-md border border-gray-700 text-sm font-medium transition-colors';
+    const idle = 'bg-gray-800 text-gray-300 hover:bg-gray-700';
+    const off = 'disabled:opacity-40 disabled:cursor-not-allowed';
+
+    const handleJump = (e) => {
+        e.preventDefault();
+        const n = parseInt(jumpTo, 10);
+        if (!isNaN(n) && n >= 1 && n <= totalPages) {
+            onPageChange(n);
+            setJumpTo('');
+        }
+    };
+
     return (
-        <div className="flex justify-center items-center mt-10 space-x-4">
-            <button onClick={() => onPageChange(currentPage - 1)} disabled={currentPage === 1} className="px-4 py-2 rounded-md border border-gray-700 bg-gray-800 text-sm font-medium text-gray-300 hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed">Poprzednia</button>
-            <span className="text-gray-400">Strona {currentPage} z {totalPages}</span>
-            <button onClick={() => onPageChange(currentPage + 1)} disabled={currentPage === totalPages} className="px-4 py-2 rounded-md border border-gray-700 bg-gray-800 text-sm font-medium text-gray-300 hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed">Następna</button>
+        <div className="flex flex-col items-center gap-3 mt-10">
+            <div className="flex justify-center items-center gap-1 flex-wrap">
+                <button onClick={() => onPageChange(1)} disabled={currentPage === 1}
+                        title="Pierwsza strona"
+                        className={`${btn} ${idle} ${off}`}>&laquo;</button>
+                <button onClick={() => onPageChange(currentPage - 1)} disabled={currentPage === 1}
+                        className={`${btn} ${idle} ${off}`}>Poprzednia</button>
+
+                {from > 1 && <span className="px-2 text-gray-500">...</span>}
+
+                {pages.map(p => (
+                    <button key={p} onClick={() => onPageChange(p)}
+                            className={`${btn} ${p === currentPage
+                                ? 'bg-red-600 text-white border-red-600'
+                                : idle}`}>{p}</button>
+                ))}
+
+                {to < totalPages && <span className="px-2 text-gray-500">...</span>}
+
+                <button onClick={() => onPageChange(currentPage + 1)} disabled={currentPage === totalPages}
+                        className={`${btn} ${idle} ${off}`}>Nastepna</button>
+                <button onClick={() => onPageChange(totalPages)} disabled={currentPage === totalPages}
+                        title="Ostatnia strona"
+                        className={`${btn} ${idle} ${off}`}>&raquo;</button>
+            </div>
+
+            <div className="flex items-center gap-2 text-sm text-gray-400">
+                <span>Strona {currentPage} z {totalPages}</span>
+                {totalPages > 5 && (
+                    <form onSubmit={handleJump} className="flex items-center gap-1 ml-2">
+                        <span>Idz do:</span>
+                        <input type="number" min="1" max={totalPages} value={jumpTo}
+                               onChange={(e) => setJumpTo(e.target.value)}
+                               className="w-20 bg-gray-700 border border-gray-600 rounded px-2 py-1 text-white"/>
+                        <button type="submit" className="px-2 py-1 rounded bg-gray-700 hover:bg-gray-600 text-gray-200">OK</button>
+                    </form>
+                )}
+            </div>
         </div>
     );
 };
@@ -2331,6 +2393,8 @@ const HomeView = ({ queryParams, onNavigate, favorites, onToggleFavorite }) => {
     const [error, setError] = useState(null);
     const [searchTerm, setSearchTerm] = useState(queryParams.search || '');
     const [searchMode, setSearchMode] = useState(queryParams.searchMode || 'name');
+    const [languages, setLanguages] = useState([]);
+    const [qualityStats, setQualityStats] = useState(null);
 
     // Debounce wyszukiwarki. Zalezy tylko od tego, co user wpisal - gdyby
     // zalezal od calego queryParams, kazda zmiana strony tworzylaby nowy
@@ -2351,13 +2415,18 @@ const HomeView = ({ queryParams, onNavigate, favorites, onToggleFavorite }) => {
     }, [searchTerm, searchMode]);
 
     useEffect(() => {
-        const fetchGenres = async () => {
-            try {
-                const response = await axios.get('/api/genres');
-                setGenres(response.data);
-            } catch (err) { console.error("Nie udało się pobrać gatunków", err); }
+        // Gatunki, jezyki i statystyki jakosci sa niezalezne - pobieramy rownolegle.
+        const fetchFilters = async () => {
+            const [g, l, q] = await Promise.allSettled([
+                axios.get('/api/genres'),
+                axios.get('/api/media/languages'),
+                axios.get('/api/media/quality-stats'),
+            ]);
+            if (g.status === 'fulfilled') setGenres(g.value.data);
+            if (l.status === 'fulfilled') setLanguages(l.value.data);
+            if (q.status === 'fulfilled') setQualityStats(q.value.data);
         };
-        fetchGenres();
+        fetchFilters();
     }, []);
 
     useEffect(() => {
@@ -2371,7 +2440,11 @@ const HomeView = ({ queryParams, onNavigate, favorites, onToggleFavorite }) => {
                     genre: queryParams.genre || 'all',
                     search: queryParams.search || '',
                     searchMode: queryParams.searchMode || 'name',
-                    filter: queryParams.filter || ''
+                    filter: queryParams.filter || '',
+                    lang: queryParams.lang || 'all',
+                    type: queryParams.type || 'all',
+                    quality: queryParams.quality || 'good',
+                    sort: queryParams.sort || 'name'
                 };
                 const response = await axios.get('/api/media', { params });
                 setMediaData(response.data);
@@ -2396,6 +2469,26 @@ const HomeView = ({ queryParams, onNavigate, favorites, onToggleFavorite }) => {
     const handleFilterChange = (newFilter) => {
         onNavigate({ ...queryParams, filter: newFilter, page: 1 });
     };
+
+    // Kazda zmiana filtra wraca na strone 1 - inaczej user ogladalby
+    // pusta strone 27 w nowym, krotszym zbiorze wynikow.
+    const handleParamChange = (key, value) => {
+        onNavigate({ ...queryParams, [key]: value, page: 1 });
+    };
+
+    const resetFilters = () => {
+        onNavigate({ page: 1 });
+        setSearchTerm('');
+        setSearchMode('name');
+    };
+
+    const activeFilterCount = [
+        queryParams.search,
+        queryParams.genre && queryParams.genre !== 'all' ? queryParams.genre : null,
+        queryParams.lang && queryParams.lang !== 'all' ? queryParams.lang : null,
+        queryParams.type && queryParams.type !== 'all' ? queryParams.type : null,
+        queryParams.filter,
+    ].filter(Boolean).length;
 
     return (
         <div>
@@ -2430,10 +2523,70 @@ const HomeView = ({ queryParams, onNavigate, favorites, onToggleFavorite }) => {
                         </div>
                     </div>
                 </div>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mt-4 pt-4 border-t border-gray-700">
+                    <div>
+                        <label htmlFor="langFilter" className="block text-sm font-medium text-gray-300 mb-1">Jezyk</label>
+                        <select id="langFilter" value={queryParams.lang || 'all'}
+                                onChange={(e) => handleParamChange('lang', e.target.value)}
+                                className="w-full bg-gray-700 border border-gray-600 rounded-md p-2 text-white focus:outline-none focus:ring-2 focus:ring-red-500">
+                            <option value="all">Wszystkie jezyki</option>
+                            {languages.map(l => (
+                                <option key={l.code} value={l.code}>{l.name} ({l.count})</option>
+                            ))}
+                        </select>
+                    </div>
+
+                    <div>
+                        <label htmlFor="typeFilter" className="block text-sm font-medium text-gray-300 mb-1">Typ</label>
+                        <select id="typeFilter" value={queryParams.type || 'all'}
+                                onChange={(e) => handleParamChange('type', e.target.value)}
+                                className="w-full bg-gray-700 border border-gray-600 rounded-md p-2 text-white focus:outline-none focus:ring-2 focus:ring-red-500">
+                            <option value="all">Filmy i seriale</option>
+                            <option value="movie">Tylko filmy</option>
+                            <option value="series">Tylko seriale</option>
+                        </select>
+                    </div>
+
+                    <div>
+                        <label htmlFor="qualityFilter" className="block text-sm font-medium text-gray-300 mb-1">
+                            Jakosc
+                            {qualityStats && qualityStats.hidden > 0 && (queryParams.quality || 'good') === 'good' && (
+                                <span className="ml-1 text-xs text-gray-500">(ukryto {qualityStats.hidden})</span>
+                            )}
+                        </label>
+                        <select id="qualityFilter" value={queryParams.quality || 'good'}
+                                onChange={(e) => handleParamChange('quality', e.target.value)}
+                                className="w-full bg-gray-700 border border-gray-600 rounded-md p-2 text-white focus:outline-none focus:ring-2 focus:ring-red-500">
+                            <option value="good">Bez CAM i AI</option>
+                            <option value="all">Pokaz wszystko</option>
+                            <option value="cam">Tylko CAM/TS</option>
+                            <option value="ai">Tylko sciezki AI</option>
+                        </select>
+                    </div>
+
+                    <div>
+                        <label htmlFor="sortBy" className="block text-sm font-medium text-gray-300 mb-1">Sortuj</label>
+                        <select id="sortBy" value={queryParams.sort || 'name'}
+                                onChange={(e) => handleParamChange('sort', e.target.value)}
+                                className="w-full bg-gray-700 border border-gray-600 rounded-md p-2 text-white focus:outline-none focus:ring-2 focus:ring-red-500">
+                            <option value="name">Alfabetycznie</option>
+                            <option value="rating">Najwyzej oceniane</option>
+                            <option value="newest">Ostatnio dodane</option>
+                        </select>
+                    </div>
+                </div>
             </div>
             <div className="flex justify-between items-center mb-6">
                 <h2 className="text-3xl font-bold text-white border-l-4 border-red-500 pl-4">Twoje Media</h2>
-                <span className="text-gray-400">Znaleziono: {mediaData.totalItems}</span>
+                <div className="flex items-center gap-3">
+                    {activeFilterCount > 0 && (
+                        <button onClick={resetFilters}
+                                className="text-sm px-3 py-1 rounded-md bg-gray-700 text-gray-300 hover:bg-gray-600">
+                            Wyczysc filtry ({activeFilterCount})
+                        </button>
+                    )}
+                    <span className="text-gray-400">Znaleziono: {mediaData.totalItems}</span>
+                </div>
             </div>
             {loading ? <p className="text-center text-gray-400">Ładowanie...</p> : error ? <p className="text-center text-red-400">{error}</p> : mediaData.items.length > 0 ? (
                 <>
