@@ -2442,7 +2442,7 @@ const HomeView = ({ queryParams, onNavigate, favorites, onToggleFavorite }) => {
                     searchMode: queryParams.searchMode || 'name',
                     filter: queryParams.filter || '',
                     lang: queryParams.lang || 'all',
-                    type: queryParams.type || 'all',
+                    type: queryParams.mediaType || 'all',
                     quality: queryParams.quality || 'good',
                     sort: queryParams.sort || 'name'
                 };
@@ -2486,7 +2486,7 @@ const HomeView = ({ queryParams, onNavigate, favorites, onToggleFavorite }) => {
         queryParams.search,
         queryParams.genre && queryParams.genre !== 'all' ? queryParams.genre : null,
         queryParams.lang && queryParams.lang !== 'all' ? queryParams.lang : null,
-        queryParams.type && queryParams.type !== 'all' ? queryParams.type : null,
+        queryParams.mediaType && queryParams.mediaType !== 'all' ? queryParams.mediaType : null,
         queryParams.filter,
     ].filter(Boolean).length;
 
@@ -2538,8 +2538,8 @@ const HomeView = ({ queryParams, onNavigate, favorites, onToggleFavorite }) => {
 
                     <div>
                         <label htmlFor="typeFilter" className="block text-sm font-medium text-gray-300 mb-1">Typ</label>
-                        <select id="typeFilter" value={queryParams.type || 'all'}
-                                onChange={(e) => handleParamChange('type', e.target.value)}
+                        <select id="typeFilter" value={queryParams.mediaType || 'all'}
+                                onChange={(e) => handleParamChange('mediaType', e.target.value)}
                                 className="w-full bg-gray-700 border border-gray-600 rounded-md p-2 text-white focus:outline-none focus:ring-2 focus:ring-red-500">
                             <option value="all">Filmy i seriale</option>
                             <option value="movie">Tylko filmy</option>
@@ -4021,7 +4021,9 @@ function App() {
               page: parseInt(queryParams.get('page') || '1', 10),
               filter: queryParams.get('filter') || '',
               lang: queryParams.get('lang') || 'all',
-              type: queryParams.get('type') || 'all',
+              // UWAGA: nie moze nazywac sie "type" - ten klucz jest juz zajety
+              // przez typ mediow w trasie #/details/:type/:id (pathParts[1]).
+              mediaType: queryParams.get('mediaType') || 'all',
               quality: queryParams.get('quality') || 'good',
               sort: queryParams.get('sort') || 'name'
           } 
@@ -4044,7 +4046,7 @@ function App() {
     if (newParams.page && newParams.page > 1) query.set('page', newParams.page);
     if (newParams.filter) query.set('filter', newParams.filter);
     if (newParams.lang && newParams.lang !== 'all') query.set('lang', newParams.lang);
-    if (newParams.type && newParams.type !== 'all') query.set('type', newParams.type);
+    if (newParams.mediaType && newParams.mediaType !== 'all') query.set('mediaType', newParams.mediaType);
     // 'good' to domyslne ukrywanie CAM/AI - nie zasmiecamy nim URL-a
     if (newParams.quality && newParams.quality !== 'good') query.set('quality', newParams.quality);
     if (newParams.sort && newParams.sort !== 'name') query.set('sort', newParams.sort);
