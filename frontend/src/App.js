@@ -3322,6 +3322,207 @@ const TMDBSearchResult = ({ item, onAdd, inWishlist = false }) => {
 };
 
 
+// === WIDOK PREMIER ===
+// Pokazuje nadchodzace tytuly z TMDB i informuje, czy sa juz w Twoich
+// zrodlach. Swiadomie NIE pobiera niczego automatycznie - kazde pobranie
+// wymaga klikniecia (inaczej niz auto_download w wishliscie).
+const PremieresView = ({ onNavigate }) => {
+    const [data, setData] = useState({ items: [], counts: {}, total_pages: 1, page: 1 });
+    const [kind, setKind] = useState('upcoming');
+    const [filter, setFilter] = useState('all');
+    const [page, setPage] = useState(1);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState(null);
+    const [busyId, setBusyId] = useState(null);
+
+    const KINDS = [
+        { id: 'upcoming', label: 'Wkrotce w kinach', icon: '🎬' },
+        { id: 'now_playing', label: 'Teraz grane', icon: '🍿' },
+        { id: 'on_the_air', label: 'Seriale w emisji', icon: '📺' },
+        { id: 'airing_today', label: 'Odcinki dzisiaj', icon: '📡' },
+    ];
+
+    useEffect(() => {
+        let cancelled = false;
+        const fetchPremieres = async () => {
+            setLoading(true);
+            setError(null);
+            try {
+                const res = await axios.get('/api/premieres', { params: { kind, filter, page } });
+                if (!cancelled) setData(res.data);
+            } catch (err) {
+                if (!cancelled) setError(err.response?.data?.error || 'Nie udalo sie pobrac premier.');
+            } finally {
+                if (!cancelled) setLoading(false);
+            }
+        };
+        fetchPremieres();
+        return () => { cancelled = true; };
+    }, [kind, filter, page]);
+
+    // Zmiana listy lub filtra zawsze wraca na strone 1.
+    const changeKind = (k) => { setKind(k); setPage(1); };
+    const changeFilter = (f) => { setFilter(f); setPage(1); };
+
+    const addToWishlist = async (item) => {
+        setBusyId(item.id);
+        try {
+            await axios.post('/api/wishlist', {
+                tmdb_id: item.id,
+                media_type: data.media_type,
+                // Premiery maja tylko obserwowac - bez automatycznego pobierania.
+                auto_download: false,
+            });
+            setData(prev => ({
+                ...prev,
+                items: prev.items.map(i =>
+                    i.id === item.id ? { ...i, in_wishlist: true, wishlist_status: 'wanted' } : i),
+            }));
+        } catch (err) {
+            alert(err.response?.data?.error || 'Nie udalo sie dodac do wishlisty.');
+        } finally {
+            setBusyId(null);
+        }
+    };
+
+    const title = (i) => i.title || i.name;
+    const date = (i) => i.release_date || i.first_air_date;
+
+    return (
+        <div>
+            <div className="flex flex-wrap justify-between items-center mb-6 gap-4">
+                <h2 className="text-3xl font-bold text-white border-l-4 border-red-500 pl-4">Premiery</h2>
+                {!loading && (
+                    <span className="text-gray-400 text-sm">
+                        Dostepne u Ciebie: {data.counts?.available ?? 0} z {data.counts?.shown ?? 0}
+                    </span>
+                )}
+            </div>
+
+            <div className="mb-6 p-4 bg-gray-800 rounded-lg shadow-lg">
+                <div className="flex flex-wrap gap-2 mb-4">
+                    {KINDS.map(k => (
+                        <button key={k.id} onClick={() => changeKind(k.id)}
+                                className={`px-3 py-2 rounded-md text-sm transition-colors ${
+                                    kind === k.id ? 'bg-red-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}`}>
+                            {k.icon} {k.label}
+                        </button>
+                    ))}
+                </div>
+                <div className="flex flex-wrap gap-2 pt-3 border-t border-gray-700">
+                    {[
+                        { id: 'all', label: 'Wszystkie' },
+                        { id: 'available', label: 'Juz dostepne' },
+                        { id: 'missing', label: 'Jeszcze brak' },
+                    ].map(f => (
+                        <button key={f.id} onClick={() => changeFilter(f.id)}
+                                className={`px-3 py-1.5 rounded-md text-sm transition-colors ${
+                                    filter === f.id ? 'bg-gray-600 text-white' : 'bg-gray-700 text-gray-400 hover:bg-gray-600'}`}>
+                            {f.label}
+                        </button>
+                    ))}
+                </div>
+            </div>
+
+            {loading ? (
+                <p className="text-center text-gray-400">Ladowanie premier...</p>
+            ) : error ? (
+                <div className="text-center bg-gray-800 p-8 rounded-lg">
+                    <p className="text-red-400 mb-2">{error}</p>
+                    {error.includes('TMDB') && (
+                        <a href="#/settings" className="text-red-400 underline">Przejdz do Ustawien</a>
+                    )}
+                </div>
+            ) : data.items.length === 0 ? (
+                <p className="text-center text-gray-400 bg-gray-800 p-8 rounded-lg">
+                    Brak pozycji dla wybranych kryteriow.
+                </p>
+            ) : (
+                <>
+                    <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+                        {data.items.map(item => (
+                            <div key={item.id}
+                                 className={`flex gap-4 p-4 rounded-lg border transition-colors ${
+                                     item.available
+                                         ? 'bg-gray-800 border-green-700/50'
+                                         : 'bg-gray-800 border-gray-700'}`}>
+                                <img
+                                    src={item.poster_path
+                                        ? imageProxy(`https://image.tmdb.org/t/p/w200${item.poster_path}`)
+                                        : 'https://placehold.co/100x150/1f2937/ffffff?text=Brak'}
+                                    alt={title(item)}
+                                    className="w-20 h-30 object-cover rounded flex-shrink-0"
+                                    style={{ width: '5rem', height: '7.5rem' }}
+                                />
+                                <div className="flex-1 min-w-0">
+                                    <h3 className="text-white font-semibold truncate" title={title(item)}>
+                                        {title(item)}
+                                    </h3>
+                                    <p className="text-gray-400 text-sm mb-2">
+                                        {date(item) || 'brak daty'}
+                                        {item.vote_average > 0 && (
+                                            <span className="ml-2">⭐ {item.vote_average.toFixed(1)}</span>
+                                        )}
+                                    </p>
+
+                                    {item.available ? (
+                                        <div className="mb-2">
+                                            <span className="inline-block px-2 py-0.5 rounded text-xs bg-green-900/60 text-green-300">
+                                                ✓ Jest u Ciebie
+                                            </span>
+                                            {item.languages.length > 0 && (
+                                                <span className="ml-2 text-xs text-gray-400">
+                                                    {item.languages.join(', ')}
+                                                </span>
+                                            )}
+                                        </div>
+                                    ) : item.available_any ? (
+                                        <div className="mb-2">
+                                            <span className="inline-block px-2 py-0.5 rounded text-xs bg-yellow-900/60 text-yellow-300"
+                                                  title="Dostepne tylko jako nagranie z kina lub sciezka AI">
+                                                ⚠ Tylko CAM/AI
+                                            </span>
+                                        </div>
+                                    ) : (
+                                        <div className="mb-2">
+                                            <span className="inline-block px-2 py-0.5 rounded text-xs bg-gray-700 text-gray-400">
+                                                Jeszcze niedostepne
+                                            </span>
+                                        </div>
+                                    )}
+
+                                    <div className="flex flex-wrap gap-2 mt-2">
+                                        {item.available && item.copies[0] && (
+                                            <a href={`#/details/${data.media_type === 'tv' ? 'series' : 'movie'}/${item.copies[0].stream_id}`}
+                                               className="text-xs px-2 py-1 rounded bg-red-600 text-white no-underline hover:bg-red-700">
+                                                Zobacz i pobierz
+                                            </a>
+                                        )}
+                                        {!item.in_wishlist ? (
+                                            <button onClick={() => addToWishlist(item)}
+                                                    disabled={busyId === item.id}
+                                                    className="text-xs px-2 py-1 rounded bg-gray-700 text-gray-200 hover:bg-gray-600 disabled:opacity-50">
+                                                {busyId === item.id ? 'Dodaje...' : '+ Obserwuj'}
+                                            </button>
+                                        ) : (
+                                            <span className="text-xs px-2 py-1 rounded bg-gray-700 text-gray-400">
+                                                ⭐ Obserwowane
+                                            </span>
+                                        )}
+                                    </div>
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+
+                    <Pagination currentPage={data.page} totalPages={data.total_pages}
+                                onPageChange={setPage} />
+                </>
+            )}
+        </div>
+    );
+};
+
 const WishlistView = () => {
     const [wishlist, setWishlist] = useState([]);
     const [stats, setStats] = useState(null);
@@ -3858,6 +4059,8 @@ function App() {
             return <SettingsView />;
         case 'wishlist':  
             return <WishlistView />;
+        case 'premieres':
+            return <PremieresView onNavigate={handleNavigate} />;
         case 'details':
             return <DetailsView type={route.params.type} id={route.params.id} favorites={favorites} onToggleFavorite={handleToggleFavorite} onDownload={handleDownload} />;
         case 'home':
@@ -3891,6 +4094,9 @@ function App() {
         </button>
         <a href="#/home" className="text-gray-300 hover:text-white px-3 py-2 rounded-md text-sm font-medium no-underline transition-colors duration-200">
           Strona Główna
+        </a>
+        <a href="#/premieres" className="text-gray-300 hover:text-white px-3 py-2 rounded-md text-sm font-medium no-underline transition-colors duration-200">
+          Premiery
         </a>
         <a href="#/wishlist" className="text-gray-300 hover:text-white px-3 py-2 rounded-md text-sm font-medium no-underline transition-colors duration-200">
           Wishlist
@@ -3946,6 +4152,14 @@ function App() {
           🏠 Strona Główna
         </a>
         
+        <a
+          href="#/premieres"
+          onClick={() => setIsMobileMenuOpen(false)}
+          className="text-gray-300 hover:text-white block px-3 py-2 rounded-md text-base font-medium no-underline transition-colors duration-200"
+        >
+          🎬 Premiery
+        </a>
+
         <a 
           href="#/wishlist" 
           onClick={() => setIsMobileMenuOpen(false)}

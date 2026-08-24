@@ -2435,6 +2435,182 @@ app.get('/api/downloads/daemon-status', (req, res) => {
     });
 });
 
+// ============================================================
+// === PREMIERY ===
+// Pokazuje nadchodzace i swiezo wydane tytuly z TMDB oraz informacje,
+// czy pojawily sie juz w Twoich zrodlach VOD.
+//
+// WAZNE: ta sekcja nigdy nie uruchamia pobierania automatycznie.
+// Sluzy wylacznie do podgladu - pobranie inicjuje uzytkownik.
+// ============================================================
+
+// Cache odpowiedzi TMDB. Listy premier zmieniaja sie raz na dobe,
+// wiec nie ma powodu pytac API przy kazdym wejsciu na zakladke.
+const premieresCache = new Map();
+const PREMIERES_TTL_MS = 6 * 60 * 60 * 1000;   // 6 godzin
+
+async function getTmdbApiKey() {
+    const rows = await dbAll('SELECT value FROM settings WHERE key = ?', ['tmdbApi']);
+    return rows[0]?.value || null;
+}
+
+/**
+ * Pobiera liste premier z TMDB.
+ * @param {string} kind  'upcoming' | 'now_playing' | 'on_the_air' | 'airing_today'
+ */
+async function fetchTmdbPremieres(kind, { page = 1, region = 'PL', language = 'pl-PL' } = {}) {
+    const apiKey = await getTmdbApiKey();
+    if (!apiKey) throw new Error('Brak klucza TMDB w ustawieniach');
+
+    const cacheKey = `${kind}:${page}:${region}:${language}`;
+    const cached = premieresCache.get(cacheKey);
+    if (cached && (Date.now() - cached.at) < PREMIERES_TTL_MS) {
+        return cached.data;
+    }
+
+    const isTv = kind === 'on_the_air' || kind === 'airing_today';
+    const base = isTv ? 'tv' : 'movie';
+
+    let url = `https://api.themoviedb.org/3/${base}/${kind}`
+        + `?api_key=${apiKey}&language=${language}&page=${page}`;
+    // region dotyczy dat kinowych - dla seriali TMDB go ignoruje
+    if (!isTv) url += `&region=${region}`;
+
+    const res = await makeRetryRequest(url, { timeout: 15000 }, 2, 1000);
+    const data = { ...res.data, media_type: isTv ? 'tv' : 'movie' };
+
+    premieresCache.set(cacheKey, { at: Date.now(), data });
+    return data;
+}
+
+/**
+ * Sprawdza dla listy pozycji TMDB, czy sa juz w bazie mediow.
+ * Jedno zapytanie na cala liste zamiast N zapytan.
+ */
+async function annotateAvailability(items, mediaType) {
+    if (items.length === 0) return [];
+
+    const streamType = mediaType === 'tv' ? 'series' : 'movie';
+    const ids = items.map(i => i.id).filter(Boolean);
+    if (ids.length === 0) return items.map(i => ({ ...i, available: false, copies: [] }));
+
+    const placeholders = ids.map(() => '?').join(',');
+    const rows = await dbAll(
+        `SELECT m.stream_id, m.tmdb_id, m.name, m.stream_type, m.playlist_id,
+                m.lang_code, m.quality_tag, p.name as playlist_name
+         FROM media m
+         LEFT JOIN playlists p ON m.playlist_id = p.id
+         WHERE m.stream_type = ? AND m.tmdb_id IN (${placeholders})`,
+        [streamType, ...ids]
+    );
+
+    // Pogrupuj kopie po tmdb_id - ten sam film bywa w kilku playlistach
+    // i w kilku wersjach jezykowych.
+    const byTmdb = new Map();
+    for (const row of rows) {
+        const key = String(row.tmdb_id);
+        if (!byTmdb.has(key)) byTmdb.set(key, []);
+        byTmdb.get(key).push(row);
+    }
+
+    // Pozycje z wishlisty - zeby UI wiedzialo, co juz obserwujesz.
+    const wishlistRows = await dbAll(
+        `SELECT tmdb_id, status FROM wishlist WHERE media_type = ?`,
+        [mediaType]
+    ).catch(() => []);
+    const wishlistMap = new Map(wishlistRows.map(w => [String(w.tmdb_id), w.status]));
+
+    return items.map(item => {
+        const copies = byTmdb.get(String(item.id)) || [];
+        // Kopie dobrej jakosci liczymy osobno - "jest, ale tylko CAM"
+        // to z punktu widzenia ogladania co innego niz "jest".
+        const goodCopies = copies.filter(c => !c.quality_tag || c.quality_tag === 'ok');
+
+        return {
+            ...item,
+            available: goodCopies.length > 0,
+            available_any: copies.length > 0,
+            copies: copies.map(c => ({
+                stream_id: c.stream_id,
+                name: c.name,
+                playlist_id: c.playlist_id,
+                playlist_name: c.playlist_name,
+                lang_code: c.lang_code,
+                quality_tag: c.quality_tag || 'ok'
+            })),
+            languages: [...new Set(goodCopies.map(c => c.lang_code).filter(Boolean))],
+            in_wishlist: wishlistMap.has(String(item.id)),
+            wishlist_status: wishlistMap.get(String(item.id)) || null
+        };
+    });
+}
+
+// --- API: Lista premier ---
+app.get('/api/premieres', async (req, res) => {
+    try {
+        const {
+            kind = 'upcoming',
+            page = 1,
+            region = 'PL',
+            filter = 'all'       // all | available | missing
+        } = req.query;
+
+        const ALLOWED = ['upcoming', 'now_playing', 'on_the_air', 'airing_today'];
+        if (!ALLOWED.includes(kind)) {
+            return res.status(400).json({ error: `Nieznany typ listy: ${kind}` });
+        }
+
+        const data = await fetchTmdbPremieres(kind, { page: parseInt(page, 10), region });
+        const mediaType = data.media_type;
+
+        let items = await annotateAvailability(data.results || [], mediaType);
+
+        // Filtr po dostepnosci liczymy po stronie serwera, zeby licznik
+        // w UI zgadzal sie z tym, co widac.
+        if (filter === 'available') items = items.filter(i => i.available);
+        else if (filter === 'missing') items = items.filter(i => !i.available);
+
+        res.json({
+            items,
+            media_type: mediaType,
+            kind,
+            page: data.page || 1,
+            total_pages: Math.min(data.total_pages || 1, 500),   // limit TMDB
+            total_results: data.total_results || 0,
+            counts: {
+                shown: items.length,
+                available: items.filter(i => i.available).length
+            }
+        });
+    } catch (error) {
+        console.error('Blad pobierania premier:', error.message);
+        const msg = error.message.includes('Brak klucza TMDB')
+            ? 'Brak klucza TMDB - uzupelnij go w Ustawieniach.'
+            : 'Nie udalo sie pobrac listy premier.';
+        res.status(500).json({ error: msg });
+    }
+});
+
+// --- API: Podsumowanie premier (do odznaki w menu) ---
+app.get('/api/premieres/summary', async (req, res) => {
+    try {
+        const apiKey = await getTmdbApiKey();
+        if (!apiKey) return res.json({ configured: false, available_now: 0 });
+
+        const data = await fetchTmdbPremieres('upcoming', { page: 1 });
+        const items = await annotateAvailability(data.results || [], 'movie');
+
+        res.json({
+            configured: true,
+            total: items.length,
+            available_now: items.filter(i => i.available).length
+        });
+    } catch (error) {
+        // Podsumowanie jest ozdobne - jego blad nie moze psuc UI.
+        res.json({ configured: true, available_now: 0, error: error.message });
+    }
+});
+
 // === API ROUTES WISHLIST === 
 // Dodaj te endpointy do server.js po istniejących API
 

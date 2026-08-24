@@ -1,1 +1,12 @@
 .DS_Store
+
+# Artefakty Pythona
+__pycache__/
+*.pyc
+
+# Zaleznosci
+node_modules/
+
+# Baza i logi (montowane z hosta)
+config/*.sqlite
+config/*.log
