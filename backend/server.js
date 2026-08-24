@@ -290,6 +290,15 @@ db.all("PRAGMA table_info(downloads)", [], (err, columns) => {
                     else console.log("Dodano kolumnę download_url");
                 });
             }
+
+            // Licznik prob - chroni przed ponawianiem w nieskonczonosc
+            // zadania, ktore po prostu nie istnieje u dostawcy (404).
+            if (!columnNames.includes('retry_count')) {
+                db.run("ALTER TABLE downloads ADD COLUMN retry_count INTEGER DEFAULT 0", (alterErr) => {
+                    if (alterErr) console.error("Blad dodawania kolumny retry_count:", alterErr);
+                    else console.log("Dodano kolumne retry_count");
+                });
+            }
         });
         
         // === KOLUMNY KLASYFIKACJI (jezyk / jakosc wydania) ===
@@ -471,6 +480,9 @@ async function makeRetryRequest(url, options = {}, maxRetries = 3, delay = 1000)
 let downloadQueue = [];
 let isProcessing = false;
 const activeDownloads = new Map();
+// Zadania, o ktorych juz wyslano powiadomienie "czeka na slot".
+// Bez tego przy 20-minutowym oczekiwaniu poszloby 40 wiadomosci.
+const slotNotified = new Set();
 
 // --- Download Manager Process ---
 let downloadManagerProcess = null;
@@ -2194,6 +2206,80 @@ app.post('/api/downloads/start', async (req, res) => {
     }
 });
 
+// --- Ponawianie nieudanych pobran ---
+// Maksymalna liczba automatycznych prob. Po jej przekroczeniu zadanie
+// czeka na reczne ponowienie - zwykle znaczy to, ze pliku po prostu nie ma.
+const MAX_AUTO_RETRIES = 3;
+
+/**
+ * Wraca zadanie do kolejki. Zwraca true, gdy sie udalo.
+ * @param {number}  id      id zadania w tabeli downloads
+ * @param {boolean} manual  true = ponowienie reczne (nie liczy sie do limitu)
+ */
+async function retryDownload(id, { manual = false } = {}) {
+    const rows = await dbAll('SELECT * FROM downloads WHERE id = ?', [id]);
+    if (rows.length === 0) return { ok: false, reason: 'Nie znaleziono zadania' };
+
+    const job = rows[0];
+    if (job.worker_status === 'downloading') {
+        return { ok: false, reason: 'Zadanie jest wlasnie pobierane' };
+    }
+
+    const retries = job.retry_count || 0;
+    if (!manual && retries >= MAX_AUTO_RETRIES) {
+        return { ok: false, reason: `Wyczerpano automatyczne proby (${retries})` };
+    }
+
+    // Reczne ponowienie zeruje licznik - user swiadomie prosi o kolejne podejscie.
+    const newCount = manual ? 0 : retries + 1;
+
+    await dbRun(
+        `UPDATE downloads
+         SET status = 'queued', worker_status = 'queued', progress = 0,
+             error_message = NULL, retry_count = ?
+         WHERE id = ?`,
+        [newCount, id]
+    );
+
+    // Wczytaj zaktualizowany wiersz do kolejki w pamieci.
+    const refreshed = await dbAll('SELECT * FROM downloads WHERE id = ?', [id]);
+    downloadQueue.push(refreshed[0]);
+
+    console.log(`[RETRY] Zadanie #${id} wrocilo do kolejki `
+        + `(${manual ? 'recznie' : `proba ${newCount}/${MAX_AUTO_RETRIES}`})`);
+
+    if (!isProcessing) processDownloadQueue();
+
+    return { ok: true, retry_count: newCount };
+}
+
+app.post('/api/downloads/retry/:id', async (req, res) => {
+    try {
+        const result = await retryDownload(parseInt(req.params.id, 10), { manual: true });
+        if (!result.ok) return res.status(400).json({ error: result.reason });
+        res.json({ message: 'Zadanie wrocilo do kolejki', ...result });
+    } catch (error) {
+        console.error('Blad ponawiania pobierania:', error);
+        res.status(500).json({ error: 'Nie udalo sie ponowic pobierania.' });
+    }
+});
+
+// Ponow wszystkie nieudane naraz
+app.post('/api/downloads/retry-all', async (req, res) => {
+    try {
+        const failed = await dbAll("SELECT id FROM downloads WHERE worker_status = 'failed'");
+        let requeued = 0;
+        for (const row of failed) {
+            const r = await retryDownload(row.id, { manual: true });
+            if (r.ok) requeued++;
+        }
+        res.json({ message: `Ponowiono ${requeued} z ${failed.length} zadan`, requeued });
+    } catch (error) {
+        console.error('Blad ponawiania wszystkich:', error);
+        res.status(500).json({ error: 'Nie udalo sie ponowic pobieran.' });
+    }
+});
+
 app.post('/api/downloads/remove/:id', async (req, res) => {
     const { id } = req.params;
     try {
@@ -3720,6 +3806,13 @@ async function processDownloadQueue() {
         // przerywalo pobierania. Bledy HTTP wychwytuje curl w download_manager.py.
         // Pobieranie zajmuje slot Xtream na caly czas transferu.
         await withXtreamSlot(downloadJob, () => new Promise((resolve, reject) => {
+            // Jesli zadanie czekalo na slot, daj znac ze w koncu ruszylo.
+            if (slotNotified.has(downloadJob.id)) {
+                sendDiscordNotification(
+                    `▶️ **Slot zwolniony - pobieranie ruszylo**\n\`${downloadJob.filename}\``
+                ).catch(() => { /* powiadomienie nie moze przerwac pobierania */ });
+            }
+
             const pythonProcess = spawn('python3', ['download_manager.py', downloadUrl, plexCompatiblePath]);
             activeDownloads.set(downloadJob.id, pythonProcess);
 
@@ -3779,6 +3872,17 @@ async function processDownloadQueue() {
                 );
                 if (powod === 'remote') {
                     console.log(`[SLOT] #${downloadJob.id} czeka - slot zajety poza aplikacja`);
+                    // Powiadamiamy tylko raz na zadanie, zeby nie zasypac
+                    // kanalu przy dlugim oczekiwaniu (sprawdzenie co 30s).
+                    if (!slotNotified.has(downloadJob.id)) {
+                        slotNotified.add(downloadJob.id);
+                        await sendDiscordNotification(
+                            `⏸️ **Pobieranie czeka na slot**\n`
+                            + `\`${downloadJob.filename}\`\n`
+                            + `Slot Xtream zajmuje teraz inny klient (TV/telefon).`
+                            + ` Pobieranie ruszy samo, gdy sie zwolni.`
+                        );
+                    }
                 }
             }
         });
@@ -3794,6 +3898,7 @@ async function processDownloadQueue() {
                     ['failed', 'failed', error.message, job.id]);
     } finally {
         activeDownloads.delete(job.id);
+        slotNotified.delete(job.id);
         isProcessing = false;
         // Kontynuuj przetwarzanie kolejki
         setTimeout(processDownloadQueue, 1000);
@@ -5524,6 +5629,40 @@ async function monitorFavoritesMultiPlaylist() {
 }
 
 // Dodaj również cron job do testowania (uruchamia się co 5 minut - tylko do debugowania)
+// --- Automatyczne ponawianie nieudanych pobran (co godzine) ---
+// Wiekszosc bledow to chwilowe problemy z lacznoscia albo zajety slot,
+// wiec warto sprobowac ponownie zanim uzytkownik w ogole to zauwazy.
+cron.schedule('30 * * * *', async () => {
+    try {
+        const failed = await dbAll(
+            `SELECT id, filename, retry_count FROM downloads
+             WHERE worker_status = 'failed'
+               AND COALESCE(retry_count, 0) < ?
+             ORDER BY added_at ASC
+             LIMIT 10`,
+            [MAX_AUTO_RETRIES]
+        );
+
+        if (failed.length === 0) return;
+
+        console.log(`[RETRY] Automatyczne ponawianie ${failed.length} nieudanych pobran...`);
+
+        let requeued = 0;
+        for (const job of failed) {
+            const result = await retryDownload(job.id, { manual: false });
+            if (result.ok) requeued++;
+        }
+
+        if (requeued > 0) {
+            await sendDiscordNotification(
+                `🔄 **Ponowiono nieudane pobrania**\nWrocilo do kolejki: ${requeued}`
+            );
+        }
+    } catch (error) {
+        console.error('[RETRY] Blad automatycznego ponawiania:', error.message);
+    }
+});
+
 cron.schedule('*/5 * * * *', async () => {
     const now = new Date();
     console.log(`🔍 [DEBUG] Cron job test - ${now.toLocaleString('pl-PL')} (minuty: ${now.getMinutes()})`);
