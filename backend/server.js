@@ -979,7 +979,12 @@ async function syncSinglePlaylist(playlist) {
 
         // Pobierz filmy
         try {
-            const moviesRes = await axios.get(`${xtreamBaseUrl}&action=get_vod_streams`, { timeout: 30000 });
+            // Pobranie pelnej listy tez zajmuje slot Xtream.
+            const moviesRes = await withXtreamSlot(
+                playlist,
+                () => axios.get(`${xtreamBaseUrl}&action=get_vod_streams`, { timeout: 30000 }),
+                { label: 'sync filmow', checkRemote: false }
+            );
             moviesList = Array.isArray(moviesRes.data) ? moviesRes.data.map(m => ({ ...m, stream_type: 'movie' })) : [];
             
             console.log(`🎬 Pobrano ${moviesList.length} filmów (przed filtrami)`);
@@ -1043,7 +1048,11 @@ async function syncSinglePlaylist(playlist) {
 
         // Pobierz seriale z analogicznymi filtrami
         try {
-            const seriesRes = await axios.get(`${xtreamBaseUrl}&action=get_series`, { timeout: 30000 });
+            const seriesRes = await withXtreamSlot(
+                playlist,
+                () => axios.get(`${xtreamBaseUrl}&action=get_series`, { timeout: 30000 }),
+                { label: 'sync seriali', checkRemote: false }
+            );
             seriesList = Array.isArray(seriesRes.data) ? seriesRes.data.map(s => ({ ...s, stream_type: 'series', stream_id: s.series_id })) : [];
             
             console.log(`📺 Pobrano ${seriesList.length} seriali (przed filtrami)`);
