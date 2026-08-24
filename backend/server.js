@@ -21,6 +21,12 @@ const db = new sqlite3.Database(dbPath, (err) => {
         console.error('Błąd podczas łączenia z bazą danych:', err.message);
     } else {
         console.log(`Połączono z bazą danych SQLite w: ${dbPath}`);
+        // WAL pozwala czytać w trakcie zapisu (sync playlisty nie blokuje UI).
+        db.run('PRAGMA journal_mode = WAL');
+        db.run('PRAGMA synchronous = NORMAL');
+        db.run('PRAGMA cache_size = -64000');   // 64MB cache
+        db.run('PRAGMA temp_store = MEMORY');
+        db.run('PRAGMA busy_timeout = 15000');
         initializeDb();
     }
 });
@@ -286,6 +292,22 @@ db.all("PRAGMA table_info(downloads)", [], (err, columns) => {
             }
         });
         
+        // === INDEKSY WYDAJNOŚCIOWE ===
+        // Bez nich każde zapytanie /api/media robi pełny skan tabeli.
+        // IF NOT EXISTS - bezpieczne przy każdym starcie.
+        db.run(`CREATE INDEX IF NOT EXISTS idx_media_playlist ON media(playlist_id)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_media_name ON media(name)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_media_tmdb ON media(tmdb_id)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_media_type_playlist ON media(stream_type, playlist_id)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_media_genres_lookup ON media_genres(media_stream_id, media_stream_type)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_media_genres_genre ON media_genres(genre_id)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_favorites_lookup ON favorites(stream_id, stream_type, playlist_id)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_downloads_worker ON downloads(worker_status)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_downloads_status ON downloads(status)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_downloads_archived ON downloads(archived)`, () => {
+            console.log("Indeksy wydajnościowe gotowe");
+        });
+
         console.log("Baza danych zainicjalizowana z tabelami pobierania");
     });
 }
@@ -2941,6 +2963,26 @@ app.get('/api/tmdb/search', async (req, res) => {
 // Znajdź funkcję "async function processDownloadQueue()" (około linii 2350-2600)
 // i ZASTĄP JĄ CAŁKOWICIE tym kodem:
 
+/**
+ * Oczyszcza tytul do uzycia jako nazwa pliku/folderu dla Jellyfin.
+ * Lapie przypadki, ktorych samo usuwanie <>:"/\|?* nie obsluguje:
+ *  - kropka/spacja na koncu (Windows/SMB nie utworzy takiego folderu)
+ *  - znaki sterujace (psuja nazwy na udzialach sieciowych)
+ *  - nawiasy kwadratowe (Jellyfin czyta [..] jako pole techniczne, np. [tmdbid-1])
+ */
+function sanitizeForFilesystem(title) {
+    if (!title) return 'Unknown';
+    return String(title)
+        .replace(/[<>:"/\\|?*]/g, '')             // znaki zabronione w nazwach plikow
+        // eslint-disable-next-line no-control-regex
+        .replace(/[\u0000-\u001f\u007f]/g, '')  // znaki sterujace
+        .replace(/[\[\]]/g, '')               // [] zarezerwowane dla [tmdbid-N]
+        .replace(/\s+/g, ' ')
+        .trim()
+        .replace(/[. ]+$/, '')              // SMB/Windows ucina koncowe kropki i spacje
+        .trim() || 'Unknown';
+}
+
 async function processDownloadQueue() {
     if (isProcessing || downloadQueue.length === 0) {
         return;
@@ -3146,14 +3188,18 @@ async function processDownloadQueue() {
             }
             
             // Wyczyść tytuł dla systemu plików
-            const safeMovieTitle = movieTitle
-                .replace(/[<>:"/\\|?*]/g, '')
-                .replace(/\s+/g, ' ')
-                .trim();
+            const safeMovieTitle = sanitizeForFilesystem(movieTitle);
             
-            // Struktura Plex: /Movies/Movie Title (Year)/Movie Title (Year).ext
-            const movieFolderName = `${safeMovieTitle} (${releaseYear})`;
-            const movieFileName = `${safeMovieTitle} (${releaseYear}).${extension}`;
+            // Struktura Jellyfin: /Movies/Movie Title (Year) [tmdbid-123]/Movie Title (Year).ext
+            // https://jellyfin.org/docs/general/server/media/movies
+            // Gdy roku brak - pomijamy nawias zamiast wpisywać "(Unknown)",
+            // bo Jellyfin sparsowałby "Unknown" jako część tytułu.
+            const yearSuffix = releaseYear !== 'Unknown' ? ` (${releaseYear})` : '';
+            // tmdbid w nazwie folderu daje Jellyfin pewne dopasowanie bez zgadywania.
+            const tmdbSuffix = tmdbData?.id ? ` [tmdbid-${tmdbData.id}]` : '';
+
+            const movieFolderName = `${safeMovieTitle}${yearSuffix}${tmdbSuffix}`;
+            const movieFileName = `${safeMovieTitle}${yearSuffix}.${extension}`;
             
             plexCompatiblePath = path.join('/downloads/movies', movieFolderName, movieFileName);
             
@@ -3219,16 +3265,14 @@ async function processDownloadQueue() {
                 }
             }
             
+            // NIE zgadujemy roku. Zmyślony rok w nazwie folderu powoduje,
+            // że Jellyfin dopasuje serial do złej pozycji w TMDB.
+            // Lepiej pominąć rok - Jellyfin dopasuje po samym tytule (lub po tmdbid poniżej).
             if (releaseYear === 'Unknown') {
-                const currentYear = new Date().getFullYear();
-                releaseYear = currentYear - 2;
-                console.log(`⚠️ Brak roku dla serialu "${seriesTitle}", używam domyślnego: ${releaseYear}`);
+                console.log(`⚠️ Brak roku dla serialu "${seriesTitle}" - pomijam rok w nazwie folderu`);
             }
             
-            const safeSeriesTitle = seriesTitle
-                .replace(/[<>:"/\\|?*]/g, '')
-                .replace(/\s+/g, ' ')
-                .trim();
+            const safeSeriesTitle = sanitizeForFilesystem(seriesTitle);
 
             // Inteligentny tytuł odcinka z TMDB
             let cleanEpisodeTitle = 'Odcinek ' + episodeData.episode_num;
@@ -3258,15 +3302,17 @@ async function processDownloadQueue() {
                 }
             }
 
-            const safeEpisodeTitle = cleanEpisodeTitle
-                .replace(/[<>:"/\\|?*]/g, '')
-                .replace(/\s+/g, ' ')
-                .trim();
+            const safeEpisodeTitle = sanitizeForFilesystem(cleanEpisodeTitle);
             
             const seasonPadded = String(episodeData.season || 1).padStart(2, '0');
             const episodePadded = String(episodeData.episode_num || 1).padStart(2, '0');
             
-            const seriesFolderName = `${safeSeriesTitle} (${releaseYear})`;
+            // Struktura Jellyfin: /Shows/Show (Year) [tmdbid-N]/Season 01/Show - S01E05 - Title.ext
+            // https://jellyfin.org/docs/general/server/media/shows
+            const seriesYearSuffix = releaseYear !== 'Unknown' ? ` (${releaseYear})` : '';
+            const seriesTmdbSuffix = tmdbData?.id ? ` [tmdbid-${tmdbData.id}]` : '';
+
+            const seriesFolderName = `${safeSeriesTitle}${seriesYearSuffix}${seriesTmdbSuffix}`;
             const seasonFolderName = `Season ${seasonPadded}`;
             const episodeFileName = `${safeSeriesTitle} - S${seasonPadded}E${episodePadded} - ${safeEpisodeTitle}.${extension}`;
             
