@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import axios from 'axios';
 import './index.css';
 
@@ -2332,14 +2332,23 @@ const HomeView = ({ queryParams, onNavigate, favorites, onToggleFavorite }) => {
     const [searchTerm, setSearchTerm] = useState(queryParams.search || '');
     const [searchMode, setSearchMode] = useState(queryParams.searchMode || 'name');
 
+    // Debounce wyszukiwarki. Zalezy tylko od tego, co user wpisal - gdyby
+    // zalezal od calego queryParams, kazda zmiana strony tworzylaby nowy
+    // obiekt i cofala paginacje na 1.
+    const searchRef = useRef({ onNavigate, queryParams });
+    searchRef.current = { onNavigate, queryParams };
+
     useEffect(() => {
         const timerId = setTimeout(() => {
-            if (searchTerm !== queryParams.search || searchMode !== queryParams.searchMode) {
-                onNavigate({ ...queryParams, search: searchTerm, searchMode: searchMode, page: 1 });
+            const { onNavigate: nav, queryParams: qp } = searchRef.current;
+            const currentSearch = qp.search || '';
+            const currentMode = qp.searchMode || 'name';
+            if (searchTerm !== currentSearch || searchMode !== currentMode) {
+                nav({ ...qp, search: searchTerm, searchMode, page: 1 });
             }
-        }, 500);
+        }, 400);
         return () => clearTimeout(timerId);
-    }, [searchTerm, searchMode, queryParams, onNavigate]);
+    }, [searchTerm, searchMode]);
 
     useEffect(() => {
         const fetchGenres = async () => {
@@ -3653,9 +3662,14 @@ function App() {
               type: pathParts[1],
               id: pathParts[2],
               search: queryParams.get('search') || '',
+              searchMode: queryParams.get('searchMode') || 'name',
               genre: queryParams.get('genre') || 'all',
               page: parseInt(queryParams.get('page') || '1', 10),
-              filter: queryParams.get('filter') || ''
+              filter: queryParams.get('filter') || '',
+              lang: queryParams.get('lang') || 'all',
+              type: queryParams.get('type') || 'all',
+              quality: queryParams.get('quality') || 'good',
+              sort: queryParams.get('sort') || 'name'
           } 
       });
     };
@@ -3669,9 +3683,17 @@ function App() {
   const handleNavigate = (newParams) => {
     const query = new URLSearchParams();
     if (newParams.search) query.set('search', newParams.search);
+    // searchMode musi trafic do URL, inaczej po zmianie strony wyszukiwanie
+    // po TMDB ID wracalo do trybu "nazwa".
+    if (newParams.searchMode && newParams.searchMode !== 'name') query.set('searchMode', newParams.searchMode);
     if (newParams.genre && newParams.genre !== 'all') query.set('genre', newParams.genre);
     if (newParams.page && newParams.page > 1) query.set('page', newParams.page);
     if (newParams.filter) query.set('filter', newParams.filter);
+    if (newParams.lang && newParams.lang !== 'all') query.set('lang', newParams.lang);
+    if (newParams.type && newParams.type !== 'all') query.set('type', newParams.type);
+    // 'good' to domyslne ukrywanie CAM/AI - nie zasmiecamy nim URL-a
+    if (newParams.quality && newParams.quality !== 'good') query.set('quality', newParams.quality);
+    if (newParams.sort && newParams.sort !== 'name') query.set('sort', newParams.sort);
     
     const queryString = query.toString();
     window.location.hash = `#home${queryString ? `?${queryString}` : ''}`;

@@ -292,6 +292,38 @@ db.all("PRAGMA table_info(downloads)", [], (err, columns) => {
             }
         });
         
+        // === KOLUMNY KLASYFIKACJI (jezyk / jakosc wydania) ===
+        // Wyliczane raz przy synchronizacji przez classifyMediaName(),
+        // zeby filtrowanie w UI bylo porownaniem po indeksie zamiast LIKE.
+        db.all("PRAGMA table_info(media)", [], (err, columns) => {
+            if (err) {
+                console.error("Blad sprawdzania struktury tabeli media:", err);
+                return;
+            }
+            const names = columns.map(c => c.name);
+
+            const addColumn = (col, ddl, cb) => {
+                if (names.includes(col)) { if (cb) cb(); return; }
+                db.run(`ALTER TABLE media ADD COLUMN ${ddl}`, (e) => {
+                    if (e) console.error(`Blad dodawania kolumny ${col}:`, e);
+                    else console.log(`Dodano kolumne ${col}`);
+                    if (cb) cb();
+                });
+            };
+
+            addColumn('lang_code', 'lang_code TEXT', () => {
+                addColumn('quality_tag', "quality_tag TEXT DEFAULT 'ok'", () => {
+                    addColumn('clean_name', 'clean_name TEXT', () => {
+                        db.run(`CREATE INDEX IF NOT EXISTS idx_media_lang ON media(lang_code)`);
+                        db.run(`CREATE INDEX IF NOT EXISTS idx_media_quality ON media(quality_tag)`);
+                        db.run(`CREATE INDEX IF NOT EXISTS idx_media_clean_name ON media(clean_name)`);
+                        // Uzupelnij pozycje sprzed migracji (jednorazowo).
+                        setTimeout(backfillClassification, 5000);
+                    });
+                });
+            });
+        });
+
         // === INDEKSY WYDAJNOŚCIOWE ===
         // Bez nich każde zapytanie /api/media robi pełny skan tabeli.
         // IF NOT EXISTS - bezpieczne przy każdym starcie.
@@ -1143,9 +1175,10 @@ async function syncSinglePlaylist(playlist) {
                 const tmdbApiRows = await dbAll(`SELECT value FROM settings WHERE key = 'tmdbApi'`);
                 const tmdbApi = tmdbApiRows[0]?.value;
                 
-                const insertMediaSql = `INSERT OR REPLACE INTO media 
-                    (stream_id, name, stream_icon, rating, tmdb_id, stream_type, container_extension, playlist_id, original_name) 
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+                const insertMediaSql = `INSERT OR REPLACE INTO media
+                    (stream_id, name, stream_icon, rating, tmdb_id, stream_type, container_extension, playlist_id, original_name,
+                     lang_code, quality_tag, clean_name)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
                     
                 const insertGenreSql = `INSERT OR IGNORE INTO genres (id, name) VALUES (?, ?)`;
                 const insertMediaGenreSql = `INSERT OR IGNORE INTO media_genres (media_stream_id, media_stream_type, genre_id) VALUES (?, ?, ?)`;
@@ -1161,6 +1194,10 @@ async function syncSinglePlaylist(playlist) {
                         const originalName = item.name;
                         
                         // Dodaj media z ORYGINALNĄ nazwą z IPTV
+                        // Klasyfikacja liczona raz, tutaj - w UI jest juz tylko
+                        // porownaniem po indeksie.
+                        const classified = classifyMediaName(originalName);
+
                         await stmtRun(mediaStmt, [
                             item.stream_id,
                             originalName,
@@ -1170,7 +1207,10 @@ async function syncSinglePlaylist(playlist) {
                             item.stream_type,
                             item.container_extension,
                             playlistId,
-                            originalName
+                            originalName,
+                            classified.langCode,
+                            classified.qualityTag,
+                            classified.cleanName
                         ]);
                         
                         // Sprawdź czy gatunki już istnieją dla tego media
@@ -1466,6 +1506,56 @@ app.post('/api/settings', async (req, res) => {
     }
 });
 
+// --- API: Jezyki obecne w bibliotece (do filtra w UI) ---
+// Zwraca tylko jezyki, ktore faktycznie wystepuja, wraz z liczba pozycji.
+app.get('/api/media/languages', async (req, res) => {
+    try {
+        const { quality = 'good' } = req.query;
+
+        // Domyslnie liczymy tak, jak wyswietla UI - bez CAM/AI.
+        const qualityWhere = quality === 'good'
+            ? "AND (quality_tag IS NULL OR quality_tag = 'ok')"
+            : '';
+
+        const rows = await dbAll(`
+            SELECT lang_code, COUNT(*) as count
+            FROM media
+            WHERE 1 = 1 ${qualityWhere}
+            GROUP BY lang_code
+            ORDER BY count DESC
+        `);
+
+        const languages = rows.map(r => ({
+            code: r.lang_code || 'none',
+            name: r.lang_code ? (LANGUAGE_NAMES[r.lang_code] || r.lang_code) : 'Bez oznaczenia',
+            count: r.count
+        }));
+
+        res.json(languages);
+    } catch (error) {
+        console.error('Blad pobierania jezykow:', error);
+        res.status(500).json({ error: 'Blad pobierania jezykow.' });
+    }
+});
+
+// --- API: Statystyki jakosci wydan (ile CAM / AI jest ukrywanych) ---
+app.get('/api/media/quality-stats', async (req, res) => {
+    try {
+        const rows = await dbAll(`
+            SELECT COALESCE(quality_tag, 'ok') as tag, COUNT(*) as count
+            FROM media GROUP BY COALESCE(quality_tag, 'ok')
+        `);
+        const stats = { ok: 0, cam: 0, ai: 0 };
+        for (const r of rows) {
+            if (stats[r.tag] !== undefined) stats[r.tag] = r.count;
+        }
+        res.json({ ...stats, hidden: stats.cam + stats.ai });
+    } catch (error) {
+        console.error('Blad statystyk jakosci:', error);
+        res.status(500).json({ error: 'Blad statystyk jakosci.' });
+    }
+});
+
 // --- API GATUNKI ---
 app.get('/api/genres', (req, res) => {
     const sql = `SELECT * FROM genres ORDER BY name ASC`;
@@ -1559,55 +1649,58 @@ app.get('/api/media', (req, res) => {
         searchMode = 'name',
         genre = 'all',
         filter = '',
-        playlist = 'all'
+        playlist = 'all',
+        lang = 'all',        // kod jezyka z prefiksu nazwy, np. PL
+        type = 'all',        // movie | series
+        quality = 'good',    // good = bez CAM/AI (domyslnie), all = wszystko
+        sort = 'name'        // name | rating | newest
     } = req.query;
-    
+
     const offset = (page - 1) * limit;
     let params = [];
-    
-    // Dodaj JOIN z playlistami żeby mieć nazwę playlisty
+
     let fromClause = `
-        FROM media m 
+        FROM media m
         LEFT JOIN playlists p ON m.playlist_id = p.id
     `;
     let selectClause = 'SELECT DISTINCT m.*, p.name as playlist_name';
-    
+
     let whereClauses = [];
-    
+
     // Filtr ulubione
     if (filter === 'favorites') {
         fromClause += ' JOIN favorites f ON m.stream_id = f.stream_id AND m.stream_type = f.stream_type AND m.playlist_id = f.playlist_id';
     }
-    
-    // Filtr gatunków
+
+    // Filtr gatunkow
     if (genre && genre !== 'all') {
         fromClause += ' JOIN media_genres mg ON m.stream_id = mg.media_stream_id AND m.stream_type = mg.media_stream_type';
         whereClauses.push('mg.genre_id = ?');
         params.push(genre);
     }
-    
-    // Filtr wyszukiwania
+
+    // Wyszukiwanie
     if (search) {
         if (searchMode === 'tmdb') {
-            whereClauses.push(`m.tmdb_id = ?`);
+            whereClauses.push('m.tmdb_id = ?');
             params.push(search);
         } else {
-            whereClauses.push(`m.name LIKE ?`);
-            params.push(`%${search}%`);
+            // Szukamy takze po clean_name (nazwa bez prefiksu "PL - "),
+            // dzieki czemu "diuna" trafia w "PL - Diuna".
+            whereClauses.push('(m.name LIKE ? OR m.clean_name LIKE ?)');
+            params.push(`%${search}%`, `%${search}%`);
         }
     }
-    
-    // NOWY: Filtr playlist
+
+    // Filtr playlist
     if (playlist && playlist !== 'all') {
         if (playlist.includes(',')) {
-            // Wiele playlist - playlist=1,2,3
             const playlistIds = playlist.split(',').map(id => parseInt(id)).filter(id => !isNaN(id));
             if (playlistIds.length > 0) {
                 whereClauses.push(`m.playlist_id IN (${playlistIds.map(() => '?').join(',')})`);
                 params.push(...playlistIds);
             }
         } else {
-            // Pojedyncza playlista
             const playlistId = parseInt(playlist);
             if (!isNaN(playlistId)) {
                 whereClauses.push('m.playlist_id = ?');
@@ -1615,54 +1708,90 @@ app.get('/api/media', (req, res) => {
             }
         }
     }
-    
+
+    // Filtr jezyka (po prefiksie nazwy)
+    if (lang && lang !== 'all') {
+        if (lang === 'none') {
+            whereClauses.push('m.lang_code IS NULL');
+        } else {
+            whereClauses.push('m.lang_code = ?');
+            params.push(String(lang).toUpperCase());
+        }
+    }
+
+    // Filtr typu
+    if (type === 'movie' || type === 'series') {
+        whereClauses.push('m.stream_type = ?');
+        params.push(type);
+    }
+
+    // Filtr jakosci wydania.
+    // Domyslnie ukrywamy CAM/TS i sciezki AI - to zwykle material nie do ogladania.
+    // quality_tag IS NULL dopuszczamy, bo pozycje sprzed migracji nie sa jeszcze
+    // sklasyfikowane i nie chcemy ich chowac przed uzytkownikiem.
+    if (quality === 'good') {
+        whereClauses.push("(m.quality_tag IS NULL OR m.quality_tag = 'ok')");
+    } else if (quality === 'cam' || quality === 'ai') {
+        whereClauses.push('m.quality_tag = ?');
+        params.push(quality);
+    }
+    // quality === 'all' -> brak warunku
+
     const whereString = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
-    
-    // POPRAWIONE ZAPYTANIA SQL
-    const dataSql = `${selectClause} ${fromClause} ${whereString} ORDER BY m.name ASC LIMIT ? OFFSET ?`;
-    
-    // POPRAWKA: Użyj subquery dla COUNT z DISTINCT
+
+    // Sortowanie - tylko z bialej listy, zeby nie wstrzykiwac SQL-a.
+    const SORTS = {
+        name: 'COALESCE(m.clean_name, m.name) ASC',   // pomija prefiks "PL - "
+        rating: 'CAST(m.rating AS REAL) DESC, COALESCE(m.clean_name, m.name) ASC',
+        newest: 'm.stream_id DESC',                   // wyzsze id = pozniej dodane
+    };
+    const orderBy = SORTS[sort] || SORTS.name;
+
+    const dataSql = `${selectClause} ${fromClause} ${whereString} ORDER BY ${orderBy} LIMIT ? OFFSET ?`;
+
     const countSql = `
-        SELECT COUNT(*) as total 
+        SELECT COUNT(*) as total
         FROM (
             SELECT DISTINCT m.stream_id, m.stream_type, m.playlist_id
-            ${fromClause} 
+            ${fromClause}
             ${whereString}
         ) as distinct_items
     `;
-    
+
     const countParams = [...params];
     params.push(limit, offset);
-    
-    // Wykonaj zapytanie liczące
+
     db.get(countSql, countParams, (err, row) => {
-        if (err) { 
-            console.error('Błąd zapytania count:', err);
-            res.status(500).json({ error: err.message }); 
-            return; 
+        if (err) {
+            console.error('Blad zapytania count:', err);
+            res.status(500).json({ error: err.message });
+            return;
         }
-        
+
         const totalItems = row.total;
         const totalPages = Math.ceil(totalItems / limit);
-        
-        // Wykonaj zapytanie główne
+
         db.all(dataSql, params, (err, rows) => {
-            if (err) { 
-                console.error('Błąd zapytania media:', err);
-                res.status(500).json({ error: err.message }); 
-                return; 
+            if (err) {
+                console.error('Blad zapytania media:', err);
+                res.status(500).json({ error: err.message });
+                return;
             }
-            
-            res.json({ 
-                items: rows, 
-                totalPages, 
-                currentPage: parseInt(page), 
+
+            res.json({
+                items: rows,
+                totalPages,
+                currentPage: parseInt(page),
                 totalItems,
                 applied_filters: {
                     search: search || null,
                     genre: genre !== 'all' ? genre : null,
                     filter: filter || null,
-                    playlist: playlist !== 'all' ? playlist : null
+                    playlist: playlist !== 'all' ? playlist : null,
+                    lang: lang !== 'all' ? lang : null,
+                    type: type !== 'all' ? type : null,
+                    quality,
+                    sort
                 }
             });
         });
@@ -2962,6 +3091,123 @@ app.get('/api/tmdb/search', async (req, res) => {
 // KOMPLETNA FUNKCJA DO PODMIANY w backend/server.js
 // Znajdź funkcję "async function processDownloadQueue()" (około linii 2350-2600)
 // i ZASTĄP JĄ CAŁKOWICIE tym kodem:
+
+// ============================================================
+// === KLASYFIKACJA NAZW: JEZYK I JAKOSC WYDANIA ===
+// Nazwy z Xtream niosa metadane w samym tytule, np.
+//   "PL - Diuna 2 (CAM)"  |  "EN - Dune 2 [AI LEKTOR]"
+// Wyliczamy je raz przy synchronizacji i zapisujemy w kolumnach
+// media.lang_code oraz media.quality_tag, zeby filtrowanie w UI
+// bylo zwyklym porownaniem po indeksie, a nie skanem z LIKE.
+// ============================================================
+
+// Prefiks jezykowy: "PL - ", "EN: ", "DE ".
+const LANG_PREFIX_RE = /^([A-Z]{2,3})\s*[-:|]\s*/;
+
+const LANGUAGE_NAMES = {
+    PL: 'Polski', EN: 'English', US: 'English (US)', UK: 'English (UK)',
+    DE: 'Deutsch', FR: 'Francais', ES: 'Espanol', IT: 'Italiano',
+    RU: 'Russkij', TR: 'Turkce', PT: 'Portugues', NL: 'Nederlands',
+    SE: 'Svenska', NO: 'Norsk', DK: 'Dansk', CZ: 'Cesky', SK: 'Slovensky',
+    UA: 'Ukrainska', HU: 'Magyar', RO: 'Romana', MULTI: 'Wielojezyczny',
+};
+
+// Wydania nagrywane w kinie - obraz i dzwiek zwykle nie nadaja sie do ogladania.
+const CAM_TAGS = ['CAM', 'CAMRIP', 'HDCAM', 'TS', 'TELESYNC', 'HDTS',
+                  'TC', 'TELECINE', 'SCR', 'SCREENER', 'DVDSCR', 'R6', 'WORKPRINT'];
+
+// Sciezki dzwiekowe generowane maszynowo.
+const AI_TAGS = ['AI', 'AILEKTOR', 'LEKTORAI', 'AIPL', 'PLAI', 'AIDUBBING',
+                 'DUBBINGAI', 'TTS', 'SYNTEZATOR', 'AIVOICE', 'VOICEAI'];
+
+/**
+ * Rozpoznaje jezyk i jakosc wydania na podstawie nazwy z Xtream.
+ *
+ * Tagi wykrywamy tylko wewnatrz nawiasow albo jako osobne slowo, dzieki
+ * czemu "Camino", "Ghosts" czy "Rain Man" nie zostana uznane za CAM/TS/AI.
+ *
+ * @returns {{ langCode: string|null, qualityTag: string, cleanName: string }}
+ *          qualityTag: 'cam' | 'ai' | 'ok'
+ */
+function classifyMediaName(rawName) {
+    const name = String(rawName || '').trim();
+    if (!name) return { langCode: null, qualityTag: 'ok', cleanName: '' };
+
+    // --- jezyk ---
+    let langCode = null;
+    let rest = name;
+    const langMatch = name.match(LANG_PREFIX_RE);
+    if (langMatch) {
+        langCode = langMatch[1].toUpperCase();
+        rest = name.slice(langMatch[0].length).trim();
+    }
+
+    // --- jakosc ---
+    // Bierzemy pod uwage tylko tresc nawiasow i pojedyncze slowa,
+    // po usunieciu znakow rozdzielajacych (np. "AI LEKTOR" -> "AILEKTOR").
+    const candidates = [];
+
+    const bracketRe = /[([{]([^)\]}]*)[)\]}]/g;
+    let m;
+    while ((m = bracketRe.exec(rest)) !== null) {
+        candidates.push(m[1]);
+    }
+    for (const word of rest.split(/[\s._-]+/)) {
+        candidates.push(word);
+    }
+
+    let qualityTag = 'ok';
+    for (const cand of candidates) {
+        const norm = cand.toUpperCase().replace(/[^A-Z]/g, '');
+        if (!norm) continue;
+        if (CAM_TAGS.includes(norm)) { qualityTag = 'cam'; break; }
+        if (AI_TAGS.includes(norm)) { qualityTag = 'ai'; }
+    }
+
+    // Nazwa bez prefiksu jezykowego - do wyszukiwania i sortowania,
+    // zeby "PL - Diuna" znajdowalo sie pod "D", a nie pod "P".
+    return { langCode, qualityTag, cleanName: rest || name };
+}
+
+/**
+ * Uzupelnia lang_code / quality_tag / clean_name dla pozycji dodanych
+ * przed wprowadzeniem klasyfikacji. Dziala partiami, zeby nie blokowac bazy.
+ */
+async function backfillClassification(batchSize = 2000) {
+    try {
+        const rows = await dbAll(
+            `SELECT stream_id, stream_type, name FROM media
+             WHERE clean_name IS NULL LIMIT ?`, [batchSize]
+        );
+        if (rows.length === 0) return;
+
+        console.log(`[KLASYFIKACJA] Uzupelniam ${rows.length} pozycji...`);
+
+        await dbRun('BEGIN TRANSACTION');
+        const stmt = db.prepare(
+            `UPDATE media SET lang_code = ?, quality_tag = ?, clean_name = ?
+             WHERE stream_id = ? AND stream_type = ?`
+        );
+        try {
+            for (const row of rows) {
+                const c = classifyMediaName(row.name);
+                await stmtRun(stmt, [c.langCode, c.qualityTag, c.cleanName,
+                                     row.stream_id, row.stream_type]);
+            }
+        } finally {
+            stmt.finalize();
+        }
+        await dbRun('COMMIT');
+
+        console.log(`[KLASYFIKACJA] Gotowe: ${rows.length} pozycji`);
+
+        // Zostalo wiecej - kolejna partia po chwili przerwy.
+        if (rows.length === batchSize) setTimeout(() => backfillClassification(batchSize), 2000);
+    } catch (err) {
+        console.error('[KLASYFIKACJA] Blad uzupelniania:', err.message);
+        try { await dbRun('ROLLBACK'); } catch (e) { /* transakcja mogla nie byc otwarta */ }
+    }
+}
 
 // ============================================================
 // === SEMAFOR SLOTU XTREAM ===
