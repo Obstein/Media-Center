@@ -680,22 +680,60 @@ app.delete('/api/playlists/:id', async (req, res) => {
             return res.status(404).json({ error: 'Playlista nie znaleziona.' });
         }
         
-        // Sprawdź ile ma mediów
         const mediaCount = await dbAll('SELECT COUNT(*) as count FROM media WHERE playlist_id = ?', [id]);
-        
-        if (mediaCount[0].count > 0) {
-            return res.status(400).json({ 
-                error: `Nie można usunąć playlisty zawierającej ${mediaCount[0].count} pozycji. Usuń najpierw media lub przenieś je do innej playlisty.` 
-            });
+        const count = mediaCount[0].count;
+
+        // Usuwamy playliste RAZEM z jej mediami. Wczesniej byla tu blokada
+        // "usun najpierw media", ale nie istnial zaden sposob, zeby to zrobic -
+        // playlisty martwego dostawcy nie dalo sie usunac wcale.
+        //
+        // Historia pobran zostaje: pliki sa juz na dysku, wiec archiwum ma
+        // wartosc niezaleznie od tego, czy zrodlo nadal istnieje.
+        await dbRun('BEGIN TRANSACTION');
+        try {
+            // Gatunki czyscimy tylko dla pozycji, ktorych nie ma
+            // w zadnej innej playliscie.
+            await dbRun(`
+                DELETE FROM media_genres
+                WHERE EXISTS (
+                    SELECT 1 FROM media m
+                    WHERE m.stream_id = media_genres.media_stream_id
+                      AND m.stream_type = media_genres.media_stream_type
+                      AND m.playlist_id = ?
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM media m2
+                    WHERE m2.stream_id = media_genres.media_stream_id
+                      AND m2.stream_type = media_genres.media_stream_type
+                      AND m2.playlist_id != ?
+                )
+            `, [id, id]);
+
+            await dbRun('DELETE FROM media WHERE playlist_id = ?', [id]);
+            await dbRun('DELETE FROM favorites WHERE playlist_id = ?', [id]);
+
+            // Zadania bez ukonczenia nie maja juz zrodla - usuwamy je.
+            await dbRun(
+                "DELETE FROM downloads WHERE playlist_id = ? AND worker_status IN ('queued', 'waiting_for_slot', 'failed')",
+                [id]
+            );
+            // Ukonczone zostaja w archiwum, tylko bez powiazania z playlista.
+            await dbRun('UPDATE downloads SET playlist_id = NULL WHERE playlist_id = ?', [id]);
+
+            await dbRun('DELETE FROM playlists WHERE id = ?', [id]);
+            await dbRun('COMMIT');
+        } catch (txError) {
+            await dbRun('ROLLBACK');
+            throw txError;
         }
-        
-        // Usuń powiązane dane
-        await dbRun('DELETE FROM favorites WHERE playlist_id = ?', [id]);
-        await dbRun('DELETE FROM downloads WHERE playlist_id = ?', [id]);
-        await dbRun('DELETE FROM playlists WHERE id = ?', [id]);
-        
-        console.log(`🗑️ Usunięto playlistę: ${playlist[0].name} (ID: ${id})`);
-        res.json({ message: 'Playlista została usunięta.' });
+
+        console.log(`🗑️ Usunieto playliste: ${playlist[0].name} (ID: ${id}) wraz z ${count} pozycjami`);
+        res.json({
+            message: count > 0
+                ? `Usunieto playliste wraz z ${count} pozycjami.`
+                : 'Playlista zostala usunieta.',
+            removed_media: count
+        });
         
     } catch (error) {
         console.error('Błąd usuwania playlisty:', error);
@@ -1535,14 +1573,16 @@ app.get('/api/media/languages', async (req, res) => {
 
         // Domyslnie liczymy tak, jak wyswietla UI - bez CAM/AI.
         const qualityWhere = quality === 'good'
-            ? "AND (quality_tag IS NULL OR quality_tag = 'ok')"
+            ? "AND (m.quality_tag IS NULL OR m.quality_tag = 'ok')"
             : '';
 
+        // Liczymy tak, jak pokazuje lista - bez playlist wylaczonych.
         const rows = await dbAll(`
-            SELECT lang_code, COUNT(*) as count
-            FROM media
-            WHERE 1 = 1 ${qualityWhere}
-            GROUP BY lang_code
+            SELECT m.lang_code, COUNT(*) as count
+            FROM media m
+            LEFT JOIN playlists p ON m.playlist_id = p.id
+            WHERE (p.is_active = 1 OR m.playlist_id IS NULL) ${qualityWhere}
+            GROUP BY m.lang_code
             ORDER BY count DESC
         `);
 
@@ -1563,8 +1603,11 @@ app.get('/api/media/languages', async (req, res) => {
 app.get('/api/media/quality-stats', async (req, res) => {
     try {
         const rows = await dbAll(`
-            SELECT COALESCE(quality_tag, 'ok') as tag, COUNT(*) as count
-            FROM media GROUP BY COALESCE(quality_tag, 'ok')
+            SELECT COALESCE(m.quality_tag, 'ok') as tag, COUNT(*) as count
+            FROM media m
+            LEFT JOIN playlists p ON m.playlist_id = p.id
+            WHERE (p.is_active = 1 OR m.playlist_id IS NULL)
+            GROUP BY COALESCE(m.quality_tag, 'ok')
         `);
         const stats = { ok: 0, cam: 0, ai: 0 };
         for (const r of rows) {
@@ -1744,6 +1787,14 @@ app.get('/api/media', (req, res) => {
     if (type === 'movie' || type === 'series') {
         whereClauses.push('m.stream_type = ?');
         params.push(type);
+    }
+
+    // Playlisty wylaczone traktujemy jak nieistniejace - ich media znikaja
+    // z listy, ale zostaja w bazie, wiec wlaczenie playlisty je przywraca
+    // bez ponownej synchronizacji.
+    // includeInactive=1 pozwala je zobaczyc (np. w panelu zarzadzania).
+    if (req.query.includeInactive !== '1') {
+        whereClauses.push('(p.is_active = 1 OR m.playlist_id IS NULL)');
     }
 
     // Filtr jakosci wydania.
@@ -2495,12 +2546,14 @@ async function annotateAvailability(items, mediaType) {
     if (ids.length === 0) return items.map(i => ({ ...i, available: false, copies: [] }));
 
     const placeholders = ids.map(() => '?').join(',');
+    // Playlisty wylaczone nie licza sie jako "masz to u siebie".
     const rows = await dbAll(
         `SELECT m.stream_id, m.tmdb_id, m.name, m.stream_type, m.playlist_id,
                 m.lang_code, m.quality_tag, p.name as playlist_name
          FROM media m
          LEFT JOIN playlists p ON m.playlist_id = p.id
-         WHERE m.stream_type = ? AND m.tmdb_id IN (${placeholders})`,
+         WHERE m.stream_type = ? AND m.tmdb_id IN (${placeholders})
+           AND (p.is_active = 1 OR m.playlist_id IS NULL)`,
         [streamType, ...ids]
     );
 

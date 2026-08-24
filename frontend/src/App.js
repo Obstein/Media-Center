@@ -789,18 +789,31 @@ const handleSaveFilters = async (filters) => {
 
     // Usuń playlistę
     const handleDeletePlaylist = async (id, name) => {
-        if (!window.confirm(`Czy na pewno chcesz usunąć playlistę "${name}"?`)) {
+        // Usuniecie kasuje takze media tej playlisty - uprzedzamy o tym wprost,
+        // podajac liczbe pozycji, ktore znikna z biblioteki.
+        const target = playlists.find(p => p.id === id);
+        const mediaCount = target?.media_count || 0;
+
+        const question = mediaCount > 0
+            ? `Usunąć playlistę "${name}" wraz z ${mediaCount} pozycjami?\n\n`
+              + `Pozycje znikną z biblioteki. Pobrane pliki na dysku pozostaną nietknięte.\n\n`
+              + `Jeśli chcesz je tylko ukryć, użyj wyłączenia playlisty zamiast usuwania.`
+            : `Czy na pewno chcesz usunąć playlistę "${name}"?`;
+
+        if (!window.confirm(question)) {
             return;
         }
 
         try {
-            await axios.delete(`/api/playlists/${id}`);
-            setMessage('Playlista została usunięta.');
+            const res = await axios.delete(`/api/playlists/${id}`);
+            setMessage(res.data?.message || 'Playlista została usunięta.');
             await Promise.all([fetchPlaylists(), fetchOverview()]);
-            setTimeout(() => setMessage(''), 3000);
+            setTimeout(() => setMessage(''), 5000);
         } catch (error) {
             console.error('Błąd usuwania playlisty:', error);
             setMessage(error.response?.data?.error || 'Błąd usuwania playlisty.');
+            // Blad zostawiamy dluzej - user musi zdazyc go przeczytac.
+            setTimeout(() => setMessage(''), 10000);
         }
     };
 
