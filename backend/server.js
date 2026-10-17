@@ -1506,6 +1506,10 @@ app.get('/api/image-proxy', async (req, res) => {
             timeout: 5000
         });
         res.setHeader('Content-Type', response.headers['content-type']);
+        // Okladki filmow/seriali sie nie zmieniaja - bez tego kazde wejscie
+        // na strone (30 miniatur) odpytywalo zdalny serwer IPTV na nowo,
+        // za kazdym razem, dla kazdego uzytkownika.
+        res.setHeader('Cache-Control', 'public, max-age=86400');
         response.data.pipe(res);
     } catch (error) {
         console.error(`Błąd proxy dla URL: ${decodeURIComponent(url)} - ${error.message}`);
@@ -1682,7 +1686,7 @@ app.post('/api/favorites/toggle', async (req, res) => {
 
 // --- API MEDIA ---
 
-app.get('/api/media', (req, res) => {
+app.get('/api/media', async (req, res) => {
     const {
         page = 1,
         limit = 30,
@@ -1810,41 +1814,39 @@ app.get('/api/media', (req, res) => {
     const countParams = [...params];
     params.push(limit, offset);
 
-    db.get(countSql, countParams, (err, row) => {
-        if (err) {
-            console.error('Blad zapytania count:', err);
-            res.status(500).json({ error: err.message });
-            return;
-        }
+    // Count i dane sa niezalezne - odpalone rownolegle (Promise.all) zamiast
+    // jedno po drugim, co w praktyce potrafi przeciez wykonac sie wspolbiezni
+    // (sqlite3 domyslnie dziala w trybie "parallelize"), zamiast czekac na
+    // zakonczenie count-a przed rozpoczeciem glownego zapytania.
+    try {
+        const [countRows, rows] = await Promise.all([
+            dbAll(countSql, countParams),
+            dbAll(dataSql, params)
+        ]);
 
-        const totalItems = row.total;
+        const totalItems = countRows[0].total;
         const totalPages = Math.ceil(totalItems / limit);
 
-        db.all(dataSql, params, (err, rows) => {
-            if (err) {
-                console.error('Blad zapytania media:', err);
-                res.status(500).json({ error: err.message });
-                return;
+        res.json({
+            items: rows,
+            totalPages,
+            currentPage: parseInt(page),
+            totalItems,
+            applied_filters: {
+                search: search || null,
+                genre: genre !== 'all' ? genre : null,
+                filter: filter || null,
+                playlist: playlist !== 'all' ? playlist : null,
+                lang: lang !== 'all' ? lang : null,
+                type: type !== 'all' ? type : null,
+                quality,
+                sort
             }
-
-            res.json({
-                items: rows,
-                totalPages,
-                currentPage: parseInt(page),
-                totalItems,
-                applied_filters: {
-                    search: search || null,
-                    genre: genre !== 'all' ? genre : null,
-                    filter: filter || null,
-                    playlist: playlist !== 'all' ? playlist : null,
-                    lang: lang !== 'all' ? lang : null,
-                    type: type !== 'all' ? type : null,
-                    quality,
-                    sort
-                }
-            });
         });
-    });
+    } catch (err) {
+        console.error('Blad zapytania /api/media:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // --- API: SZCZEGÓŁY MEDIA ---
@@ -2031,26 +2033,39 @@ app.get('/api/downloads/status', async (req, res) => {
             LIMIT 50
         `);
         
-        // Dodaj logi pobierania jeśli istnieją
-        const downloadsWithLogs = await Promise.all(downloads.map(async (download) => {
+        // Dodaj logi pobierania jeśli istnieją. Jedno zapytanie z ROW_NUMBER()
+        // zamiast N+1 (osobne SELECT per pobranie) - ten endpoint jest
+        // odpytywany co 5s przez kazdego podlaczonego klienta, wiec przy
+        // 50 pobraniach to bylo 50 dodatkowych zapytan co 5 sekund.
+        let logsByDownloadId = new Map();
+        if (downloads.length > 0) {
             try {
-                const logs = await dbAll(`
-                    SELECT timestamp, level, message 
-                    FROM download_logs 
-                    WHERE download_id = ? 
-                    ORDER BY timestamp DESC 
-                    LIMIT 10
-                `, [download.id]);
-                
-                return {
-                    ...download,
-                    logs: logs
-                };
+                const placeholders = downloads.map(() => '?').join(',');
+                const allLogs = await dbAll(`
+                    SELECT download_id, timestamp, level, message FROM (
+                        SELECT download_id, timestamp, level, message,
+                               ROW_NUMBER() OVER (PARTITION BY download_id ORDER BY timestamp DESC) as rn
+                        FROM download_logs
+                        WHERE download_id IN (${placeholders})
+                    ) WHERE rn <= 10
+                `, downloads.map(d => d.id));
+
+                for (const log of allLogs) {
+                    if (!logsByDownloadId.has(log.download_id)) {
+                        logsByDownloadId.set(log.download_id, []);
+                    }
+                    logsByDownloadId.get(log.download_id).push(log);
+                }
             } catch (logError) {
-                return download; // Zwróć bez logów jeśli błąd
+                console.error('Błąd pobierania logów pobierania:', logError.message);
             }
+        }
+
+        const downloadsWithLogs = downloads.map(download => ({
+            ...download,
+            logs: logsByDownloadId.get(download.id) || []
         }));
-        
+
         res.json(downloadsWithLogs);
     } catch (error) {
         console.error("Błąd pobierania statusu:", error);
@@ -4388,7 +4403,7 @@ async function backfillTmdbGenres(limit = 50) {
             try {
                 const tmdbType = item.stream_type === 'series' ? 'tv' : 'movie';
                 const tmdbUrl = `${tmdbBaseUrl}/${tmdbType}/${tmdbId}?api_key=${settings.tmdbApi}&language=pl-PL`;
-                const tmdbRes = await axios.get(tmdbUrl);
+                const tmdbRes = await axios.get(tmdbUrl, { timeout: 10000 });
                 
                 if (tmdbRes.data && tmdbRes.data.genres && tmdbRes.data.genres.length > 0) {
                     console.log(`Pobrano gatunki dla ${item.stream_type} ID ${tmdbId}`);
