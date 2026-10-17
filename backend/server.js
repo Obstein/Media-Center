@@ -1230,19 +1230,14 @@ async function syncSinglePlaylist(playlist) {
             
             // Dodaj nowe pozycje
             if (itemsToAdd.length > 0) {
-                const tmdbApiRows = await dbAll(`SELECT value FROM settings WHERE key = 'tmdbApi'`);
-                const tmdbApi = tmdbApiRows[0]?.value;
-                
                 const insertMediaSql = `INSERT OR REPLACE INTO media
                     (stream_id, name, stream_icon, rating, tmdb_id, stream_type, container_extension, playlist_id, original_name,
                      lang_code, quality_tag, clean_name)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
                     
-                const insertGenreSql = `INSERT OR IGNORE INTO genres (id, name) VALUES (?, ?)`;
                 const insertMediaGenreSql = `INSERT OR IGNORE INTO media_genres (media_stream_id, media_stream_type, genre_id) VALUES (?, ?, ?)`;
-                
+
                 const mediaStmt = db.prepare(insertMediaSql);
-                const genreStmt = db.prepare(insertGenreSql);
                 const mediaGenreStmt = db.prepare(insertMediaGenreSql);
                 
                 try {
@@ -1270,41 +1265,19 @@ async function syncSinglePlaylist(playlist) {
                             classified.qualityTag,
                             classified.cleanName
                         ]);
-                        
-                        // Sprawdź czy gatunki już istnieją dla tego media
-                        const existingGenres = await dbAll(`
-                            SELECT COUNT(*) as count 
-                            FROM media_genres 
-                            WHERE media_stream_id = ? AND media_stream_type = ?
-                        `, [item.stream_id, item.stream_type]);
-                        
-                        // Pobierz gatunki z TMDB tylko jeśli jeszcze ich nie ma
-                        if (existingGenres[0].count === 0 && tmdbId && tmdbApi) {
-                            try {
-                                const tmdbType = item.stream_type === 'series' ? 'tv' : 'movie';
-                                const tmdbUrl = `https://api.themoviedb.org/3/${tmdbType}/${tmdbId}?api_key=${tmdbApi}&language=pl-PL&append_to_response=translations`;
-                                
-                                const tmdbRes = await axios.get(tmdbUrl, { timeout: 10000 });
-                                let tmdbData = tmdbRes.data;
-                                
-                                // Dodaj gatunki
-                                if (tmdbData.genres) {
-                                    for (const genre of tmdbData.genres) {
-                                        await stmtRun(genreStmt, [genre.id, genre.name]);
-                                        await stmtRun(mediaGenreStmt, [item.stream_id, item.stream_type, genre.id]);
-                                    }
-                                } else {
-                                    await stmtRun(mediaGenreStmt, [item.stream_id, item.stream_type, -1]);
-                                }
-                                
-                                await new Promise(resolve => setTimeout(resolve, 50));
-                            } catch (tmdbError) {
-                                await stmtRun(mediaGenreStmt, [item.stream_id, item.stream_type, -1]);
-                            }
-                        } else if (existingGenres[0].count === 0) {
+
+                        // Gatunki z TMDB sa uzupelniane w tle po zakonczeniu synchronizacji
+                        // (zobacz scheduleTmdbGenreBackfillDrain) - pobieranie ich tutaj,
+                        // pozycja po pozycji, trzymalo cala synchronizacje w jednej otwartej
+                        // transakcji przez caly czas trwania (nawet godziny dla duzych playlist),
+                        // przez co nowo dodane media byly niewidoczne w wyszukiwaniu i pobieraniu
+                        // do samego konca synchronizacji.
+                        // Tutaj oznaczamy tylko pozycje bez tmdb_id jako "sprawdzone" - i tak
+                        // nigdy nie trafia dla nich zapytanie do TMDB.
+                        if (!tmdbId) {
                             await stmtRun(mediaGenreStmt, [item.stream_id, item.stream_type, -1]);
                         }
-                        
+
                         processedCount++;
                         if (processedCount % 100 === 0) {
                             console.log(`  📈 Przetworzono ${processedCount}/${itemsToAdd.length} pozycji...`);
@@ -1312,11 +1285,10 @@ async function syncSinglePlaylist(playlist) {
                     }
                 } finally {
                     mediaStmt.finalize();
-                    genreStmt.finalize();
                     mediaGenreStmt.finalize();
                 }
             }
-            
+
             // Zaktualizuj licznik mediów i datę synchronizacji
             const newMediaCount = await dbAll('SELECT COUNT(*) as count FROM media WHERE playlist_id = ?', [playlistId]);
             await dbRun('UPDATE playlists SET media_count = ?, last_sync = ? WHERE id = ?', [
@@ -1327,9 +1299,15 @@ async function syncSinglePlaylist(playlist) {
             
             await dbRun('COMMIT');
             transactionActive = false;
-            
+
             console.log(`  ✅ Synchronizacja ${name} zakończona: +${itemsToAdd.length} -${itemsToDelete.length} (łącznie: ${newMediaCount[0].count})`);
-            
+
+            // Media sa juz widoczne (transakcja zatwierdzona) - gatunki z TMDB
+            // doganiaja w tle, bez blokowania odpowiedzi tego endpointu.
+            if (itemsToAdd.length > 0) {
+                scheduleTmdbGenreBackfillDrain();
+            }
+
             return {
                 added: itemsToAdd.length,
                 removed: itemsToDelete.length,
@@ -1891,9 +1869,7 @@ app.post('/api/media/refresh', async (req, res) => {
     
     try {
         const xtreamBaseUrl = `${serverUrl}/player_api.php?username=${username}&password=${password}`;
-        const tmdbBaseUrl = 'https://api.themoviedb.org/3';
-        const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
-        
+
         console.log('Pobieranie filmów i seriali z Xtream...');
         
         // Pobierz dane z Xtream
@@ -1969,11 +1945,9 @@ app.post('/api/media/refresh', async (req, res) => {
             console.log(`Dodawanie ${itemsToAdd.length} nowych pozycji...`);
             
             const insertMediaSql = `INSERT OR REPLACE INTO media (stream_id, name, stream_icon, rating, tmdb_id, stream_type, container_extension, lang_code, quality_tag, clean_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
-            const insertGenreSql = `INSERT OR IGNORE INTO genres (id, name) VALUES (?, ?)`;
             const insertMediaGenreSql = `INSERT OR IGNORE INTO media_genres (media_stream_id, media_stream_type, genre_id) VALUES (?, ?, ?)`;
-            
+
             const mediaStmt = db.prepare(insertMediaSql);
-            const genreStmt = db.prepare(insertGenreSql);
             const mediaGenreStmt = db.prepare(insertMediaGenreSql);
             
             try {
@@ -1994,36 +1968,13 @@ app.post('/api/media/refresh', async (req, res) => {
                         classified.cleanName
                     ]);
                     
-                    // Pobierz gatunki z TMDB jeśli mamy ID
-                    if (tmdbId) {
-                        try {
-                            const tmdbType = item.stream_type === 'series' ? 'tv' : 'movie';
-                            const tmdbUrl = `${tmdbBaseUrl}/${tmdbType}/${tmdbId}?api_key=${tmdbApi}&language=pl-PL`;
-                            
-                            const tmdbRes = await axios.get(tmdbUrl, {
-                                timeout: 10000
-                            });
-                            
-                            if (tmdbRes.data && tmdbRes.data.genres) {
-                                for (const genre of tmdbRes.data.genres) {
-                                    await stmtRun(genreStmt, [genre.id, genre.name]);
-                                    await stmtRun(mediaGenreStmt, [item.stream_id, item.stream_type, genre.id]);
-                                }
-                            }
-                            
-                            await delay(50); // Krótkie opóźnienie dla TMDB API
-                        } catch (tmdbError) {
-                            if (tmdbError.response && tmdbError.response.status !== 404) {
-                                console.warn(`Błąd TMDB dla ID ${tmdbId} (typ: ${item.stream_type}): ${tmdbError.response.status}`);
-                            }
-                            // Dodaj domyślny gatunek przy błędzie
-                            await stmtRun(mediaGenreStmt, [item.stream_id, item.stream_type, -1]);
-                        }
-                    } else {
-                        // Brak TMDB ID - dodaj domyślny gatunek
+                    // Gatunki z TMDB sa uzupelniane w tle po commicie (patrz
+                    // scheduleTmdbGenreBackfillDrain nizej) - bez tego ta petla
+                    // trzymala transakcje otwarta przez cala synchronizacje.
+                    if (!tmdbId) {
                         await stmtRun(mediaGenreStmt, [item.stream_id, item.stream_type, -1]);
                     }
-                    
+
                     processedCount++;
                     if (processedCount % 100 === 0) {
                         console.log(`Przetworzono ${processedCount}/${itemsToAdd.length} nowych pozycji...`);
@@ -2031,15 +1982,18 @@ app.post('/api/media/refresh', async (req, res) => {
                 }
             } finally {
                 mediaStmt.finalize();
-                genreStmt.finalize();
                 mediaGenreStmt.finalize();
             }
         }
-        
+
         // Zatwierdź transakcję
         await dbRun('COMMIT');
         transactionActive = false;
-        
+
+        if (itemsToAdd.length > 0) {
+            scheduleTmdbGenreBackfillDrain();
+        }
+
         const summary = `Synchronizacja zakończona. Dodano: ${itemsToAdd.length}, Usunięto: ${itemsToDelete.length}.`;
         console.log(summary);
         res.status(200).json({ message: summary });
@@ -4395,12 +4349,12 @@ async function backfillTmdbGenres(limit = 50) {
         const rows = await dbAll(`SELECT key, value FROM settings WHERE key = 'tmdbApi'`);
         if (rows.length === 0 || !rows[0].value) {
             console.log('Zadanie uzupełniania przerwane: brak klucza API do TMDB w ustawieniach.');
-            return;
+            return 0;
         }
         settings = { tmdbApi: rows[0].value };
     } catch (err) {
         console.error('Błąd odczytu ustawień w zadaniu uzupełniania:', err.message);
-        return;
+        return 0;
     }
 
     try {
@@ -4415,7 +4369,7 @@ async function backfillTmdbGenres(limit = 50) {
 
         if (itemsToUpdate.length === 0) {
             console.log('Zadanie uzupełniania zakończone: brak pozycji do zaktualizowania.');
-            return;
+            return 0;
         }
 
         console.log(`Znaleziono ${itemsToUpdate.length} pozycji do uzupełnienia gatunków.`);
@@ -4460,9 +4414,41 @@ async function backfillTmdbGenres(limit = 50) {
         mediaGenreStmt.finalize();
         console.log('Zadanie uzupełniania zakończone pomyślnie.');
 
+        return itemsToUpdate.length;
+
     } catch (error) {
         console.error('Wystąpił krytyczny błąd w zadaniu uzupełniania:', error.message);
+        return 0;
     }
+}
+
+// Pojedyncze wywolanie backfillTmdbGenres robi tylko jedna partie (domyslnie
+// 50 pozycji). Po duzej synchronizacji (tysiace nowych pozycji) trzeba je
+// doganiac w wielu partiach, bez ponownego wywolywania recznie - ta funkcja
+// odpala samonapedzajaca sie petle w tle, a flaga chroni przed nalozeniem
+// kilku takich petli naraz (np. sync-all odpalajacy kilka playlist pod rzad).
+let tmdbBackfillRunning = false;
+
+function scheduleTmdbGenreBackfillDrain(batchSize = 100) {
+    if (tmdbBackfillRunning) return;
+    tmdbBackfillRunning = true;
+
+    (async () => {
+        try {
+            let processed;
+            do {
+                processed = await backfillTmdbGenres(batchSize);
+                if (processed >= batchSize) {
+                    // Krotka przerwa miedzy partiami - nie zapychamy TMDB API.
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
+            } while (processed >= batchSize);
+        } catch (error) {
+            console.error('Błąd pętli uzupełniania gatunków TMDB w tle:', error.message);
+        } finally {
+            tmdbBackfillRunning = false;
+        }
+    })();
 }
 
 app.get('/api/debug/serial-details/:id', async (req, res) => {
@@ -5642,15 +5628,11 @@ cron.schedule('0 * * * *', async () => { // Uruchamia się co godzinę
             }
         }
 
-        // Zawsze uruchamiaj uzupełnianie brakujących gatunków
-        console.log(`🎭 Uruchamianie uzupełniania gatunków TMDB...`);
-        try {
-            await backfillTmdbGenres(50);
-            console.log(`✅ Uzupełnianie gatunków TMDB zakończone pomyślnie`);
-        } catch (error) {
-            console.error(`❌ Błąd uzupełniania gatunków TMDB: ${error.message}`);
-        }
-        
+        // Zawsze uruchamiaj uzupełnianie brakujących gatunków - w tle, jako
+        // siatka bezpieczeństwa (normalnie odpala się tuż po każdej synchronizacji).
+        console.log(`🎭 Uruchamianie uzupełniania gatunków TMDB w tle...`);
+        scheduleTmdbGenreBackfillDrain();
+
     } catch (error) {
         console.error(`❌ Krytyczny błąd w cron job: ${error.message}`);
     }
