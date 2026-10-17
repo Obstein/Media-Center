@@ -2226,16 +2226,23 @@ app.post('/api/downloads/start', async (req, res) => {
 });
 
 // --- Ponawianie nieudanych pobran ---
-// Maksymalna liczba automatycznych prob. Po jej przekroczeniu zadanie
-// czeka na reczne ponowienie - zwykle znaczy to, ze pliku po prostu nie ma.
+// Maksymalna liczba automatycznych prob w ciagu dnia (co godzine). Po jej
+// przekroczeniu zadanie czeka na reczne ponowienie - ALE wiekszosc takich
+// bledow to po prostu zajety slot Xtream w godzinach, gdy ktos ogladac na
+// TV/telefonie, nie brak pliku - wiec dajemy mu dodatkowe MAX_NIGHT_RETRIES
+// prob w nocy (patrz cron '0 1-5 * * *'), gdy slot zwykle jest wolny.
 const MAX_AUTO_RETRIES = 3;
+const MAX_NIGHT_RETRIES = 10;
 
 /**
  * Wraca zadanie do kolejki. Zwraca true, gdy sie udalo.
- * @param {number}  id      id zadania w tabeli downloads
- * @param {boolean} manual  true = ponowienie reczne (nie liczy sie do limitu)
+ * @param {number}  id          id zadania w tabeli downloads
+ * @param {boolean} manual      true = ponowienie reczne (nie liczy sie do limitu)
+ * @param {number}  maxRetries  gorny limit prob dla tego wywolania - nocny
+ *                              cron przekazuje wyzszy, zeby dac dodatkowa szanse
+ *                              zadaniom, ktore wyczerpaly juz dzienny limit.
  */
-async function retryDownload(id, { manual = false } = {}) {
+async function retryDownload(id, { manual = false, maxRetries = MAX_AUTO_RETRIES } = {}) {
     const rows = await dbAll('SELECT * FROM downloads WHERE id = ?', [id]);
     if (rows.length === 0) return { ok: false, reason: 'Nie znaleziono zadania' };
 
@@ -2245,7 +2252,7 @@ async function retryDownload(id, { manual = false } = {}) {
     }
 
     const retries = job.retry_count || 0;
-    if (!manual && retries >= MAX_AUTO_RETRIES) {
+    if (!manual && retries >= maxRetries) {
         return { ok: false, reason: `Wyczerpano automatyczne proby (${retries})` };
     }
 
@@ -2265,7 +2272,7 @@ async function retryDownload(id, { manual = false } = {}) {
     downloadQueue.push(refreshed[0]);
 
     console.log(`[RETRY] Zadanie #${id} wrocilo do kolejki `
-        + `(${manual ? 'recznie' : `proba ${newCount}/${MAX_AUTO_RETRIES}`})`);
+        + `(${manual ? 'recznie' : `proba ${newCount}/${maxRetries}`})`);
 
     if (!isProcessing) processDownloadQueue();
 
@@ -5885,6 +5892,46 @@ cron.schedule('30 * * * *', async () => {
         }
     } catch (error) {
         console.error('[RETRY] Blad automatycznego ponawiania:', error.message);
+    }
+});
+
+// --- Nocne ponawianie zadan, ktore wyczerpaly dzienny limit ---
+// Zadania z retry_count >= MAX_AUTO_RETRIES normalnie czekaja na reczne
+// ponowienie - ale czesto "wyczerpanie prob" w ciagu dnia znaczy tylko,
+// ze slot Xtream caly czas byl zajety przez inny ekran. W nocy zwykle
+// nikt nie ogladac, wiec dajemy im dodatkowe podejscia o 1:00-5:00,
+// do limitu MAX_AUTO_RETRIES + MAX_NIGHT_RETRIES - plik, ktory naprawde
+// nie istnieje (404), i tak znowu szybko skonczy jako failed.
+cron.schedule('0 1-5 * * *', async () => {
+    try {
+        const nightCeiling = MAX_AUTO_RETRIES + MAX_NIGHT_RETRIES;
+        const failed = await dbAll(
+            `SELECT id, filename, retry_count FROM downloads
+             WHERE worker_status = 'failed'
+               AND COALESCE(retry_count, 0) >= ?
+               AND COALESCE(retry_count, 0) < ?
+             ORDER BY added_at ASC
+             LIMIT 20`,
+            [MAX_AUTO_RETRIES, nightCeiling]
+        );
+
+        if (failed.length === 0) return;
+
+        console.log(`[RETRY-NIGHT] Nocne ponawianie ${failed.length} nieudanych pobran (slot zwykle wolny w nocy)...`);
+
+        let requeued = 0;
+        for (const job of failed) {
+            const result = await retryDownload(job.id, { manual: false, maxRetries: nightCeiling });
+            if (result.ok) requeued++;
+        }
+
+        if (requeued > 0) {
+            await sendDiscordNotification(
+                `🌙 **Nocne ponowienie nieudanych pobran**\nWrocilo do kolejki: ${requeued}`
+            );
+        }
+    } catch (error) {
+        console.error('[RETRY-NIGHT] Blad nocnego ponawiania:', error.message);
     }
 });
 
